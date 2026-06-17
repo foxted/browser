@@ -49,28 +49,63 @@ pub fn fetch(url: &str) -> Result<Response, String> {
         return fetch_file(path, url);
     }
 
+    // Opt-in on-disk cache (set NET_CACHE_DIR): serve a previously-cached body so repeated runs
+    // don't re-hit the network. Off by default, so normal browsing is unaffected.
+    let cache = cache_path(url);
+    if let Some(p) = &cache {
+        if let Ok(body) = std::fs::read(p) {
+            return Ok(Response {
+                status: 200,
+                content_type: content_type_from_url(url),
+                body,
+                final_url: url.to_string(),
+            });
+        }
+    }
+
     // Present a mainstream browser User-Agent. Many sites (Google, etc.) serve a stripped
     // or blocked page to unknown clients like ureq's default UA, so we look like a browser.
-    let resp = match agent()
-        .get(url)
-        // Bound the whole request (DNS + connect + read) so one stalled connection can't hang
-        // the engine — important when fetching large resource graphs (e.g. 200+ JS modules).
-        .timeout(std::time::Duration::from_secs(15))
-        .set("User-Agent", BROWSER_USER_AGENT)
-        .set(
-            "Accept",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        )
-        .set("Accept-Language", "en-US,en;q=0.9")
-        .call()
-    {
-        Ok(resp) => resp,
-        // ureq's `Error::Status` carries a non-2xx response; surface it as an error
-        // string. Any other variant is a transport/connection error.
-        Err(ureq::Error::Status(code, _)) => {
-            return Err(format!("HTTP error status {code} for {url}"));
+    // Retry transient transport failures (connection reset/timeout under heavy concurrency, or
+    // 429/5xx) a few times with backoff — fetching a 200+ module graph concurrently otherwise
+    // drops the occasional connection, and a single missing module breaks the whole JS app.
+    let mut attempt = 0;
+    let resp = loop {
+        let result = agent()
+            .get(url)
+            // Bound the whole request (DNS + connect + read) so one stalled connection can't
+            // hang the engine.
+            .timeout(std::time::Duration::from_secs(15))
+            .set("User-Agent", BROWSER_USER_AGENT)
+            .set(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .set("Accept-Language", "en-US,en;q=0.9")
+            .call();
+        // Exponential-ish backoff: 200ms, 500ms, 1s, 2s.
+        let backoff = |a: u32| std::time::Duration::from_millis(match a { 1 => 200, 2 => 500, 3 => 1000, _ => 2000 });
+        match result {
+            Ok(resp) => break resp,
+            // Retry rate-limit / transient statuses. CDNs often use 403 for bot/rate limiting,
+            // so retry it too (with backoff) — a 200+ module burst can trip it mid-load.
+            Err(ureq::Error::Status(code, _)) => {
+                if (code == 403 || code == 429 || code >= 500) && attempt < 4 {
+                    attempt += 1;
+                    std::thread::sleep(backoff(attempt));
+                    continue;
+                }
+                return Err(format!("HTTP error status {code} for {url}"));
+            }
+            // Transport/connection error (reset, timeout, DNS) — retry a few times.
+            Err(e) => {
+                if attempt < 4 {
+                    attempt += 1;
+                    std::thread::sleep(backoff(attempt));
+                    continue;
+                }
+                return Err(format!("request failed: {e}"));
+            }
         }
-        Err(e) => return Err(format!("request failed: {e}")),
     };
 
     let status = resp.status();
@@ -85,7 +120,40 @@ pub fn fetch(url: &str) -> Result<Response, String> {
         .read_to_end(&mut body)
         .map_err(|e| format!("failed to read body: {e}"))?;
 
+    // Populate the opt-in disk cache on success.
+    if status == 200 {
+        if let Some(p) = &cache {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(p, &body);
+        }
+    }
+
     Ok(Response { status, content_type, body, final_url: url.to_string() })
+}
+
+/// Disk-cache file path for `url` under `NET_CACHE_DIR` (a stable hash of the URL), or `None`
+/// when the cache is disabled.
+fn cache_path(url: &str) -> Option<std::path::PathBuf> {
+    let dir = std::env::var_os("NET_CACHE_DIR")?;
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
+    Some(std::path::Path::new(&dir).join(format!("{:016x}", h.finish())))
+}
+
+/// Guess a content type from a URL's file extension (used for cached responses).
+fn content_type_from_url(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    match path.rsplit('.').next() {
+        Some("js") | Some("mjs") => "text/javascript",
+        Some("css") => "text/css",
+        Some("html") | Some("htm") => "text/html",
+        Some("json") => "application/json",
+        _ => "application/octet-stream",
+    }
+    .to_string()
 }
 
 /// Read a `file://` URL from local disk. `path` is the part after `file://`.
