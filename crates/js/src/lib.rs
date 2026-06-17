@@ -2447,6 +2447,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   wrapReturningElement(document, "querySelector");
   wrapReturningElement(document, "querySelectorAll");
 
+  // createElementNS(ns, qualifiedName) — used by Vue/SVG. There is no namespaced node in the
+  // DOM arena, so create a normal element from the local name (dropping any prefix) and record
+  // the namespace so namespace-aware code can read it back. The element is fully enriched via
+  // document.createElement above (appendChild/setAttribute/etc. all present).
+  if (typeof document.createElementNS !== "function") {
+    def(document, "createElementNS", function (ns, qualifiedName) {
+      var name = String(qualifiedName == null ? "" : qualifiedName);
+      var local = name.indexOf(":") >= 0 ? name.slice(name.indexOf(":") + 1) : name;
+      var el = document.createElement(local);
+      try { def(el, "namespaceURI", ns == null ? null : String(ns)); } catch (e) {}
+      return el;
+    });
+  }
+
   // Enrich element wrappers returned by the native element-navigation accessors and methods.
   // These return fresh wrapper objects each time, so wrap the prototype-less accessors by
   // intercepting via getter wrappers is impractical; instead wrap the element-returning methods
@@ -3964,5 +3978,22 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("7|1|true"));
+    }
+
+    #[test]
+    fn create_element_ns_returns_enriched_appendable_element() {
+        // Vue's runtime-dom createElement uses document.createElementNS for SVG/MathML. The result
+        // must be a real, enriched element (appendChild/setAttribute present) and record namespaceURI.
+        let out = env_eval(
+            "https://example.com/",
+            "var ns = 'http://www.w3.org/2000/svg'; \
+             var el = document.createElementNS(ns, 'svg:path'); \
+             el.setAttribute('d', 'M0 0'); \
+             document.body.appendChild(el); \
+             [el.tagName.toLowerCase(), el.namespaceURI === ns, \
+              typeof el.appendChild, document.body.lastChild === el].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("path|true|function|true"));
     }
 }
