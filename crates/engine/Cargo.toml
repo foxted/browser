@@ -1,0 +1,17 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fontdue = "0.9"
+paint = { path = "../paint" }
+net = { path = "../net" }
+html = { path = "../html" }
+css = { path = "../css" }
+dom = { path = "../dom" }
+style = { path = "../style" }
+layout = { path = "../layout" }
+js = { path = "../js" }
+url = "2.5"
