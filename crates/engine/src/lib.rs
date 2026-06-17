@@ -598,8 +598,8 @@ pub fn collect_stylesheets(doc: &dom::Document, base: &str) -> (Vec<css::Stylesh
 /// Walk the DOM in document order collecting `<img>` elements with a resolvable `src`, then
 /// fetch + decode each into a [`DecodedImage`] keyed by its DOM node. Caps the number fetched
 /// ([`MAX_IMAGES`]) and skips oversized decodes ([`MAX_IMAGE_PIXELS`]). Decode/fetch failures
-/// are skipped (with a console note) and never panic. `data:` URLs are not handled (they are
-/// rejected by `resolve_url`); a base64 data-URL decoder is a future addition.
+/// are skipped (with a console note) and never panic. `data:` URLs are decoded inline (base64
+/// or percent-encoded); SVG payloads decode but don't raster (`image` has no SVG support).
 fn collect_images(
     doc: &dom::Document,
     base: &str,
@@ -610,7 +610,11 @@ fn collect_images(
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag.eq_ignore_ascii_case("img") {
                 if let Some(src) = e.attrs.get("src") {
-                    if let Some(abs) = resolve_url(base, src) {
+                    let src = src.trim();
+                    // Keep `data:` URLs verbatim (decoded inline below); resolve the rest.
+                    if src.starts_with("data:") {
+                        out.push((id, src.to_string()));
+                    } else if let Some(abs) = resolve_url(base, src) {
                         out.push((id, abs));
                     }
                 }
@@ -631,12 +635,24 @@ fn collect_images(
             continue;
         }
         fetched += 1;
-        match net::fetch(&url) {
-            Ok(resp) => match decode_image(&resp.body) {
+        // `data:` URLs decode inline; everything else is fetched over the network.
+        let bytes = if url.starts_with("data:") {
+            match decode_data_url(&url) {
+                Some(b) => Ok(b),
+                None => Err("malformed data: URL".to_string()),
+            }
+        } else {
+            net::fetch(&url).map(|r| r.body).map_err(|e| e)
+        };
+        match bytes {
+            Ok(b) => match decode_image(&b) {
                 Some(img) => {
                     images.insert(node, img);
                 }
-                None => console.push(format!("[failed to decode image: {url}]")),
+                None => {
+                    let label = if url.starts_with("data:") { "data: image" } else { &url };
+                    console.push(format!("[failed to decode image: {label}]"));
+                }
             },
             Err(e) => console.push(format!("[failed to load image: {url} — {e}]")),
         }
@@ -655,6 +671,76 @@ fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
     }
     let rgba = dynimg.to_rgba8();
     Some(DecodedImage { rgba: rgba.into_raw(), w, h })
+}
+
+/// Decode a `data:[<mediatype>][;base64],<data>` URL into its raw bytes. Returns `None` if it
+/// isn't a well-formed data URL. (SVG data URLs decode fine here but won't raster — `image`
+/// has no SVG support — and are dropped at the `decode_image` step.)
+fn decode_data_url(url: &str) -> Option<Vec<u8>> {
+    let rest = url.strip_prefix("data:")?;
+    let comma = rest.find(',')?;
+    let meta = &rest[..comma];
+    let payload = &rest[comma + 1..];
+    if meta.split(';').any(|t| t.eq_ignore_ascii_case("base64")) {
+        base64_decode(payload)
+    } else {
+        Some(percent_decode(payload))
+    }
+}
+
+/// Minimal standard/URL-safe base64 decoder (ignores padding/whitespace). No external dep.
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        })
+    }
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut buf, mut bits) = (0u32, 0u32);
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        buf = (buf << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Percent-decode bytes (`%HH`), passing other bytes through.
+fn percent_decode(s: &str) -> Vec<u8> {
+    fn hex(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 /// Draw a single run at `(x, baseline)`. If `bold`, approximate bold by drawing each glyph
@@ -1030,6 +1116,44 @@ mod tests {
         assert_eq!(top, back, "scrolling back to the top restores the original render");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn base64_encode(data: &[u8]) -> String {
+        const A: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            out.push(A[(n >> 18 & 63) as usize] as char);
+            out.push(A[(n >> 12 & 63) as usize] as char);
+            out.push(if chunk.len() > 1 { A[(n >> 6 & 63) as usize] as char } else { '=' });
+            out.push(if chunk.len() > 2 { A[(n & 63) as usize] as char } else { '=' });
+        }
+        out
+    }
+
+    #[test]
+    fn base64_decode_known_strings() {
+        assert_eq!(base64_decode("SGVsbG8h").unwrap(), b"Hello!");
+        assert_eq!(base64_decode("SGVsbG8=").unwrap(), b"Hello");
+    }
+
+    #[test]
+    fn data_url_png_image_decodes() {
+        // Generate a 3x2 PNG, base64-encode it into a data URL, and decode it back.
+        let mut img = image::RgbaImage::new(3, 2);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([200, 40, 40, 255]);
+        }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let url = format!("data:image/png;base64,{}", base64_encode(&png));
+        let bytes = decode_data_url(&url).expect("data url decodes");
+        let decoded = decode_image(&bytes).expect("png decodes");
+        assert_eq!((decoded.w, decoded.h), (3, 2));
     }
 
     #[test]
