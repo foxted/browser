@@ -61,6 +61,15 @@ void browser_engine_set_viewport(struct Engine *engine,
 int32_t browser_engine_load_url(struct Engine *engine, const char *url);
 
 /**
+ * Scroll the page by `dy` device pixels (positive scrolls content up / toward the end).
+ * Clamped to the document bounds on the next render.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+void browser_engine_scroll_by(struct Engine *engine, float dy);
+
+/**
  * Paint the current state and return a borrowed view of the framebuffer.
  * Valid until the next render/free on this handle.
  *

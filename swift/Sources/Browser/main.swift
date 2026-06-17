@@ -8,6 +8,8 @@ import CBrowser
 /// yet, paints a near-black background to match the engine's dark scene (no white flash).
 final class BitmapView: NSView {
     var image: CGImage?
+    /// Called with a vertical delta in points (positive = scroll content toward the end).
+    var onScroll: ((CGFloat) -> Void)?
 
     private static let emptyColor = NSColor(calibratedRed: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
 
@@ -20,6 +22,14 @@ final class BitmapView: NSView {
             return
         }
         ctx.draw(image, in: bounds)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        var dy = event.scrollingDeltaY
+        // Line-based wheels report small deltas; scale them to roughly a line height.
+        if !event.hasPreciseScrollingDeltas { dy *= 16 }
+        // Scrolling down (finger/wheel) should reveal content further down the page.
+        onScroll?(-dy)
     }
 }
 
@@ -426,6 +436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // MARK: Bitmap content view
         bitmapView = BitmapView()
         bitmapView.translatesAutoresizingMaskIntoConstraints = false
+        bitmapView.onScroll = { [weak self] dyPoints in self?.scrollActiveTab(dyPoints) }
         content.addSubview(bitmapView)
 
         // MARK: Auto Layout
@@ -787,6 +798,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func windowDidChangeBackingProperties(_ notification: Notification) {
         updateViewport()
+        refresh()
+    }
+
+    // MARK: Scrolling
+
+    /// Scroll the active tab's page by `dyPoints` (points) and re-render. The engine works
+    /// in device pixels, so scale by the backing factor.
+    private func scrollActiveTab(_ dyPoints: CGFloat) {
+        guard let engine = activeTab?.engine else { return }
+        let scale = Float(window?.backingScaleFactor ?? 1)
+        browser_engine_scroll_by(engine, Float(dyPoints) * scale)
         refresh()
     }
 

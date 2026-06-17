@@ -35,6 +35,9 @@ pub struct Engine {
     scale: f32,
     state: LoadState,
     font: Option<SystemFont>,
+    /// Vertical scroll offset of the page content, in device pixels (0 = top). Clamped to
+    /// the laid-out document height during `render`.
+    scroll_y: f32,
     /// Retained so the FFI layer can hand out a pointer that stays valid until the next
     /// render or until the engine is dropped.
     framebuffer: Option<Framebuffer>,
@@ -54,8 +57,15 @@ impl Engine {
             scale: 1.0,
             state: LoadState::Empty,
             font: SystemFont::load(),
+            scroll_y: 0.0,
             framebuffer: None,
         }
+    }
+
+    /// Scroll the page by `dy` device pixels (positive = down). The upper bound is clamped
+    /// against the document height on the next `render`.
+    pub fn scroll_by(&mut self, dy: f32) {
+        self.scroll_y = (self.scroll_y + dy).max(0.0);
     }
 
     pub fn set_viewport(&mut self, w: u32, h: u32, scale: f32) {
@@ -66,6 +76,7 @@ impl Engine {
 
     /// Fetch `url` and remember the outcome. Returns 0 on success, negative on error.
     pub fn load_url(&mut self, url: &str) -> i32 {
+        self.scroll_y = 0.0; // new navigation starts at the top
         match net::fetch(url) {
             Ok(resp) => {
                 // Parse HTML responses into a DOM; other content types just record metadata.
@@ -123,6 +134,9 @@ impl Engine {
         let dw = ((self.vp_w as f32) * self.scale).round() as u32;
         let dh = ((self.vp_h as f32) * self.scale).round() as u32;
         let mut fb = Framebuffer::new(dw.max(1), dh.max(1));
+        // Local copy so we can clamp against the document height inside the (immutably
+        // borrowed) state match, then write the clamped value back after.
+        let mut scroll_y = self.scroll_y;
 
         paint_gradient(&mut fb);
 
@@ -169,9 +183,17 @@ impl Engine {
                             let root = layout::layout_document(
                                 d, &computed, viewport_width, viewport_height, &measurer,
                             );
-                            // Translate the whole page so it sits below the header band,
-                            // with a small left inset, and clip vertically to the page region.
-                            paint_box(&mut fb, font, &root, left, header_h, header_h, page_max_y);
+                            // Clamp the scroll offset to the laid-out document height so we
+                            // can't scroll past the end.
+                            let content_h = root.dimensions.margin_box().height;
+                            let max_scroll = (content_h - viewport_height).max(0.0);
+                            scroll_y = scroll_y.min(max_scroll);
+                            // Translate the page below the header band, offset by the scroll
+                            // position, and clip vertically to the page region.
+                            paint_box(
+                                &mut fb, font, &root, left, header_h - scroll_y, header_h,
+                                page_max_y,
+                            );
                         }
                         None => {
                             let line_h = px * 1.4;
@@ -202,6 +224,7 @@ impl Engine {
             }
         }
 
+        self.scroll_y = scroll_y; // persist the clamped offset
         self.framebuffer = Some(fb);
         self.framebuffer.as_ref().unwrap()
     }
@@ -832,6 +855,50 @@ fn draw_console_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Column of RGB pixels down the middle of a framebuffer (for comparing renders).
+    fn center_column(fb: &Framebuffer) -> Vec<u8> {
+        let x = (fb.width / 2) as usize;
+        (0..fb.height)
+            .flat_map(|y| {
+                let i = (y * fb.stride) as usize + x * 4;
+                fb.pixels[i..i + 3].to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn scrolling_shifts_page_content() {
+        // A page much taller than the viewport: 30 colored blocks of height 80 (~2400px).
+        // Backgrounds paint without a font, so this is deterministic in CI.
+        let mut body = String::from("<html><body>");
+        for i in 0..30 {
+            let shade = 40 + (i * 6) % 200;
+            body.push_str(&format!(
+                "<div style=\"height:80px; background-color:#{shade:02x}1414\"></div>"
+            ));
+        }
+        body.push_str("</body></html>");
+        let path = std::env::temp_dir().join("browser_scroll_test.html");
+        std::fs::write(&path, body).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(120, 200, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+
+        let top = center_column(e.render()).clone();
+        // Scroll down well past one viewport and re-render.
+        e.scroll_by(600.0);
+        let scrolled = center_column(e.render()).clone();
+        assert_ne!(top, scrolled, "scrolling a tall page must change the visible content");
+
+        // Scrolling back to the top restores the original view (clamped at 0).
+        e.scroll_by(-100000.0);
+        let back = center_column(e.render()).clone();
+        assert_eq!(top, back, "scrolling back to the top restores the original render");
+
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn renders_a_nonblank_framebuffer() {

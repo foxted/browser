@@ -77,6 +77,18 @@ pub unsafe extern "C" fn browser_engine_load_url(engine: *mut Engine, url: *cons
     }
 }
 
+/// Scroll the page by `dy` device pixels (positive scrolls content up / toward the end).
+/// Clamped to the document bounds on the next render.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_scroll_by(engine: *mut Engine, dy: f32) {
+    if let Some(e) = engine.as_mut() {
+        e.0.scroll_by(dy);
+    }
+}
+
 /// Paint the current state and return a borrowed view of the framebuffer.
 /// Valid until the next render/free on this handle.
 ///
