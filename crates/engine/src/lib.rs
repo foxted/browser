@@ -168,13 +168,12 @@ impl Engine {
         if matches!(&self.layout_cache, Some(c) if c.dw == dw && c.dh == dh) {
             return;
         }
-        let left = 16.0 * self.scale;
         // Compute into owned values first so the `&self.state` borrow ends before we assign.
         let computed = if let (Some(font), LoadState::Loaded { doc: Some(d), styles, console, images, .. }) =
             (self.font.as_ref(), &self.state)
         {
             let page_max_y = if console.is_empty() { dh as f32 } else { (dh as f32 * 0.65).floor() };
-            let vw = (dw as f32 - 2.0 * left).max(1.0);
+            let vw = (dw as f32).max(1.0);
             let vh = (page_max_y - header_h).max(1.0);
             let measurer = FontMeasurer { font };
             let intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
@@ -196,8 +195,8 @@ impl Engine {
     pub fn render(&mut self) -> &Framebuffer {
         let dw = ((self.vp_w as f32) * self.scale).round().max(1.0) as u32;
         let dh = ((self.vp_h as f32) * self.scale).round().max(1.0) as u32;
-        // Small top inset so page content isn't flush against the toolbar (no debug bar).
-        let header_h = 8.0 * self.scale;
+        // No engine inset: page paints flush at (0,0); margin/padding come from CSS.
+        let header_h = 0.0;
 
         // Expensive: cascade + layout (cached across scrolls / repeated renders at this size).
         self.ensure_layout(dw, dh, header_h);
@@ -217,7 +216,7 @@ impl Engine {
                               12.0 * self.scale, 60.0 * self.scale, px, Color::WHITE);
                 }
                 LoadState::Loaded { url, doc, console, images, .. } => {
-                    let left = 16.0 * self.scale;
+                    let left = 0.0;
                     let page_max_y = if console.is_empty() {
                         dh as f32
                     } else {
@@ -277,9 +276,9 @@ impl Engine {
     /// resolved to a fetchable absolute URL (in-page `#frag` / `javascript:` are rejected by
     /// `resolve_url`).
     pub fn link_at(&self, x: f32, y: f32) -> Option<String> {
-        // SAME constants as render/paint_box.
-        let left = 16.0 * self.scale;
-        let header_h = 8.0 * self.scale;
+        // SAME constants as render/paint_box (no engine inset).
+        let left = 0.0;
+        let header_h = 0.0;
 
         let cache = self.layout_cache.as_ref()?;
         let (doc, page_url) = match &self.state {
