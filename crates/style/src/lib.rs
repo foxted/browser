@@ -167,6 +167,14 @@ pub struct ComputedStyle {
     pub width: Option<f32>,
     /// Explicit content `height` in px (`None` = auto).
     pub height: Option<f32>,
+    /// `min-width` constraint (`None` = 0/unset). Resolved against the containing block in layout.
+    pub min_width: Option<SizeConstraint>,
+    /// `max-width` constraint (`None`/`none` = no maximum).
+    pub max_width: Option<SizeConstraint>,
+    /// `min-height` constraint (`None` = 0/unset).
+    pub min_height: Option<SizeConstraint>,
+    /// `max-height` constraint (`None`/`none` = no maximum).
+    pub max_height: Option<SizeConstraint>,
     /// Margin thicknesses (px). Not inherited.
     pub margin: Edges,
     /// Padding thicknesses (px). Not inherited.
@@ -203,6 +211,24 @@ pub struct ComputedStyle {
     // --- Grid item placement ---
     pub grid_column: Option<GridPlacement>,
     pub grid_row: Option<GridPlacement>,
+
+    // --- Text / typography extras ---
+    /// Resolved `line-height` in px (`None` = use the font metric default). Inherits.
+    pub line_height: Option<f32>,
+    /// `text-transform`. Inherits.
+    pub text_transform: TextTransform,
+    /// `letter-spacing` in px added per character (0 = normal). Inherits.
+    pub letter_spacing: f32,
+
+    // --- Paint extras ---
+    /// `text-decoration` underline flag. Inherits.
+    pub underline: bool,
+    /// `text-decoration` line-through flag. Inherits.
+    pub line_through: bool,
+    /// `opacity` in 0.0..=1.0 (1.0 = fully opaque). Not inherited (composited per-box).
+    pub opacity: f32,
+    /// Uniform `border-radius` in px (0 = square corners). Not inherited.
+    pub border_radius: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +236,35 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// CSS `text-transform`. Inherits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextTransform {
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+/// A length that may be a fixed px value or a percentage of the containing block. Used for
+/// min/max sizing constraints so percentages can be resolved in layout (like `width`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SizeConstraint {
+    /// A resolved pixel value.
+    Px(f32),
+    /// A percentage of the containing block's size (0..=100 → 0.0..=1.0 already divided here).
+    Pct(f32),
+}
+
+impl SizeConstraint {
+    /// Resolve to px given the containing block size along the relevant axis.
+    pub fn resolve(&self, basis: f32) -> f32 {
+        match self {
+            SizeConstraint::Px(v) => *v,
+            SizeConstraint::Pct(p) => basis * p,
+        }
+    }
 }
 
 impl Default for ComputedStyle {
@@ -232,6 +287,10 @@ impl Default for ComputedStyle {
             z_index: None,
             width: None,
             height: None,
+            min_width: None,
+            max_width: None,
+            min_height: None,
+            max_height: None,
             margin: Edges::default(),
             padding: Edges::default(),
             border: Edges::default(),
@@ -252,6 +311,13 @@ impl Default for ComputedStyle {
             grid_template_rows: Vec::new(),
             grid_column: None,
             grid_row: None,
+            line_height: None,
+            text_transform: TextTransform::None,
+            letter_spacing: 0.0,
+            underline: false,
+            line_through: false,
+            opacity: 1.0,
+            border_radius: 0.0,
         }
     }
 }
@@ -338,6 +404,10 @@ fn compute_element_style(
         // Box properties are not inherited: each element starts from initial values.
         width: None,
         height: None,
+        min_width: None,
+        max_width: None,
+        min_height: None,
+        max_height: None,
         margin: Edges::default(),
         padding: Edges::default(),
         border: Edges::default(),
@@ -358,6 +428,15 @@ fn compute_element_style(
         grid_template_rows: Vec::new(),
         grid_column: None,
         grid_row: None,
+        // Typography extras inherit.
+        line_height: parent.line_height,
+        text_transform: parent.text_transform,
+        letter_spacing: parent.letter_spacing,
+        underline: parent.underline,
+        line_through: parent.line_through,
+        // Paint extras: opacity & border-radius are not inherited.
+        opacity: 1.0,
+        border_radius: 0.0,
     };
     if parent_hidden {
         style.display_none = true;
@@ -1091,8 +1170,230 @@ fn apply_declaration(
             style.height = parse_length(val);
         }
 
+        // --- Sizing constraints (min/max) ---
+        "min-width" => style.min_width = parse_size_constraint(val),
+        "max-width" => style.max_width = parse_size_constraint(val),
+        "min-height" => style.min_height = parse_size_constraint(val),
+        "max-height" => style.max_height = parse_size_constraint(val),
+
+        // --- Logical / shorthand insets ---
+        "inset" => {
+            if let Some(e) = parse_optional_edges_shorthand(val) {
+                style.top = e.top;
+                style.right = e.right;
+                style.bottom = e.bottom;
+                style.left = e.left;
+            }
+        }
+        "inset-block" => {
+            if let Some((a, b)) = parse_pair(val) {
+                style.top = a;
+                style.bottom = b;
+            }
+        }
+        "inset-inline" => {
+            if let Some((a, b)) = parse_pair(val) {
+                style.left = a;
+                style.right = b;
+            }
+        }
+
+        // --- Logical padding / margin ---
+        "padding-block" => {
+            if let Some((a, b)) = parse_edge_pair(val) {
+                style.padding.top = a;
+                style.padding.bottom = b;
+            }
+        }
+        "padding-inline" => {
+            if let Some((a, b)) = parse_edge_pair(val) {
+                style.padding.left = a;
+                style.padding.right = b;
+            }
+        }
+        "margin-block" => {
+            if let Some((a, b)) = parse_edge_pair(val) {
+                style.margin.top = a;
+                style.margin.bottom = b;
+            }
+        }
+        "margin-inline" => {
+            if let Some((a, b)) = parse_edge_pair(val) {
+                style.margin.left = a;
+                style.margin.right = b;
+            }
+        }
+
+        // --- Typography extras ---
+        "line-height" => {
+            if let Some(px) = parse_line_height(val, style.font_size) {
+                style.line_height = Some(px);
+            }
+        }
+        "text-transform" => match val.trim().to_ascii_lowercase().as_str() {
+            "none" => style.text_transform = TextTransform::None,
+            "uppercase" => style.text_transform = TextTransform::Uppercase,
+            "lowercase" => style.text_transform = TextTransform::Lowercase,
+            "capitalize" => style.text_transform = TextTransform::Capitalize,
+            _ => {}
+        },
+        "letter-spacing" => {
+            let v = val.trim().to_ascii_lowercase();
+            if v == "normal" {
+                style.letter_spacing = 0.0;
+            } else if let Some(px) = parse_length(val) {
+                style.letter_spacing = px;
+            }
+        }
+
+        // --- text-decoration (underline / line-through) ---
+        "text-decoration" | "text-decoration-line" => {
+            apply_text_decoration(style, val);
+        }
+
+        // --- opacity ---
+        "opacity" => {
+            let v = val.trim().to_ascii_lowercase();
+            let n = if let Some(p) = v.strip_suffix('%') {
+                p.trim().parse::<f32>().ok().map(|x| x / 100.0)
+            } else {
+                v.parse::<f32>().ok()
+            };
+            if let Some(n) = n {
+                style.opacity = n.clamp(0.0, 1.0);
+            }
+        }
+
+        // --- border-radius ---
+        "border-radius" => {
+            if let Some(r) = parse_border_radius(val) {
+                style.border_radius = r;
+            }
+        }
+
         _ => {}
     }
+}
+
+/// Parse a `min-width`/`max-width`/`min-height`/`max-height` value. `none`/`auto`/empty → `None`
+/// (no constraint). Supports px (and pt/unitless via [`parse_length`]) and `%`.
+fn parse_size_constraint(val: &str) -> Option<SizeConstraint> {
+    let v = val.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "none" || v == "auto" {
+        return None;
+    }
+    if let Some(p) = v.strip_suffix('%') {
+        return p.trim().parse::<f32>().ok().map(|x| SizeConstraint::Pct(x / 100.0));
+    }
+    parse_length(val).map(SizeConstraint::Px)
+}
+
+/// Parse an `inset` shorthand of 1–4 values into per-side `Option<f32>` (auto → None).
+/// CSS order: `all` / `vert horiz` / `top horiz bottom` / `top right bottom left`.
+struct OptionalEdges {
+    top: Option<f32>,
+    right: Option<f32>,
+    bottom: Option<f32>,
+    left: Option<f32>,
+}
+
+fn parse_optional_edges_shorthand(val: &str) -> Option<OptionalEdges> {
+    let parts: Vec<Option<f32>> = val.split_whitespace().map(parse_length).collect();
+    match parts.len() {
+        1 => Some(OptionalEdges { top: parts[0], right: parts[0], bottom: parts[0], left: parts[0] }),
+        2 => Some(OptionalEdges { top: parts[0], bottom: parts[0], right: parts[1], left: parts[1] }),
+        3 => Some(OptionalEdges { top: parts[0], right: parts[1], left: parts[1], bottom: parts[2] }),
+        n if n >= 4 => Some(OptionalEdges { top: parts[0], right: parts[1], bottom: parts[2], left: parts[3] }),
+        _ => None,
+    }
+}
+
+/// Parse a 1–2 value list into `(first, second)` of `Option<f32>` (used by inset-block/inline);
+/// a single value applies to both sides.
+fn parse_pair(val: &str) -> Option<(Option<f32>, Option<f32>)> {
+    let parts: Vec<&str> = val.split_whitespace().collect();
+    match parts.len() {
+        1 => {
+            let a = parse_length(parts[0]);
+            Some((a, a))
+        }
+        n if n >= 2 => Some((parse_length(parts[0]), parse_length(parts[1]))),
+        _ => None,
+    }
+}
+
+/// Like [`parse_pair`] but for padding/margin edges (`auto`/`none` → 0), returning concrete f32.
+fn parse_edge_pair(val: &str) -> Option<(f32, f32)> {
+    let parts: Vec<f32> = val
+        .split_whitespace()
+        .map(|t| parse_edge_length(t).unwrap_or(0.0))
+        .collect();
+    match parts.len() {
+        1 => Some((parts[0], parts[0])),
+        n if n >= 2 => Some((parts[0], parts[1])),
+        _ => None,
+    }
+}
+
+/// Parse `line-height`: unitless number (× font-size), `px`, or `%`/`em`/`rem` (× font-size,
+/// rem × 16). `normal` → `None` (use the font metric). Returns resolved px.
+fn parse_line_height(val: &str, font_size: f32) -> Option<f32> {
+    let v = val.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "normal" {
+        return None;
+    }
+    if let Some(p) = v.strip_suffix('%') {
+        return p.trim().parse::<f32>().ok().map(|x| x / 100.0 * font_size);
+    }
+    if let Some(e) = v.strip_suffix("rem") {
+        return e.trim().parse::<f32>().ok().map(|x| x * 16.0);
+    }
+    if let Some(e) = v.strip_suffix("em") {
+        return e.trim().parse::<f32>().ok().map(|x| x * font_size);
+    }
+    if let Some(px) = v.strip_suffix("px") {
+        return px.trim().parse::<f32>().ok();
+    }
+    if let Some(pt) = v.strip_suffix("pt") {
+        return pt.trim().parse::<f32>().ok().map(|x| x * 4.0 / 3.0);
+    }
+    // Unitless: a multiple of the font size.
+    v.parse::<f32>().ok().map(|x| x * font_size)
+}
+
+/// Apply a `text-decoration`/`text-decoration-line` value: detect `underline` / `line-through` /
+/// `overline` / `none` keywords (color/style tokens ignored). `none` clears both flags.
+fn apply_text_decoration(style: &mut ComputedStyle, val: &str) {
+    let lower = val.to_ascii_lowercase();
+    if lower.split_whitespace().any(|t| t == "none") {
+        style.underline = false;
+        style.line_through = false;
+        return;
+    }
+    for tok in lower.split_whitespace() {
+        match tok {
+            "underline" => style.underline = true,
+            "line-through" => style.line_through = true,
+            // `overline` is treated as an underline-ish line for our purposes (rarely used).
+            "overline" => style.underline = true,
+            _ => {}
+        }
+    }
+}
+
+/// Parse `border-radius` (1–4 values). We take the *first* radius and use it uniformly (per-corner
+/// and elliptical `/` syntax are simplified away). `%` resolves to `None` here (can't resolve
+/// without box size) → falls back to 0; px/unitless resolve directly.
+fn parse_border_radius(val: &str) -> Option<f32> {
+    // Ignore the elliptical `a / b` part: use the horizontal radii before `/`.
+    let main = val.split('/').next().unwrap_or(val);
+    let first = main.split_whitespace().next()?;
+    let lower = first.trim().to_ascii_lowercase();
+    if lower.ends_with('%') {
+        // Percentage radius unsupported (needs box size); approximate as 0 → square.
+        return Some(0.0);
+    }
+    parse_length(first).map(|r| r.max(0.0))
 }
 
 /// Which side(s) of a box a value targets.
@@ -2133,6 +2434,150 @@ mod tests {
         let map = cascade(&doc, &[sheet]);
         let p = elem(&doc, |e| e.tag == "p");
         assert_eq!(map[&p].color, (255, 0, 0));
+    }
+
+    #[test]
+    fn min_max_width_height_parse_px_and_pct() {
+        let sheet = css::parse(
+            "#a { max-width: 200px; min-width: 50%; max-height: none; min-height: 30px }",
+        );
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        assert_eq!(map[&a].max_width, Some(SizeConstraint::Px(200.0)));
+        assert_eq!(map[&a].min_width, Some(SizeConstraint::Pct(0.5)));
+        assert_eq!(map[&a].max_height, None); // none → unset
+        assert_eq!(map[&a].min_height, Some(SizeConstraint::Px(30.0)));
+    }
+
+    #[test]
+    fn inset_shorthand_sets_four_sides() {
+        let sheet = css::parse("#a { inset: 1px 2px 3px 4px }");
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        assert_eq!(map[&a].top, Some(1.0));
+        assert_eq!(map[&a].right, Some(2.0));
+        assert_eq!(map[&a].bottom, Some(3.0));
+        assert_eq!(map[&a].left, Some(4.0));
+    }
+
+    #[test]
+    fn inset_block_and_inline_map_to_physical() {
+        let sheet = css::parse("#a { inset-block: 5px 6px; inset-inline: 7px 8px }");
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        assert_eq!(map[&a].top, Some(5.0));
+        assert_eq!(map[&a].bottom, Some(6.0));
+        assert_eq!(map[&a].left, Some(7.0));
+        assert_eq!(map[&a].right, Some(8.0));
+    }
+
+    #[test]
+    fn padding_and_margin_block_inline() {
+        let sheet = css::parse(
+            "#a { padding-block: 4px; padding-inline: 8px 12px; margin-block: 2px 3px }",
+        );
+        let doc = html::parse(r#"<html><body><div id="a"></div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        assert_eq!(map[&a].padding.top, 4.0);
+        assert_eq!(map[&a].padding.bottom, 4.0);
+        assert_eq!(map[&a].padding.left, 8.0);
+        assert_eq!(map[&a].padding.right, 12.0);
+        assert_eq!(map[&a].margin.top, 2.0);
+        assert_eq!(map[&a].margin.bottom, 3.0);
+    }
+
+    #[test]
+    fn line_height_unitless_px_percent() {
+        // unitless 1.5 × 16 = 24
+        assert_eq!(parse_line_height("1.5", 16.0), Some(24.0));
+        // px direct
+        assert_eq!(parse_line_height("20px", 16.0), Some(20.0));
+        // percent of font-size: 150% × 20 = 30
+        assert_eq!(parse_line_height("150%", 20.0), Some(30.0));
+        // em × font-size
+        assert_eq!(parse_line_height("2em", 10.0), Some(20.0));
+        assert_eq!(parse_line_height("normal", 16.0), None);
+    }
+
+    #[test]
+    fn line_height_inherits_resolved_px() {
+        let sheet = css::parse("#wrap { font-size: 20px; line-height: 1.5 }");
+        let doc = html::parse(
+            r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let wrap = elem(&doc, |e| e.id() == Some("wrap"));
+        let span = elem(&doc, |e| e.tag == "span");
+        assert_eq!(map[&wrap].line_height, Some(30.0)); // 1.5 × 20
+        assert_eq!(map[&span].line_height, Some(30.0)); // inherited resolved px
+    }
+
+    #[test]
+    fn text_transform_parses_and_inherits() {
+        let sheet = css::parse("#wrap { text-transform: uppercase }");
+        let doc = html::parse(
+            r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let wrap = elem(&doc, |e| e.id() == Some("wrap"));
+        let span = elem(&doc, |e| e.tag == "span");
+        assert_eq!(map[&wrap].text_transform, TextTransform::Uppercase);
+        assert_eq!(map[&span].text_transform, TextTransform::Uppercase);
+    }
+
+    #[test]
+    fn text_decoration_underline_flag() {
+        let sheet = css::parse("#a { text-decoration: underline } #b { text-decoration: line-through } #c { text-decoration: none }");
+        let doc = html::parse(
+            r#"<html><body><a id="a">x</a><a id="b">y</a><a id="c">z</a></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        let b = elem(&doc, |e| e.id() == Some("b"));
+        let c = elem(&doc, |e| e.id() == Some("c"));
+        assert!(map[&a].underline);
+        assert!(!map[&a].line_through);
+        assert!(map[&b].line_through);
+        assert!(!map[&c].underline && !map[&c].line_through);
+    }
+
+    #[test]
+    fn opacity_clamps_to_unit_range() {
+        let sheet = css::parse("#a { opacity: 0.5 } #b { opacity: 2 } #c { opacity: -1 }");
+        let doc = html::parse(
+            r#"<html><body><div id="a"></div><div id="b"></div><div id="c"></div></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let a = elem(&doc, |e| e.id() == Some("a"));
+        let b = elem(&doc, |e| e.id() == Some("b"));
+        let c = elem(&doc, |e| e.id() == Some("c"));
+        assert_eq!(map[&a].opacity, 0.5);
+        assert_eq!(map[&b].opacity, 1.0);
+        assert_eq!(map[&c].opacity, 0.0);
+    }
+
+    #[test]
+    fn border_radius_one_and_four_values() {
+        assert_eq!(parse_border_radius("8px"), Some(8.0));
+        // four values → first is used uniformly
+        assert_eq!(parse_border_radius("4px 8px 12px 16px"), Some(4.0));
+        // elliptical syntax: use horizontal radii before `/`
+        assert_eq!(parse_border_radius("10px / 20px"), Some(10.0));
+    }
+
+    #[test]
+    fn opacity_does_not_inherit() {
+        let sheet = css::parse("#wrap { opacity: 0.5 }");
+        let doc = html::parse(
+            r#"<html><body><div id="wrap"><span>t</span></div></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let span = elem(&doc, |e| e.tag == "span");
+        assert_eq!(map[&span].opacity, 1.0);
     }
 
     #[test]

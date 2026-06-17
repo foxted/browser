@@ -343,7 +343,7 @@ fn paint_gradient(fb: &mut Framebuffer) {
     }
 }
 
-/// Draw a left-anchored string with its baseline at `baseline_y`.
+/// Draw a left-anchored string with its baseline at `baseline_y`. Returns the final pen x.
 fn draw_text(
     fb: &mut Framebuffer,
     font: &dyn GlyphRasterizer,
@@ -352,7 +352,23 @@ fn draw_text(
     baseline_y: f32,
     px: f32,
     color: Color,
-) {
+) -> f32 {
+    draw_text_spaced(fb, font, text, x, baseline_y, px, color, 0.0)
+}
+
+/// Like [`draw_text`] but adds `letter_spacing` px to the pen after each character. Returns the
+/// final pen x (after the last glyph's advance + spacing), used to size text-decoration lines.
+#[allow(clippy::too_many_arguments)]
+fn draw_text_spaced(
+    fb: &mut Framebuffer,
+    font: &dyn GlyphRasterizer,
+    text: &str,
+    x: f32,
+    baseline_y: f32,
+    px: f32,
+    color: Color,
+    letter_spacing: f32,
+) -> f32 {
     let mut pen = x;
     for ch in text.chars() {
         if let Some(g) = font.rasterize(ch, px) {
@@ -371,7 +387,9 @@ fn draw_text(
         } else {
             pen += font.advance(ch, px);
         }
+        pen += letter_spacing;
     }
+    pen
 }
 
 /// A [`layout::TextMeasurer`] backed by our [`SystemFont`], so layout can size text without
@@ -431,8 +449,36 @@ fn paint_box(
     clip_bottom: f32,
     images: &HashMap<dom::NodeId, DecodedImage>,
 ) {
+    paint_box_opacity(fb, font, b, ox, oy, clip_top, clip_bottom, images, 1.0);
+}
+
+/// Scale a u8 alpha by an effective opacity in 0.0..=1.0.
+fn scale_alpha(a: u8, opacity: f32) -> u8 {
+    ((a as f32) * opacity.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8
+}
+
+/// Paint a box, multiplying every painted alpha by `effective_opacity` (the product of this
+/// box's and all ancestor `opacity` values). This approximates group opacity without an offscreen
+/// layer: each fill/blit/glyph is composited at the scaled alpha rather than the whole subtree
+/// being flattened first, so overlapping descendants may show seams — acceptable for our purposes.
+#[allow(clippy::too_many_arguments)]
+fn paint_box_opacity(
+    fb: &mut Framebuffer,
+    font: &dyn GlyphRasterizer,
+    b: &layout::LayoutBox,
+    ox: f32,
+    oy: f32,
+    clip_top: f32,
+    clip_bottom: f32,
+    images: &HashMap<dom::NodeId, DecodedImage>,
+    parent_opacity: f32,
+) {
+    // This box's opacity multiplies into the inherited (effective) opacity for itself + subtree.
+    let opacity = parent_opacity * b.style.opacity.clamp(0.0, 1.0);
+
     let border = b.dimensions.border_box();
     let content = b.dimensions.content;
+    let radius = b.style.border_radius;
     // Translate the box's vertical extent into device space for clipping.
     let top = border.y.min(content.y) + oy;
     let bottom = (border.y + border.height).max(content.y + content.height) + oy;
@@ -440,23 +486,30 @@ fn paint_box(
     // skip when even the box's lower edge is above the band, or its top is below it).
     let offscreen = bottom < clip_top || top >= clip_bottom;
 
-    if !offscreen {
-        // (a) Background fills the border box.
+    if !offscreen && opacity > 0.0 {
+        // (a) Background fills the border box (rounded if border-radius is set).
         if let Some((r, g, bl)) = b.style.background_color {
-            fb.fill_rect(rect_i(border.x + ox, border.y + oy, border.width, border.height),
-                         Color::rgb(r, g, bl));
+            let c = Color { r, g, b: bl, a: scale_alpha(255, opacity) };
+            fb.fill_round_rect(
+                rect_i(border.x + ox, border.y + oy, border.width, border.height),
+                radius,
+                c,
+            );
         }
 
-        // (b) Borders: four filled edge rects, each `border.<side>` thick.
+        // (b) Borders: four filled edge rects, each `border.<side>` thick. With a corner radius we
+        // approximate by rounding the outer outline (the inner straight edges still butt the
+        // background); the background corners are the visually dominant effect.
         let e = b.dimensions.border;
-        let bc = Color::rgb(b.style.border_color.0, b.style.border_color.1, b.style.border_color.2);
+        let ba = scale_alpha(255, opacity);
+        let bc = Color { r: b.style.border_color.0, g: b.style.border_color.1, b: b.style.border_color.2, a: ba };
         let bx = border.x + ox;
         let by = border.y + oy;
         if e.top > 0.0 {
-            fb.fill_rect(rect_i(bx, by, border.width, e.top), bc);
+            fb.fill_round_rect(rect_i(bx, by, border.width, e.top), radius.min(e.top.max(1.0)), bc);
         }
         if e.bottom > 0.0 {
-            fb.fill_rect(rect_i(bx, by + border.height - e.bottom, border.width, e.bottom), bc);
+            fb.fill_round_rect(rect_i(bx, by + border.height - e.bottom, border.width, e.bottom), radius.min(e.bottom.max(1.0)), bc);
         }
         if e.left > 0.0 {
             fb.fill_rect(rect_i(bx, by, e.left, border.height), bc);
@@ -468,10 +521,29 @@ fn paint_box(
         // (c) Text content, at the content rect's baseline. Don't paint into the console area.
         if let layout::BoxContent::Text(s) = &b.content {
             if content.y + oy < clip_bottom {
-                let color = Color::rgb(b.style.color.0, b.style.color.1, b.style.color.2);
+                let ta = scale_alpha(255, opacity);
+                let color = Color { r: b.style.color.0, g: b.style.color.1, b: b.style.color.2, a: ta };
                 let x = content.x + ox;
                 let baseline = content.y + oy + b.style.font_size * 0.8;
-                draw_run(fb, font, s, x, baseline, b.style.font_size, color, b.style.bold);
+                let end_x = draw_run(
+                    fb, font, s, x, baseline, b.style.font_size, color, b.style.bold,
+                    b.style.letter_spacing,
+                );
+                // (c2) text-decoration lines, drawn in the text color across the run width.
+                let run_w = (end_x - x).max(0.0);
+                if run_w > 0.0 {
+                    let thickness = (b.style.font_size / 14.0).clamp(1.0, 2.0).round().max(1.0) as i32;
+                    if b.style.underline {
+                        // Just below the baseline.
+                        let uy = (baseline + 1.0).round() as i32;
+                        fb.fill_rect(Rect { x: x.round() as i32, y: uy, w: run_w.round() as i32, h: thickness }, color);
+                    }
+                    if b.style.line_through {
+                        // Roughly the text mid-height (baseline is ~0.8 of em below content top).
+                        let my = (baseline - b.style.font_size * 0.3).round() as i32;
+                        fb.fill_rect(Rect { x: x.round() as i32, y: my, w: run_w.round() as i32, h: thickness }, color);
+                    }
+                }
             }
         }
 
@@ -480,10 +552,18 @@ fn paint_box(
             if content.y + oy < clip_bottom {
                 let dst = rect_i(content.x + ox, content.y + oy, content.width, content.height);
                 match images.get(node) {
-                    Some(img) => fb.blit_rgba(dst, &img.rgba, img.w, img.h),
+                    Some(img) if opacity >= 0.999 => fb.blit_rgba(dst, &img.rgba, img.w, img.h),
+                    Some(img) => {
+                        // Apply opacity by pre-scaling each source pixel's alpha.
+                        let mut scaled = img.rgba.clone();
+                        for px in scaled.chunks_exact_mut(4) {
+                            px[3] = scale_alpha(px[3], opacity);
+                        }
+                        fb.blit_rgba(dst, &scaled, img.w, img.h);
+                    }
                     None => {
                         // Missing / undecoded image: draw a faint placeholder border.
-                        let ph = Color { r: 140, g: 140, b: 150, a: 120 };
+                        let ph = Color { r: 140, g: 140, b: 150, a: scale_alpha(120, opacity) };
                         if dst.w > 0 && dst.h > 0 {
                             fb.fill_rect(Rect { x: dst.x, y: dst.y, w: dst.w, h: 1 }, ph);
                             fb.fill_rect(Rect { x: dst.x, y: dst.y + dst.h - 1, w: dst.w, h: 1 }, ph);
@@ -497,7 +577,7 @@ fn paint_box(
     }
 
     for child in &b.children {
-        paint_box(fb, font, child, ox, oy, clip_top, clip_bottom, images);
+        paint_box_opacity(fb, font, child, ox, oy, clip_top, clip_bottom, images, opacity);
     }
 }
 
@@ -843,7 +923,8 @@ fn percent_decode(s: &str) -> Vec<u8> {
 }
 
 /// Draw a single run at `(x, baseline)`. If `bold`, approximate bold by drawing each glyph
-/// twice with a 1px horizontal offset ("faux bold").
+/// twice with a 1px horizontal offset ("faux bold"). `letter_spacing` px is added per character.
+/// Returns the final pen x (end of the run), used to size text-decoration underlines.
 #[allow(clippy::too_many_arguments)]
 fn draw_run(
     fb: &mut Framebuffer,
@@ -854,11 +935,13 @@ fn draw_run(
     px: f32,
     color: Color,
     bold: bool,
-) {
-    draw_text(fb, font, text, x, baseline_y, px, color);
+    letter_spacing: f32,
+) -> f32 {
+    let end = draw_text_spaced(fb, font, text, x, baseline_y, px, color, letter_spacing);
     if bold {
-        draw_text(fb, font, text, x + 1.0, baseline_y, px, color);
+        draw_text_spaced(fb, font, text, x + 1.0, baseline_y, px, color, letter_spacing);
     }
+    end
 }
 
 /// One executable script slot in document order: an inline `<script>` body, or an external
@@ -1596,6 +1679,58 @@ mod tests {
         // The root box should exist; with the parallel layout stub it may have no children yet,
         // so only assert the path completed and the root carries the viewport width.
         assert!(root.dimensions.content.width >= 0.0);
+    }
+
+    #[test]
+    fn opacity_blends_background_over_gradient() {
+        // A full-viewport div with opacity:0.5 and a solid white background, painted over the
+        // dark gradient, must yield a lighter result than the same opaque div would *not* —
+        // simplest check: the opacity:0.5 render differs from the opacity:1 render, and the
+        // half-opacity pixel is between the gradient and full white.
+        struct M;
+        impl layout::TextMeasurer for M {
+            fn text_width(&self, t: &str, px: f32, _b: bool) -> f32 {
+                t.chars().count() as f32 * px * 0.5
+            }
+            fn line_height(&self, px: f32) -> f32 {
+                px * 1.3
+            }
+        }
+        struct NoFont;
+        impl GlyphRasterizer for NoFont {
+            fn rasterize(&self, _c: char, _p: f32) -> Option<paint::GlyphBitmap> {
+                None
+            }
+            fn advance(&self, _c: char, p: f32) -> f32 {
+                p * 0.5
+            }
+        }
+
+        let render_div = |opacity: &str| -> [u8; 3] {
+            let html = format!(
+                r#"<html><body><div style="height:100px; background-color:#ffffff; opacity:{opacity}"></div></body></html>"#
+            );
+            let doc = html::parse(&html);
+            let (sheets, _c) = collect_stylesheets(&doc, "https://example.com/");
+            let computed = style::cascade(&doc, &sheets);
+            let root = layout::layout_document(&doc, &computed, 100.0, 200.0, &M, &HashMap::new());
+            let mut fb = Framebuffer::new(100, 100);
+            paint_gradient(&mut fb);
+            let imgs: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+            paint_box(&mut fb, &NoFont, &root, 0.0, 0.0, 0.0, 200.0, &imgs);
+            // Sample a pixel inside the div.
+            let i = (50 * fb.stride + 50 * 4) as usize;
+            [fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2]]
+        };
+
+        let opaque = render_div("1");
+        let half = render_div("0.5");
+        // Opaque white background → near 255 everywhere.
+        assert!(opaque[0] > 240, "opaque white r={}", opaque[0]);
+        // Half opacity → blended with the dark gradient → noticeably darker than opaque white,
+        // but lighter than the bare gradient (which is < ~50).
+        assert!(half[0] < opaque[0], "half {:?} should be darker than opaque {:?}", half, opaque);
+        assert!(half[0] > 80, "half white over dark should still be fairly light, r={}", half[0]);
     }
 
     #[test]

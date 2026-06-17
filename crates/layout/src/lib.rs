@@ -61,7 +61,7 @@ fn expand(r: Rect, e: Edges) -> Rect {
 
 /// Everything the painter needs to draw a box, lifted out of the computed style so the
 /// painter never has to re-consult the style map.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PaintStyle {
     pub color: (u8, u8, u8),
     pub font_size: f32,
@@ -69,6 +69,38 @@ pub struct PaintStyle {
     pub italic: bool,
     pub background_color: Option<(u8, u8, u8)>,
     pub border_color: (u8, u8, u8),
+    /// Draw an underline under text runs (`text-decoration: underline`).
+    pub underline: bool,
+    /// Draw a strike-through line over text runs (`text-decoration: line-through`).
+    pub line_through: bool,
+    /// Per-box opacity (0.0..=1.0); the painter multiplies painted alpha by this (and threads it
+    /// to the subtree). 1.0 = fully opaque.
+    pub opacity: f32,
+    /// Uniform corner radius (px) for the background/border (0 = square).
+    pub border_radius: f32,
+    /// Extra px advance added per character (`letter-spacing`). Painter uses it to space glyphs.
+    pub letter_spacing: f32,
+    /// Resolved `line-height` in px (`None` = use the font metric). Drives inline line advance.
+    pub line_height: Option<f32>,
+}
+
+impl Default for PaintStyle {
+    fn default() -> Self {
+        PaintStyle {
+            color: (0, 0, 0),
+            font_size: 0.0,
+            bold: false,
+            italic: false,
+            background_color: None,
+            border_color: (0, 0, 0),
+            underline: false,
+            line_through: false,
+            opacity: 1.0,
+            border_radius: 0.0,
+            letter_spacing: 0.0,
+            line_height: None,
+        }
+    }
 }
 
 /// What a box contains.
@@ -178,6 +210,52 @@ fn style_of<'a>(
     styles: &'a HashMap<dom::NodeId, style::ComputedStyle>,
 ) -> Option<&'a style::ComputedStyle> {
     boxx.node.and_then(|n| styles.get(&n))
+}
+
+/// Clamp a used content `width` to the box's `[min-width, max-width]` (resolved against the
+/// containing block content width `cb_width`). `max-width` applies first per CSS, then
+/// `min-width` (so min wins on conflict). A box with no node leaves the width unchanged.
+fn clamp_width(
+    boxx: &LayoutBox,
+    width: f32,
+    cb_width: f32,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> f32 {
+    let cs = match style_of(boxx, styles) {
+        Some(cs) => cs,
+        None => return width,
+    };
+    let mut w = width;
+    if let Some(max) = cs.max_width {
+        w = w.min(max.resolve(cb_width));
+    }
+    if let Some(min) = cs.min_width {
+        w = w.max(min.resolve(cb_width));
+    }
+    w.max(0.0)
+}
+
+/// Clamp a used content `height` to the box's `[min-height, max-height]` (resolved against the
+/// containing block height `cb_height`). Percentages of an indefinite container height resolve
+/// against `cb_height` (which may be 0 → percentage min/max effectively unset).
+fn clamp_height(
+    boxx: &LayoutBox,
+    height: f32,
+    cb_height: f32,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> f32 {
+    let cs = match style_of(boxx, styles) {
+        Some(cs) => cs,
+        None => return height,
+    };
+    let mut h = height;
+    if let Some(max) = cs.max_height {
+        h = h.min(max.resolve(cb_height));
+    }
+    if let Some(min) = cs.min_height {
+        h = h.max(min.resolve(cb_height));
+    }
+    h.max(0.0)
 }
 
 /// The `display` mode of a box (defaults to Block for anonymous/root boxes).
@@ -307,6 +385,12 @@ fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         italic: cs.italic,
         background_color: cs.background_color,
         border_color: cs.border_color,
+        underline: cs.underline,
+        line_through: cs.line_through,
+        opacity: cs.opacity,
+        border_radius: cs.border_radius,
+        letter_spacing: cs.letter_spacing,
+        line_height: cs.line_height,
     }
 }
 
@@ -393,7 +477,11 @@ fn build_box(
             // Text nodes inherit paint info from the nearest element ancestor; the cascade
             // stores a style for elements only, so look up the parent element's style.
             let ps = nearest_element_style(doc, id, styles);
-            let tb = LayoutBox::new(BoxContent::Text(collapsed), ps, Some(id));
+            // Apply text-transform (inherited from the nearest element) to the rendered string so
+            // the transformed text is what gets measured + painted.
+            let transform = nearest_element_text_transform(doc, id, styles);
+            let transformed = apply_text_transform(&collapsed, transform);
+            let tb = LayoutBox::new(BoxContent::Text(transformed), ps, Some(id));
             out.push(tb);
         }
         dom::NodeData::Element(el) => {
@@ -473,6 +561,47 @@ fn nearest_element_style(
     PaintStyle::default()
 }
 
+/// Find the `text-transform` of the nearest element ancestor of a text node (defaults to None).
+fn nearest_element_text_transform(
+    doc: &dom::Document,
+    mut id: dom::NodeId,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> style::TextTransform {
+    while let Some(parent) = doc.get(id).parent {
+        if let Some(cs) = styles.get(&parent) {
+            return cs.text_transform;
+        }
+        id = parent;
+    }
+    style::TextTransform::None
+}
+
+/// Apply a CSS `text-transform` to a string. `Capitalize` upper-cases the first letter of each
+/// whitespace-separated word.
+fn apply_text_transform(s: &str, t: style::TextTransform) -> String {
+    match t {
+        style::TextTransform::None => s.to_string(),
+        style::TextTransform::Uppercase => s.to_uppercase(),
+        style::TextTransform::Lowercase => s.to_lowercase(),
+        style::TextTransform::Capitalize => {
+            let mut out = String::with_capacity(s.len());
+            let mut at_word_start = true;
+            for ch in s.chars() {
+                if ch.is_whitespace() {
+                    at_word_start = true;
+                    out.push(ch);
+                } else if at_word_start {
+                    out.extend(ch.to_uppercase());
+                    at_word_start = false;
+                } else {
+                    out.push(ch);
+                }
+            }
+            out
+        }
+    }
+}
+
 /// Collapse runs of ASCII whitespace into single spaces and trim the ends.
 fn collapse_whitespace(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -521,6 +650,8 @@ fn layout_block(
         Some(w) => w,
         None => (containing.width - horizontal).max(0.0),
     };
+    // Clamp the used width to min-width / max-width (resolved against the containing block).
+    let content_width = clamp_width(boxx, content_width, containing.width, styles);
 
     // Position: content origin sits inside the containing block, offset by left edges.
     let x = containing.x + margin.left + border.left + padding.left;
@@ -565,6 +696,8 @@ fn layout_block(
     };
 
     let final_height = explicit_h.unwrap_or(content_height);
+    // Clamp the used height to min-height / max-height (% against the containing block height).
+    let final_height = clamp_height(boxx, final_height, containing.height, styles);
     boxx.dimensions.content.height = final_height;
 
     // Resolve any out-of-flow children now that this box's geometry (and thus the containing
@@ -690,6 +823,8 @@ fn layout_out_of_flow(
         let avail = (cb.width - horizontal).max(0.0);
         (intrinsic - own_edges).max(0.0).min(avail)
     };
+    // Clamp to min/max-width against the containing block.
+    let content_width = clamp_width(boxx, content_width, cb.width, styles);
 
     // Tentative content origin: relative to the containing block's top-left, offset by insets.
     // The insets address the box's *margin* box edge; we then add the box's own left/top edges.
@@ -740,6 +875,7 @@ fn layout_out_of_flow(
         }
     };
     let final_height = cs.height.unwrap_or(content_height);
+    let final_height = clamp_height(boxx, final_height, cb.height, styles);
     boxx.dimensions.content.height = final_height;
 
     // If positioned by `bottom` (no `top`), re-anchor now that height is known.
@@ -851,7 +987,7 @@ fn intrinsic_width(
     if !words.is_empty() {
         let mut line_w = 0.0f32;
         for (i, w) in words.iter().enumerate() {
-            let ww = measurer.text_width(&w.text, w.style.font_size, w.style.bold);
+            let ww = run_width(measurer, &w.text, w.style.font_size, w.style.bold, w.style.letter_spacing);
             let sp = if i == 0 {
                 0.0
             } else {
@@ -1793,8 +1929,11 @@ fn layout_inline_children(
     let mut total_h = 0.0f32;
     for line in &lines {
         let line_font = if line.max_font_size > 0.0 { line.max_font_size } else { 16.0 };
-        let text_lh = measurer.line_height(line_font);
-        let lh = text_lh.max(line.height);
+        // The line advance is the tallest item's preferred line-height (its computed
+        // `line-height` if set, else the font metric — both already folded into `line.height`).
+        let lh = if line.height > 0.0 { line.height } else { measurer.line_height(line_font) };
+        // The emitted Text box's own height matches the line advance.
+        let text_lh = lh;
         let line_x = match align {
             TextAlignLocal::Left => content.x,
             TextAlignLocal::Center => content.x + (avail - line.width).max(0.0) / 2.0,
@@ -1820,8 +1959,9 @@ fn layout_inline_children(
         let flush = |run: &mut Option<Run>, out: &mut Vec<LayoutBox>| {
             if let Some(r) = run.take() {
                 let text = r.texts.join(" ");
+                let ls = r.style.letter_spacing;
                 let mut tb = LayoutBox::new(BoxContent::Text(text), r.style, r.node);
-                let w = measurer.text_width(&tb_text(&tb), line_font, false);
+                let w = run_width(measurer, &tb_text(&tb), line_font, false, ls);
                 tb.dimensions.content =
                     Rect { x: line_x + r.start_off, y, width: w, height: text_lh };
                 out.push(tb);
@@ -1867,6 +2007,16 @@ fn layout_inline_children(
     total_h
 }
 
+/// Advance width of a text run including `letter-spacing` (added once per character).
+fn run_width(measurer: &dyn TextMeasurer, text: &str, px: f32, bold: bool, letter_spacing: f32) -> f32 {
+    let base = measurer.text_width(text, px, bold);
+    if letter_spacing != 0.0 {
+        base + letter_spacing * text.chars().count() as f32
+    } else {
+        base
+    }
+}
+
 /// Helper to read the text out of a Text box (for measuring).
 fn tb_text(b: &LayoutBox) -> String {
     match &b.content {
@@ -1895,12 +2045,14 @@ enum InlineItem {
 }
 
 impl InlineItem {
-    /// Returns (advance_width, font_size, height, leads_with_space).
+    /// Returns (advance_width, font_size, height, leads_with_space). `height` is the item's
+    /// preferred line advance: the element's computed `line-height` if set, else the font metric.
     fn metrics(&self, measurer: &dyn TextMeasurer) -> (f32, f32, f32, bool) {
         match self {
             InlineItem::Word { text, style, .. } => {
-                let w = measurer.text_width(text, style.font_size, style.bold);
-                (w, style.font_size, measurer.line_height(style.font_size), true)
+                let w = run_width(measurer, text, style.font_size, style.bold, style.letter_spacing);
+                let lh = style.line_height.unwrap_or_else(|| measurer.line_height(style.font_size));
+                (w, style.font_size, lh, true)
             }
             InlineItem::Atomic(b) => {
                 let mb = b.dimensions.margin_box();
@@ -2106,6 +2258,140 @@ mod tests {
         assert_eq!(mb.y, 0.0);
         // content width = 800 - (margin 20 + border 4 + padding 10) = 766.
         assert_eq!(c.width, 766.0);
+    }
+
+    #[test]
+    fn max_width_clamps_box_in_wide_container() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let a = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                max_width: Some(style::SizeConstraint::Px(200.0)),
+                ..Default::default()
+            },
+        );
+
+        // Container is 1000 wide; the box must be clamped to 200.
+        let root_box = layout_document(&doc, &styles, 1000.0, 600.0, &Stub, &HashMap::new());
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        assert_eq!(abox.dimensions.content.width, 200.0);
+    }
+
+    #[test]
+    fn min_width_raises_small_box() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let a = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                width: Some(50.0),
+                min_width: Some(style::SizeConstraint::Px(120.0)),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        // min-width raises the 50px width to 120.
+        assert_eq!(abox.dimensions.content.width, 120.0);
+    }
+
+    #[test]
+    fn max_height_clamps_box_height() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let a = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            a,
+            style::ComputedStyle {
+                display_block: true,
+                height: Some(300.0),
+                max_height: Some(style::SizeConstraint::Px(100.0)),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
+        assert_eq!(abox.dimensions.content.height, 100.0);
+    }
+
+    #[test]
+    fn text_transform_uppercases_text_box_content() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("hello world".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            p,
+            style::ComputedStyle {
+                display_block: true,
+                text_transform: style::TextTransform::Uppercase,
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        let texts = collect_text_boxes(pbox);
+        let joined: String = texts
+            .iter()
+            .filter_map(|b| match &b.content {
+                BoxContent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(joined.contains("HELLO"), "got {joined:?}");
+        assert!(joined.contains("WORLD"), "got {joined:?}");
+    }
+
+    #[test]
+    fn line_height_changes_line_advance() {
+        // A single line of text with line-height 40px → the block's content height is 40 (one
+        // line), versus the default ~20.8 font metric.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("one".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            p,
+            style::ComputedStyle {
+                display_block: true,
+                line_height: Some(40.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+        assert!((pbox.dimensions.content.height - 40.0).abs() < 0.01,
+            "expected line advance 40, got {}", pbox.dimensions.content.height);
     }
 
     #[test]

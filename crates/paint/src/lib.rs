@@ -79,6 +79,79 @@ impl Framebuffer {
         }
     }
 
+    /// Source-over fill of an axis-aligned rect with rounded corners of `radius` px, clipped to
+    /// the framebuffer. The radius is clamped to half the smaller side. Pixels outside the
+    /// quarter-circle at each corner are skipped; a 1px anti-aliased band softens the corner edge
+    /// (coverage scaled by how far inside the circle the pixel center lies). A radius of 0 is a
+    /// plain [`fill_rect`](Self::fill_rect).
+    pub fn fill_round_rect(&mut self, rect: Rect, radius: f32, c: Color) {
+        if radius <= 0.0 {
+            self.fill_rect(rect, c);
+            return;
+        }
+        let r = radius.min(rect.w as f32 / 2.0).min(rect.h as f32 / 2.0).max(0.0);
+        if r <= 0.0 {
+            self.fill_rect(rect, c);
+            return;
+        }
+        let x0 = rect.x.max(0);
+        let y0 = rect.y.max(0);
+        let x1 = (rect.x + rect.w).min(self.width as i32);
+        let y1 = (rect.y + rect.h).min(self.height as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        // Corner circle centers (in device pixels), inset by the radius from each corner.
+        let left_cx = rect.x as f32 + r;
+        let right_cx = (rect.x + rect.w) as f32 - r;
+        let top_cy = rect.y as f32 + r;
+        let bottom_cy = (rect.y + rect.h) as f32 - r;
+        for y in y0..y1 {
+            let py = y as f32 + 0.5;
+            let row = (y as u32 * self.stride) as usize;
+            for x in x0..x1 {
+                let px = x as f32 + 0.5;
+                // Determine which corner region (if any) this pixel is in.
+                let cx = if px < left_cx {
+                    Some(left_cx)
+                } else if px > right_cx {
+                    Some(right_cx)
+                } else {
+                    None
+                };
+                let cy = if py < top_cy {
+                    Some(top_cy)
+                } else if py > bottom_cy {
+                    Some(bottom_cy)
+                } else {
+                    None
+                };
+                let coverage = match (cx, cy) {
+                    (Some(cx), Some(cy)) => {
+                        // In a corner: distance from the circle center, with 1px AA falloff.
+                        let dist = ((px - cx).powi(2) + (py - cy).powi(2)).sqrt();
+                        let edge = r - dist; // >0 inside, <0 outside
+                        if edge >= 0.5 {
+                            255
+                        } else if edge <= -0.5 {
+                            0
+                        } else {
+                            (((edge + 0.5) * 255.0).round()).clamp(0.0, 255.0) as u8
+                        }
+                    }
+                    // Straight edges / interior: fully covered.
+                    _ => 255,
+                };
+                if coverage == 0 {
+                    continue;
+                }
+                let i = row + (x as usize) * 4;
+                let cc = Color { a: ((c.a as u16 * coverage as u16) / 255) as u8, ..c };
+                blend_over(&mut self.pixels[i..i + 4], cc);
+            }
+        }
+    }
+
     /// Blit a decoded straight-alpha RGBA8 image into the destination rect `dst`, scaling with
     /// nearest-neighbour sampling and source-over compositing each pixel. `src` is
     /// `src_w * src_h * 4` bytes; out-of-range / empty inputs are ignored. The destination is
@@ -221,6 +294,41 @@ mod tests {
         fb.blit_rgba(Rect { x: 0, y: 0, w: 10, h: 10 }, &src, 1, 1);
         // ~50% white over black.
         assert!(fb.pixels[0] > 120 && fb.pixels[0] < 135);
+    }
+
+    #[test]
+    fn round_rect_corner_is_clear_center_filled() {
+        // A 16x16 rounded rect with a large radius. The very corner pixel is outside the
+        // quarter-circle (untouched black), while the center is fully filled.
+        let mut fb = Framebuffer::new(16, 16);
+        fb.clear(Color::BLACK);
+        fb.fill_round_rect(Rect { x: 0, y: 0, w: 16, h: 16 }, 8.0, Color::rgb(255, 0, 0));
+        let px = |x: usize, y: usize| {
+            let i = (y as u32 * fb.stride) as usize + x * 4;
+            &fb.pixels[i..i + 4]
+        };
+        // Top-left corner pixel: outside the circle → still black.
+        assert_eq!(px(0, 0), &[0, 0, 0, 255]);
+        // Center: fully red.
+        assert_eq!(px(8, 8), &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn round_rect_zero_radius_is_plain_fill() {
+        let mut fb = Framebuffer::new(4, 4);
+        fb.clear(Color::BLACK);
+        fb.fill_round_rect(Rect { x: 0, y: 0, w: 4, h: 4 }, 0.0, Color::rgb(10, 20, 30));
+        assert_eq!(&fb.pixels[0..4], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn opacity_scaled_fill_blends() {
+        // Filling with a half-alpha color over black yields ~50% gray (proves alpha scaling for
+        // the opacity-threading path, which pre-scales each fill's alpha).
+        let mut fb = Framebuffer::new(1, 1);
+        fb.clear(Color::BLACK);
+        fb.fill_rect(Rect { x: 0, y: 0, w: 1, h: 1 }, Color { r: 255, g: 255, b: 255, a: 128 });
+        assert!(fb.pixels[0] > 120 && fb.pixels[0] < 135, "got {}", fb.pixels[0]);
     }
 
     #[test]
