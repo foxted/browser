@@ -14,3 +14,6 @@ v8 = "150"
 dom = { path = "../dom" }
 # HTML parsing, so the `innerHTML` setter can build real child nodes from markup.
 html = { path = "../html" }
+# URL parsing/joining, so dynamic `import()` can resolve relative specifiers against the
+# importing module's canonical URL and fetch modules not in the pre-fetched static graph.
+url = "2"

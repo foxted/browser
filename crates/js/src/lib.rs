@@ -2783,15 +2783,60 @@ pub fn run_with_dom(
 // ES modules + dynamic import (run_modules). V8 handles modules natively; we wire resolution.
 // ---------------------------------------------------------------------------------------------
 
+/// Upper bound on the number of distinct modules (static + on-demand) we will ever compile in a
+/// single `run_modules` pass. Mirrors the engine's static-graph cap; the on-demand fetcher shares
+/// this budget so a runaway dynamic-import chain cannot fetch unboundedly.
+const MODULE_CAP: usize = 800;
+
 /// Registry of compiled modules + their (already canonicalized) source map, stored on the context
 /// slot so the bare-fn resolve/dynamic-import callbacks can recover it. Keyed by canonical URL.
 struct ModuleRegistry {
-    /// Canonical URL -> already-rewritten module source.
-    sources: HashMap<String, String>,
-    /// Canonical URL -> compiled module. Populated lazily (compile-on-resolve). Specifiers are
-    /// already canonical URLs (the engine rewrites them), so resolution is a direct lookup and no
-    /// referrer-relative bookkeeping is needed.
+    /// Canonical URL -> already-rewritten module source. Acts as a warm cache: the engine
+    /// pre-fetches the static graph into here, and on-demand fetches are inserted alongside so the
+    /// same dynamic module is only fetched once.
+    sources: RefCell<HashMap<String, String>>,
+    /// Canonical URL -> compiled module. Populated lazily (compile-on-resolve).
     compiled: RefCell<HashMap<String, v8::Global<v8::Module>>>,
+    /// `Module::get_identity_hash()` -> the canonical URL it was compiled under. Lets the resolve /
+    /// dynamic-import callbacks recover a referrer module's own URL so relative specifiers resolve
+    /// against the right base.
+    identity_to_url: RefCell<HashMap<i32, String>>,
+    /// On-demand fetcher for modules absent from `sources` (dynamic imports of non-pre-fetched
+    /// URLs). Called only on the isolate's own worker thread, so blocking inside it is fine.
+    fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+    /// Page/entry URL, used as the base for resolving specifiers when a referrer's own URL is
+    /// unknown (e.g. dynamic `import()` from a non-module classic context).
+    base_url: String,
+}
+
+impl ModuleRegistry {
+    /// Resolve `specifier` against `base` (a canonical URL) via `Url::join`. Returns the canonical
+    /// absolute URL, or `specifier` unchanged if neither parses (best-effort, never panics).
+    fn resolve_specifier(specifier: &str, base: &str) -> String {
+        if let Ok(base_url) = url::Url::parse(base) {
+            if let Ok(joined) = base_url.join(specifier) {
+                return joined.to_string();
+            }
+        }
+        // Fall back to the specifier itself (already absolute in the common pre-rewritten case).
+        url::Url::parse(specifier)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| specifier.to_string())
+    }
+
+    /// Obtain the source for a canonical URL: from the warm `sources` cache, or on demand via the
+    /// fetcher (which is then cached). Returns None if both miss or the cap is reached.
+    fn source_for(&self, url: &str) -> Option<String> {
+        if let Some(s) = self.sources.borrow().get(url) {
+            return Some(s.clone());
+        }
+        if self.sources.borrow().len() >= MODULE_CAP {
+            return None;
+        }
+        let fetched = (self.fetcher)(url)?;
+        self.sources.borrow_mut().insert(url.to_string(), fetched.clone());
+        Some(fetched)
+    }
 }
 
 /// Compile a module source under its canonical URL origin and register it. Returns the compiled
@@ -2825,27 +2870,62 @@ fn compile_and_register<'s>(
     let module = v8::script_compiler::compile_module(scope, &mut src)?;
     let global = v8::Global::new(scope, module);
     registry.compiled.borrow_mut().insert(url.to_string(), global);
+    // Record identity -> URL so the resolve/dynamic-import callbacks can recover this module's own
+    // canonical URL when resolving its relative specifiers.
+    registry.identity_to_url.borrow_mut().insert(module.get_identity_hash().get() as i32, url.to_string());
     Some(module)
 }
 
-/// Module resolution callback. The specifier is the already-canonical URL (the engine rewrote it),
-/// so we look it up directly in the registry, compiling on demand.
+/// Get-or-(fetch+compile) the module for a canonical URL: returns an already-compiled module, or
+/// fetches its source (warm cache then on-demand fetcher) and compiles it. None on miss/compile
+/// error (the latter leaves the exception on the TryCatch).
+fn get_or_compile<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    url: &str,
+) -> Option<v8::Local<'s, v8::Module>> {
+    let registry = scope.get_current_context().get_slot::<ModuleRegistry>()?;
+    if let Some(g) = registry.compiled.borrow().get(url) {
+        return Some(v8::Local::new(scope, g));
+    }
+    let source = registry.source_for(url)?;
+    compile_and_register(scope, url, &source)
+}
+
+/// Resolve a specifier against a referrer module's own URL. Looks the referrer up in the identity
+/// map (falling back to the registry's base/page URL), joins the specifier onto it, and returns the
+/// canonical absolute URL. Best-effort; never panics.
+fn resolve_against_referrer(
+    registry: &ModuleRegistry,
+    specifier: &str,
+    referrer_identity: Option<i32>,
+) -> String {
+    let base = referrer_identity
+        .and_then(|h| registry.identity_to_url.borrow().get(&h).cloned())
+        .unwrap_or_else(|| registry.base_url.clone());
+    ModuleRegistry::resolve_specifier(specifier, &base)
+}
+
+/// Module resolution callback (used during instantiation). We resolve the specifier against the
+/// referrer module's canonical URL, then get-or-(fetch+compile) the target. Instantiation recurses,
+/// so this transparently loads whole subtrees of dynamically-discovered modules.
 fn resolve_module_callback<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
     _import_attributes: v8::Local<'s, v8::FixedArray>,
-    _referrer: v8::Local<'s, v8::Module>,
+    referrer: v8::Local<'s, v8::Module>,
 ) -> Option<v8::Local<'s, v8::Module>> {
     v8::callback_scope!(unsafe scope, context);
-    let url = specifier.to_rust_string_lossy(scope);
-    let registry = scope.get_current_context().get_slot::<ModuleRegistry>()?;
-    if let Some(g) = registry.compiled.borrow().get(&url) {
-        return Some(v8::Local::new(scope, g));
-    }
-    let source = registry.sources.get(&url).cloned();
-    match source {
-        Some(src) => compile_and_register(scope, &url, &src),
+    let spec = specifier.to_rust_string_lossy(scope);
+    let referrer_identity = referrer.get_identity_hash().get() as i32;
+    let url = {
+        let registry = scope.get_current_context().get_slot::<ModuleRegistry>()?;
+        resolve_against_referrer(&registry, &spec, Some(referrer_identity))
+    };
+    match get_or_compile(scope, &url) {
+        Some(m) => Some(m),
         None => {
+            // Surface as a module error rather than panicking: throw so the caught exception
+            // propagates to the importing module's instantiation/evaluation.
             let msg = v8::String::new(scope, &format!("module not found: {url}")).unwrap();
             let exc = v8::Exception::type_error(scope, msg);
             scope.throw_exception(exc);
@@ -2854,22 +2934,34 @@ fn resolve_module_callback<'s>(
     }
 }
 
-/// Dynamic `import(specifier)` host callback. The specifier is already canonical. We resolve it
-/// from the registry (compiling, instantiating, and evaluating as needed) and resolve a promise
-/// with the module namespace; on failure we reject.
+/// Dynamic `import(specifier)` host callback. The specifier is resolved against the importing
+/// module's URL (recovered from the resource name) and then get-or-(fetch+compile)d on demand —
+/// this is what unblocks runtime imports of modules NOT in the pre-fetched static graph. We
+/// instantiate + evaluate, drain microtasks, and resolve the promise with the namespace; reject on
+/// any failure.
 fn dynamic_import_callback<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
-    _resource_name: v8::Local<'s, v8::Value>,
+    resource_name: v8::Local<'s, v8::Value>,
     specifier: v8::Local<'s, v8::String>,
     _import_attributes: v8::Local<'s, v8::FixedArray>,
 ) -> Option<v8::Local<'s, v8::Promise>> {
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
-    let url = specifier.to_rust_string_lossy(scope);
+    let spec = specifier.to_rust_string_lossy(scope);
 
-    let registry = match scope.get_current_context().get_slot::<ModuleRegistry>() {
-        Some(r) => r,
+    // The resource name is the importing module's canonical URL (its ScriptOrigin resource). Use it
+    // as the base for resolving the requested specifier; fall back to the registry's base URL.
+    let resource = if resource_name.is_string() {
+        Some(resource_name.to_rust_string_lossy(scope))
+    } else {
+        None
+    };
+    let url = match scope.get_current_context().get_slot::<ModuleRegistry>() {
+        Some(registry) => {
+            let base = resource.unwrap_or_else(|| registry.base_url.clone());
+            ModuleRegistry::resolve_specifier(&spec, &base)
+        }
         None => {
             let msg = v8::String::new(scope, "no module registry").unwrap();
             let exc = v8::Exception::error(scope, msg);
@@ -2878,16 +2970,10 @@ fn dynamic_import_callback<'s>(
         }
     };
 
-    // Compile-on-demand from the source map. Modules not in the provided graph reject.
+    // Get-or-(fetch+compile): warm cache, then on-demand fetch for non-pre-fetched URLs.
     let module = {
-        let existing = registry.compiled.borrow().get(&url).map(|g| v8::Local::new(scope, g));
-        match existing {
-            Some(m) => Some(m),
-            None => registry.sources.get(&url).cloned().and_then(|src| {
-                v8::tc_scope!(let tc, scope);
-                compile_and_register(tc, &url, &src)
-            }),
-        }
+        v8::tc_scope!(let tc, scope);
+        get_or_compile(tc, &url)
     };
 
     let module = match module {
@@ -2911,6 +2997,9 @@ fn dynamic_import_callback<'s>(
             Some(())
         }
     };
+    // Drain microtasks so the module's evaluation promise (top-level await) settles before we read
+    // its namespace/status.
+    scope.perform_microtask_checkpoint();
 
     match ok {
         Some(()) if module.get_status() != v8::ModuleStatus::Errored => {
@@ -2940,6 +3029,7 @@ pub fn run_modules(
     url: &str,
     entries: Vec<String>,
     modules: HashMap<String, String>,
+    fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
 ) -> (dom::Document, Vec<EvalOutput>) {
     let url = url.to_string();
     let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
@@ -2961,8 +3051,11 @@ pub fn run_modules(
                 let state = HostState::new(Rc::clone(&shared));
                 scope.get_current_context().set_slot(state);
                 let registry = Rc::new(ModuleRegistry {
-                    sources: modules,
+                    sources: RefCell::new(modules),
                     compiled: RefCell::new(HashMap::new()),
+                    identity_to_url: RefCell::new(HashMap::new()),
+                    fetcher,
+                    base_url: url.clone(),
                 });
                 scope.get_current_context().set_slot(registry);
                 install_browser_environment(scope, &url);
@@ -3019,7 +3112,7 @@ fn run_one_entry(scope: &mut v8::PinScope, entry: &str) -> EvalOutput {
     let error: Option<String> = {
         v8::tc_scope!(let tc, scope);
         let registry = tc.get_current_context().get_slot::<ModuleRegistry>();
-        let source = registry.as_ref().and_then(|r| r.sources.get(entry).cloned());
+        let source = registry.as_ref().and_then(|r| r.source_for(entry));
         match source {
             None => Some(format!("entry module not found: {entry}")),
             Some(src) => match compile_and_register(tc, entry, &src) {
@@ -3899,6 +3992,11 @@ mod tests {
         out.iter().flat_map(|o| o.console.clone()).collect()
     }
 
+    /// A fetcher that never serves anything (the static `modules` map is the only source).
+    fn no_fetch() -> Box<dyn Fn(&str) -> Option<String> + Send> {
+        Box::new(|_u: &str| None)
+    }
+
     #[test]
     fn two_module_graph_resolves_named_import() {
         let entry = "https://x/app.js".to_string();
@@ -3912,7 +4010,7 @@ mod tests {
         modules.insert(util, "export const v = 42;".to_string());
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "got 42"), "console was {console:?}");
@@ -3932,7 +4030,7 @@ mod tests {
         modules.insert(leaf, r#"export function hello() { return "chained"; }"#.to_string());
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "chained"), "console was {console:?}");
@@ -3949,7 +4047,7 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
         // Must not panic; the entry's evaluation surfaces an error.
         assert!(out.iter().any(|o| o.error.is_some()), "expected an error, got {out:?}");
     }
@@ -3963,7 +4061,7 @@ mod tests {
         modules.insert(dep, r#"console.log("side effect ran");"#.to_string());
 
         let (doc, _) = doc_with_body("");
-        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(
@@ -3983,13 +4081,41 @@ mod tests {
         );
 
         let (doc, _) = doc_with_body("orig");
-        let (doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let (doc, out) = run_modules(doc, "https://x/", vec![entry], modules, no_fetch());
         let console = all_console(&out);
         assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
         assert!(console.iter().any(|l| l == "title:from-module"), "console was {console:?}");
         // The mutation is visible in the returned document.
         let title = find_by_tag(&doc, doc.root(), "title").map(|n| text_content(&doc, n));
         assert_eq!(title.as_deref(), Some("from-module"));
+    }
+
+    #[test]
+    fn dynamic_import_of_on_demand_fetched_module_resolves() {
+        // Module A is in the pre-fetched map and dynamically imports B at runtime. B is provided
+        // ONLY by the fetcher (not in `modules`), simulating browserscore's per-feature modules
+        // computed at runtime. The dynamic import must resolve and B's export be observed.
+        let entry = "https://x/a.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"const m = await import("https://x/b.js"); console.log("dyn:" + m.answer);"#
+                .to_string(),
+        );
+
+        let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
+            if u == "https://x/b.js" {
+                Some("export const answer = 99;".to_string())
+            } else {
+                None
+            }
+        });
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules, fetcher);
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.iter().any(|l| l == "dyn:99"), "console was {console:?}");
     }
 
     // --- DOM interface globals + element identity / expandos -----------------------------

@@ -1479,7 +1479,12 @@ pub fn run_modules(doc: dom::Document, page_url: &str) -> (dom::Document, Vec<St
     if entries.is_empty() {
         return (doc, notes);
     }
-    let (doc, results) = js::run_modules(doc, page_url, entries, sources);
+    // On-demand fetcher for dynamic imports of modules not in the pre-fetched static graph.
+    // Called only on the JS isolate's own worker thread, so blocking `net::fetch` is fine here.
+    let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
+        net::fetch(u).ok().map(|r| String::from_utf8_lossy(&r.body).into_owned())
+    });
+    let (doc, results) = js::run_modules(doc, page_url, entries, sources, fetcher);
     let mut out = notes;
     for result in results {
         out.extend(result.console);
