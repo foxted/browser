@@ -2241,6 +2241,51 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   function makeRect() { return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: function () { return this; } }; }
 
+  // Split CSS source into top-level rules (brace-balanced), returning one normalized cssText per
+  // rule. Good enough for feature-detection libraries that read `styleEl.sheet.cssRules[i].cssText`.
+  function parseCssRules(css) {
+    css = String(css == null ? "" : css);
+    var rules = [], depth = 0, start = 0, i = 0, n = css.length;
+    for (; i < n; i++) {
+      var ch = css[i];
+      if (ch === "{") { depth++; }
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0) { var seg = css.slice(start, i + 1).trim(); if (seg) { rules.push(normalizeCssText(seg)); } start = i + 1; }
+      }
+      else if (ch === ";" && depth === 0) {
+        var s2 = css.slice(start, i + 1).trim(); if (s2) { rules.push(normalizeCssText(s2)); } start = i + 1;
+      }
+    }
+    var tail = css.slice(start).trim();
+    if (tail) { rules.push(normalizeCssText(tail + (depth > 0 ? "}" : ""))); }
+    return rules;
+  }
+  function normalizeCssText(t) {
+    // Collapse internal whitespace and normalize "{ }" spacing so equal rules compare equal.
+    t = String(t).replace(/\s+/g, " ").trim();
+    t = t.replace(/\s*{\s*/g, " { ").replace(/\s*}\s*/g, " }").replace(/\s*;\s*/g, "; ").trim();
+    return t;
+  }
+  function makeRule(text) {
+    return { cssText: text, type: 1, selectorText: (String(text).split("{")[0] || "").trim(),
+             cssRules: [], parentRule: null, parentStyleSheet: null };
+  }
+  function makeStyleSheet(styleEl) {
+    var ss = {
+      type: "text/css", disabled: false, href: null, title: null, media: { length: 0 },
+      ownerNode: styleEl, parentStyleSheet: null,
+      get cssRules() { var rs = parseCssRules(styleEl.textContent).map(makeRule); rs.item = function (i) { return this[i] || null; }; return rs; },
+      insertRule: function (rule, index) {
+        var t = styleEl.textContent || ""; styleEl.textContent = (index ? t : "") + String(rule) + (index ? "" : t); return index || 0;
+      },
+      deleteRule: function () {},
+      replaceSync: function (text) { styleEl.textContent = String(text); }
+    };
+    Object.defineProperty(ss, "rules", { get: function () { return this.cssRules; }, enumerable: false, configurable: true });
+    return ss;
+  }
+
   // --- per-node wrapper cache (stable identity + expando persistence) ----------------------
   // Native DOM methods/accessors return a FRESH wrapper object on every call (each carrying the
   // hidden `__node` id). Frameworks like Vue stash internal state directly on DOM nodes
@@ -2349,6 +2394,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         var d = Object.getOwnPropertyDescriptor(el, an);
         if (d && d.get) { var og = d.get; Object.defineProperty(el, an, { get: function () { var r = og.call(this); if (r && typeof r.length === "number") { for (var i = 0; i < r.length; i++) { r[i] = canon(r[i]); } } return r; }, configurable: true, enumerable: d.enumerable }); }
       })(listAccessors[ci]);
+    }
+
+    // <style> (and stylesheet <link>) expose a live CSSStyleSheet via `.sheet`.
+    if (typeof el.tagName === "string" && (el.tagName.toLowerCase() === "style" || el.tagName.toLowerCase() === "link") && !("sheet" in el)) {
+      var __sheet = null;
+      Object.defineProperty(el, "sheet", { get: function () { if (!__sheet) { __sheet = makeStyleSheet(this); } return __sheet; }, configurable: true, enumerable: false });
     }
 
     if (typeof el.getBoundingClientRect !== "function") { def(el, "getBoundingClientRect", makeRect); }
@@ -3844,6 +3895,20 @@ mod tests {
             out.value.as_deref(),
             Some("function,function,function,function,function,function,function,function,function,function,function,function|protos|true|true|true")
         );
+    }
+
+    #[test]
+    fn style_element_exposes_sheet_with_css_rules() {
+        // Feature-detection libs (e.g. browserscore) read `styleEl.sheet.cssRules[0].cssText`.
+        let out = env_eval(
+            "https://example.com/",
+            "var s = document.createElement('style'); \
+             document.documentElement.appendChild(s); \
+             s.textContent = 'a { color: red }'; \
+             [typeof s.sheet, s.sheet.cssRules.length, s.sheet.cssRules[0].cssText].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("object|1|a { color: red }"));
     }
 
     #[test]
