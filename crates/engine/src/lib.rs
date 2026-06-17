@@ -133,6 +133,10 @@ impl Engine {
                     Some(d) => {
                         let (d, script_console) = run_scripts(d, &base);
                         console.extend(script_console);
+                        // ES modules are deferred: run them after classic scripts, sharing the
+                        // same DOM. Builds + rewrites the module graph and executes it.
+                        let (d, module_console) = run_modules(d, &base);
+                        console.extend(module_console);
                         Some(d)
                     }
                     None => None,
@@ -985,9 +989,10 @@ pub enum ScriptSource {
 
 /// Walk the DOM in document order, classifying each *runnable* `<script>` element. Inline
 /// scripts contribute their text body; `<script src>` contribute the resolved absolute URL.
-/// Scripts with a non-JS `type` (e.g. `application/json`, `application/ld+json`, `module` —
-/// we don't support ES modules, so they're skipped) are omitted. Pure: unit-testable without
-/// network.
+/// Scripts with a non-JS `type` (e.g. `application/json`, `application/ld+json`) are omitted.
+/// `<script type="module">` is also skipped here — modules are collected separately by
+/// [`collect_module_entries`] and run (deferred) via [`run_modules`]. Pure: unit-testable
+/// without network.
 pub fn collect_script_sources(doc: &dom::Document, base: &str) -> Vec<ScriptSource> {
     fn is_js_type(ty: Option<&str>) -> bool {
         match ty {
@@ -1032,6 +1037,415 @@ pub fn collect_script_sources(doc: &dom::Document, base: &str) -> Vec<ScriptSour
     let mut out = Vec::new();
     walk(doc, doc.root(), base, &mut out);
     out
+}
+
+/// Maximum number of modules fetched per page's module graph (across all entries).
+const MAX_MODULES: usize = 400;
+/// Skip module sources larger than this (Vue's runtime is ~400 KiB; 16 MiB is generous).
+const MAX_MODULE_BYTES: usize = 16 * 1024 * 1024;
+
+/// One ES-module entry point in document order: an inline `<script type=module>` body (with the
+/// page URL as its base), or an external `<script type=module src>` whose `src` resolved to an
+/// absolute URL. Pure classification, no fetching.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModuleEntry {
+    /// Inline module source. The base URL for resolving its imports is the page URL.
+    Inline(String),
+    /// External module URL (already resolved to an absolute `http(s)`/`file` URL).
+    External(String),
+}
+
+/// Walk the DOM in document order, collecting `<script type="module">` elements (the ones
+/// [`collect_script_sources`] deliberately skips). Inline modules contribute their text body;
+/// external `<script type=module src>` contribute the resolved absolute URL. Pure: unit-testable
+/// without network.
+pub fn collect_module_entries(doc: &dom::Document, base: &str) -> Vec<ModuleEntry> {
+    fn is_module_type(ty: Option<&str>) -> bool {
+        matches!(ty, Some(t) if t.trim().eq_ignore_ascii_case("module"))
+    }
+    fn walk(doc: &dom::Document, id: dom::NodeId, base: &str, out: &mut Vec<ModuleEntry>) {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag == "script" {
+                if is_module_type(e.attrs.get("type").map(String::as_str)) {
+                    if let Some(src) = e.attrs.get("src") {
+                        if let Some(abs) = resolve_url(base, src) {
+                            out.push(ModuleEntry::External(abs));
+                        }
+                    } else {
+                        let mut source = String::new();
+                        for &child in &doc.get(id).children {
+                            if let dom::NodeData::Text(t) = &doc.get(child).data {
+                                source.push_str(t);
+                            }
+                        }
+                        out.push(ModuleEntry::Inline(source));
+                    }
+                }
+                return;
+            }
+        }
+        for &child in &doc.get(id).children {
+            walk(doc, child, base, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(doc, doc.root(), base, &mut out);
+    out
+}
+
+/// One import/export specifier found in a module's source: the byte range of the *quoted* string
+/// literal (including its quotes) plus the unquoted specifier text. Used to both resolve and
+/// rewrite specifiers in place.
+#[derive(Debug, PartialEq, Eq)]
+struct SpecifierRef {
+    /// Byte offset of the opening quote in the source.
+    start: usize,
+    /// Byte offset just past the closing quote.
+    end: usize,
+    /// The specifier string between the quotes (no quotes).
+    spec: String,
+}
+
+/// Tolerantly scan `src` for static, string-literal module specifiers in `import`/`export`
+/// statements and dynamic `import(...)` calls. Recognizes:
+///   - `import ... from 'spec'` / `import ... from "spec"`
+///   - `import 'spec'` (side-effect)
+///   - `export ... from 'spec'` / `export * from 'spec'`
+///   - `import('spec')` (dynamic, string-literal argument only)
+///
+/// This is a lexical scan, not a full parse: it skips line/block comments and string/template
+/// literals so the keywords/quotes inside them aren't mistaken for imports, then looks for the
+/// `from` / bare-import / `import(` patterns. Only static string literals are returned;
+/// computed dynamic imports (`import(expr)`) are ignored. Never panics.
+fn extract_specifiers(src: &str) -> Vec<SpecifierRef> {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    // Read a quoted string literal starting at the opening quote `b[i]`; returns (spec, end).
+    fn read_string(b: &[u8], i: usize) -> Option<(String, usize)> {
+        let quote = b[i];
+        let mut j = i + 1;
+        let mut s = Vec::new();
+        while j < b.len() {
+            let c = b[j];
+            if c == b'\\' {
+                // Keep escapes verbatim; specifiers rarely use them and we only need the URL form.
+                if j + 1 < b.len() {
+                    s.push(b[j + 1]);
+                    j += 2;
+                    continue;
+                }
+                return None;
+            }
+            if c == quote {
+                return Some((String::from_utf8_lossy(&s).into_owned(), j + 1));
+            }
+            if c == b'\n' {
+                return None; // unterminated single-line string
+            }
+            s.push(c);
+            j += 1;
+        }
+        None
+    }
+
+    // Is the byte at `p` a JS identifier char (so we can require word boundaries around keywords)?
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+
+    while i < n {
+        let c = b[i];
+        // Skip comments.
+        if c == b'/' && i + 1 < n && b[i + 1] == b'/' {
+            i += 2;
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(n);
+            continue;
+        }
+        // Skip string / template literals (so their contents aren't scanned for keywords).
+        if c == b'"' || c == b'\'' {
+            match read_string(b, i) {
+                Some((_, end)) => {
+                    i = end;
+                    continue;
+                }
+                None => {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+        if c == b'`' {
+            // Template literal: skip to the matching backtick, honoring escapes. Nested `${}` may
+            // contain backticks; we don't fully track them, but mismatches only cause us to miss a
+            // specifier, never to misrewrite one.
+            let mut j = i + 1;
+            while j < n {
+                if b[j] == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if b[j] == b'`' {
+                    break;
+                }
+                j += 1;
+            }
+            i = (j + 1).min(n);
+            continue;
+        }
+
+        // Match `import` or `export` keyword at a word boundary.
+        let is_import = b[i..].starts_with(b"import");
+        let word = if is_import || b[i..].starts_with(b"export") {
+            Some(6)
+        } else {
+            None
+        };
+        if let Some(kw_len) = word {
+            let before_ok = i == 0 || !is_ident(b[i - 1]);
+            let after = i + kw_len;
+            let after_ok = after >= n || !is_ident(b[after]);
+            if before_ok && after_ok {
+                // Dynamic `import(...)`: skip whitespace after the keyword, expect `(`.
+                if is_import {
+                    let mut k = after;
+                    while k < n && b[k].is_ascii_whitespace() {
+                        k += 1;
+                    }
+                    if k < n && b[k] == b'(' {
+                        k += 1;
+                        while k < n && b[k].is_ascii_whitespace() {
+                            k += 1;
+                        }
+                        if k < n && (b[k] == b'"' || b[k] == b'\'') {
+                            if let Some((spec, end)) = read_string(b, k) {
+                                out.push(SpecifierRef { start: k, end, spec });
+                                i = end;
+                                continue;
+                            }
+                        }
+                        i = after;
+                        continue;
+                    }
+                }
+                // Static import/export. For a bare side-effect `import 'spec'`, the next non-space
+                // token is the string itself. Otherwise the specifier follows a `from` keyword,
+                // bounded by the statement terminator (`;`) or end of source.
+                if is_import {
+                    let mut p = after;
+                    while p < n && b[p].is_ascii_whitespace() {
+                        p += 1;
+                    }
+                    if p < n && (b[p] == b'"' || b[p] == b'\'') {
+                        if let Some((spec, end)) = read_string(b, p) {
+                            out.push(SpecifierRef { start: p, end, spec });
+                            i = end;
+                            continue;
+                        }
+                    }
+                }
+                // Scan to a `from` keyword (bounded by the next `;`), then read the string after it.
+                let stmt_end = b[after..]
+                    .iter()
+                    .position(|&c| c == b';')
+                    .map(|off| after + off)
+                    .unwrap_or(n);
+                let mut k = after;
+                let mut matched = false;
+                while k < stmt_end {
+                    if b[k..].starts_with(b"from")
+                        && (k == 0 || !is_ident(b[k - 1]))
+                        && (k + 4 >= n || !is_ident(b[k + 4]))
+                    {
+                        let mut p = k + 4;
+                        while p < stmt_end && b[p].is_ascii_whitespace() {
+                            p += 1;
+                        }
+                        if p < stmt_end && (b[p] == b'"' || b[p] == b'\'') {
+                            if let Some((spec, end)) = read_string(b, p) {
+                                out.push(SpecifierRef { start: p, end, spec });
+                                i = end;
+                                matched = true;
+                                break;
+                            }
+                        }
+                    }
+                    k += 1;
+                }
+                if !matched {
+                    i = after;
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Classify a specifier for module resolution.
+fn is_bare_specifier(spec: &str) -> bool {
+    let s = spec.trim();
+    if s.starts_with("./") || s.starts_with("../") || s.starts_with('/') {
+        return false;
+    }
+    // A scheme like `http:`/`https:`/`file:` makes it absolute, not bare.
+    !matches!(
+        s.split_once(':'),
+        Some((scheme, _)) if scheme.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+            && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    )
+}
+
+/// Build the page's ES-module graph by fetching the entries and every transitively-imported
+/// module, rewriting each module's import/export specifiers to the canonical absolute URL it was
+/// fetched under. Returns the entry canonical URLs (document order), a `url -> rewritten source`
+/// map, and console notes for skipped bare imports / failed loads.
+///
+/// `inline_counter` produces a synthetic unique URL for each inline `<script type=module>` so the
+/// loader can key it; its imports resolve against the page URL.
+pub fn collect_module_graph(
+    doc: &dom::Document,
+    page_url: &str,
+) -> (Vec<String>, HashMap<String, String>, Vec<String>) {
+    let entries_raw = collect_module_entries(doc, page_url);
+    if entries_raw.is_empty() {
+        return (Vec::new(), HashMap::new(), Vec::new());
+    }
+
+    let mut sources: HashMap<String, String> = HashMap::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut entry_urls: Vec<String> = Vec::new();
+    // Work queue of (canonical url, base url for resolving its imports) modules to process.
+    let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    // Raw (un-rewritten) sources fetched so far, keyed by canonical url, with the base for imports.
+    let mut raw: HashMap<String, String> = HashMap::new();
+
+    let mut inline_idx = 0usize;
+    for entry in entries_raw {
+        match entry {
+            ModuleEntry::Inline(src) => {
+                let url = format!("{page_url}#inline-module-{inline_idx}");
+                inline_idx += 1;
+                entry_urls.push(url.clone());
+                raw.insert(url.clone(), src);
+                queue.push_back(url);
+            }
+            ModuleEntry::External(url) => {
+                if entry_urls.contains(&url) || raw.contains_key(&url) {
+                    if !entry_urls.contains(&url) {
+                        entry_urls.push(url);
+                    }
+                    continue;
+                }
+                entry_urls.push(url.clone());
+                queue.push_back(url);
+            }
+        }
+    }
+
+    // BFS the graph, fetching each new module once. Inline entries are already in `raw`.
+    while let Some(url) = queue.pop_front() {
+        if sources.len() >= MAX_MODULES {
+            notes.push(format!("[skipped module (limit {MAX_MODULES} reached): {url}]"));
+            continue;
+        }
+        // Fetch the source unless it's an inline entry already present in `raw`.
+        let body = if let Some(src) = raw.remove(&url) {
+            src
+        } else if url.contains("#inline-module-") {
+            // Already-consumed inline; nothing to fetch.
+            continue;
+        } else {
+            match net::fetch(&url) {
+                Ok(resp) if resp.body.len() > MAX_MODULE_BYTES => {
+                    notes.push(format!("[skipped large module: {} ({} bytes)]", url, resp.body.len()));
+                    continue;
+                }
+                Ok(resp) => String::from_utf8_lossy(&resp.body).into_owned(),
+                Err(e) => {
+                    notes.push(format!("[failed to load module: {url} — {e}]"));
+                    continue;
+                }
+            }
+        };
+
+        // The base for resolving this module's imports: an inline entry uses the page URL; a
+        // fetched module uses its own canonical URL.
+        let base = if url.contains("#inline-module-") { page_url } else { &url };
+
+        // Extract specifiers, then rewrite each in place (right-to-left so earlier byte offsets
+        // stay valid) to the resolved canonical URL. Enqueue newly-discovered modules.
+        let specs = extract_specifiers(&body);
+        let mut rewritten = body.clone();
+        // Resolve first (left-to-right) so notes read in source order, collecting replacements.
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+        for s in &specs {
+            if is_bare_specifier(&s.spec) {
+                notes.push(format!("[skipped bare import: {}]", s.spec));
+                continue;
+            }
+            let resolved = match url::Url::parse(base).ok().and_then(|b| b.join(s.spec.trim()).ok()) {
+                Some(u) => u.to_string(),
+                None => {
+                    notes.push(format!("[failed to resolve import: {} (in {url})]", s.spec));
+                    continue;
+                }
+            };
+            // Only http(s)/file modules are loadable; others (data:, etc.) are skipped.
+            let scheme = resolved.split(':').next().unwrap_or("");
+            if !matches!(scheme, "http" | "https" | "file") {
+                notes.push(format!("[skipped non-loadable import: {}]", s.spec));
+                continue;
+            }
+            // Replace the quoted specifier (keep the original quote characters).
+            let quote = &body[s.start..s.start + 1];
+            let replacement = format!("{quote}{resolved}{quote}");
+            replacements.push((s.start, s.end, replacement));
+            if !sources.contains_key(&resolved) && resolved != url && !queue.contains(&resolved) {
+                queue.push_back(resolved);
+            }
+        }
+        // Apply replacements right-to-left so byte offsets remain valid.
+        replacements.sort_by(|a, b| b.0.cmp(&a.0));
+        for (start, end, rep) in replacements {
+            rewritten.replace_range(start..end, &rep);
+        }
+
+        sources.insert(url, rewritten);
+    }
+
+    (entry_urls, sources, notes)
+}
+
+/// Run the page's ES modules (deferred — after classic scripts). Builds the module graph
+/// (fetch + rewrite via [`collect_module_graph`]) and executes it through [`js::run_modules`] so
+/// modules share the same DOM-wired `document`/`window` classic scripts use. Returns the mutated
+/// document plus console/error/note lines (errors prefixed `⚠`).
+pub fn run_modules(doc: dom::Document, page_url: &str) -> (dom::Document, Vec<String>) {
+    let (entries, sources, notes) = collect_module_graph(&doc, page_url);
+    if entries.is_empty() {
+        return (doc, notes);
+    }
+    let (doc, results) = js::run_modules(doc, page_url, entries, sources);
+    let mut out = notes;
+    for result in results {
+        out.extend(result.console);
+        if let Some(err) = result.error {
+            out.push(format!("⚠ {err}"));
+        }
+    }
+    (doc, out)
 }
 
 /// Collect the page's scripts in document order — inline `<script>` bodies and external
@@ -1862,5 +2276,98 @@ mod tests {
         assert_eq!(fb.width, 400);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- ES module collection / import extraction / specifier rewrite -------------------
+
+    #[test]
+    fn collect_module_entries_picks_module_scripts() {
+        let doc = html::parse(
+            r#"<html><body>
+                 <script src="/classic.js"></script>
+                 <script type="module" src="/app.js"></script>
+                 <script type="module">import "./side.js";</script>
+               </body></html>"#,
+        );
+        let entries = collect_module_entries(&doc, "https://x.com/page/");
+        assert_eq!(entries.len(), 2, "classic script must be excluded: {entries:?}");
+        assert_eq!(entries[0], ModuleEntry::External("https://x.com/app.js".to_string()));
+        assert!(matches!(&entries[1], ModuleEntry::Inline(s) if s.contains("./side.js")));
+        // Classic scripts are NOT collected as modules.
+        let classic = collect_script_sources(&doc, "https://x.com/page/");
+        assert!(classic.iter().any(|s| matches!(s, ScriptSource::External(u) if u.ends_with("classic.js"))));
+        // ...and the module scripts are skipped by the classic collector.
+        assert!(!classic.iter().any(|s| matches!(s, ScriptSource::External(u) if u.ends_with("app.js"))));
+    }
+
+    #[test]
+    fn extract_specifiers_handles_all_forms() {
+        let src = r#"
+            import { a, b } from "./util.js";
+            import def from '../lib/x.js';
+            import "./side-effect.js";
+            export { c } from "./reexp.js";
+            export * from "./all.js";
+            const lazy = import("./dyn.js");
+            // import "./comment.js";
+            const s = "import 'not-real.js'";
+        "#;
+        let specs = extract_specifiers(src);
+        let found: Vec<&str> = specs.iter().map(|s| s.spec.as_str()).collect();
+        assert_eq!(
+            found,
+            vec![
+                "./util.js",
+                "../lib/x.js",
+                "./side-effect.js",
+                "./reexp.js",
+                "./all.js",
+                "./dyn.js",
+            ],
+            "got {found:?}"
+        );
+        // Comment and string-literal occurrences must NOT be extracted.
+        assert!(!found.contains(&"./comment.js"));
+        assert!(!found.contains(&"not-real.js"));
+    }
+
+    #[test]
+    fn bare_specifier_classification() {
+        assert!(is_bare_specifier("vue"));
+        assert!(is_bare_specifier("@vue/runtime-core"));
+        assert!(is_bare_specifier("lodash/merge"));
+        assert!(!is_bare_specifier("./local.js"));
+        assert!(!is_bare_specifier("../up.js"));
+        assert!(!is_bare_specifier("/abs.js"));
+        assert!(!is_bare_specifier("https://x/y.js"));
+        assert!(!is_bare_specifier("file:///a.js"));
+    }
+
+    #[test]
+    fn collect_module_graph_rewrites_inline_entry_specifiers_to_canonical_urls() {
+        // An inline module importing a relative specifier should be rewritten to an absolute URL,
+        // and a bare specifier should be skipped with a note. No network: the relative import
+        // points at a file:// path so the fetch would fail, but we only assert the rewrite/notes
+        // on the inline entry source which is in the map already.
+        let doc = html::parse(
+            r#"<html><body><script type="module">
+                 import { x } from "./dep.js";
+                 import vue from "vue";
+                 console.log(x);
+               </script></body></html>"#,
+        );
+        let (entries, sources, notes) = collect_module_graph(&doc, "https://site.test/app/");
+        assert_eq!(entries.len(), 1);
+        let entry_src = sources.get(&entries[0]).expect("entry source present");
+        // Relative specifier rewritten to its canonical absolute URL.
+        assert!(
+            entry_src.contains("https://site.test/app/dep.js"),
+            "expected rewritten dep url in {entry_src:?}"
+        );
+        // The bare `vue` import is recorded as skipped (and left intact / unresolved).
+        assert!(
+            notes.iter().any(|n| n.contains("[skipped bare import: vue]")),
+            "expected bare-import note, got {notes:?}"
+        );
     }
 }

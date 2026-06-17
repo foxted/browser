@@ -5,13 +5,16 @@
 //! `paint`/fontdue. Nothing outside this crate knows Boa exists.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use boa_engine::{
+    builtins::promise::PromiseState,
     js_string,
+    module::{ModuleLoader, Referrer},
     object::{builtins::JsArray, ObjectInitializer},
     property::Attribute,
-    Context, JsObject, JsResult, JsValue, NativeFunction, Source,
+    Context, JsObject, JsResult, JsString, JsValue, Module, NativeFunction, Source,
 };
 
 /// A JS execution result: the value rendered as a string (if any) plus any console output
@@ -152,11 +155,7 @@ pub fn run_with_dom(
 
             let mut context = Context::default();
             let console = Rc::new(RefCell::new(Vec::new()));
-            install_console(&mut context, &console);
-            install_globals(&mut context);
-            install_document(&mut context, &shared);
-            install_timers(&mut context);
-            install_browser_env(&mut context, &url);
+            install_browser_environment(&mut context, &console, &shared, &url);
 
             let mut results = Vec::with_capacity(sources.len());
             for source in &sources {
@@ -207,6 +206,203 @@ pub fn run_with_dom(
                     error: Some("script execution aborted (panic in JS engine)".to_string()),
                 };
                 count.max(1)
+            ];
+            (dom::Document::new(), results)
+        }),
+        Err(e) => (
+            dom::Document::new(),
+            vec![EvalOutput {
+                value: None,
+                console: Vec::new(),
+                error: Some(format!("could not start JS worker thread: {e}")),
+            }],
+        ),
+    }
+}
+
+/// Install the full DOM-aware "browser environment" into `context`: console capture, the
+/// `window`/`self`/`globalThis` aliases, the DOM-wired `document` (with write-through), the
+/// timer/event-loop APIs, and the navigator/location/etc. bootstrap. Shared by both
+/// [`run_with_dom`] (classic scripts) and [`run_modules`] (ES modules) so modules see the same
+/// `document`/`window` globals page scripts do. Order matters: `install_globals` must precede
+/// `install_browser_env` (which overwrites the minimal `location` and patches `document`).
+fn install_browser_environment(
+    context: &mut Context,
+    console: &Rc<RefCell<Vec<String>>>,
+    shared: &SharedDoc,
+    url: &str,
+) {
+    install_console(context, console);
+    install_globals(context);
+    install_document(context, shared);
+    install_timers(context);
+    install_browser_env(context, url);
+}
+
+/// A map-backed ES module loader. The engine has already rewritten every import/export specifier
+/// in each module's source to its **canonical absolute URL**, so this loader does no
+/// referrer-relative resolution: the `specifier` it receives *is* the canonical URL, and it is
+/// looked up directly in `sources`. Parsed [`Module`]s are cached by URL so a module imported from
+/// several places is parsed once (and cycles terminate).
+///
+/// GC soundness: the cached `Module`s are `Trace`-able Boa values, but they live behind an `Rc`
+/// owned by the loader (which Boa itself owns via `Context`), not captured into any
+/// `NativeFunction::from_closure`. The source `HashMap` holds only `String`s.
+struct MapLoader {
+    sources: HashMap<String, String>,
+    cache: RefCell<HashMap<String, Module>>,
+}
+
+impl ModuleLoader for MapLoader {
+    async fn load_imported_module(
+        self: Rc<Self>,
+        _referrer: Referrer,
+        specifier: JsString,
+        context: &RefCell<&mut Context>,
+    ) -> JsResult<Module> {
+        let key = specifier.to_std_string_escaped();
+        if let Some(m) = self.cache.borrow().get(&key) {
+            return Ok(m.clone());
+        }
+        let src = match self.sources.get(&key) {
+            Some(s) => s.clone(),
+            None => {
+                return Err(boa_engine::JsNativeError::typ()
+                    .with_message(format!("module not found: {key}"))
+                    .into());
+            }
+        };
+        let module = {
+            let mut ctx = context.borrow_mut();
+            Module::parse(Source::from_bytes(src.as_bytes()), None, &mut ctx)?
+        };
+        self.cache
+            .borrow_mut()
+            .insert(key, module.clone());
+        Ok(module)
+    }
+}
+
+/// Run the ES module graph for a page. `entries` are the canonical URLs of the entry modules in
+/// document order; `modules` maps every canonical module URL to its **already-rewritten** source
+/// (every import/export specifier replaced with its canonical URL). Returns the (possibly mutated)
+/// document plus one [`EvalOutput`] per entry (console output is folded into the last entry's
+/// output, the same way [`run_with_dom`] folds drain output).
+///
+/// Runs on the same 1 GiB-stack worker thread as [`run_with_dom`] (Boa's recursive-descent parser
+/// overflows small stacks on real-world minified JS — Vue is ~400 KB). The browser environment is
+/// installed identically via [`install_browser_environment`], so modules see `document`/`window`.
+pub fn run_modules(
+    doc: dom::Document,
+    url: &str,
+    entries: Vec<String>,
+    modules: HashMap<String, String>,
+) -> (dom::Document, Vec<EvalOutput>) {
+    let count = entries.len().max(1);
+    let url = url.to_string();
+    let worker = std::thread::Builder::new()
+        .name("js-modules".to_string())
+        .stack_size(1024 * 1024 * 1024)
+        .spawn(move || {
+            let shared: SharedDoc = Rc::new(RefCell::new(doc));
+
+            let loader = Rc::new(MapLoader { sources: modules, cache: RefCell::new(HashMap::new()) });
+            let loader_ref = Rc::clone(&loader);
+            let mut context = match Context::builder().module_loader(loader).build() {
+                Ok(c) => c,
+                Err(e) => {
+                    let doc = Rc::try_unwrap(shared)
+                        .map(RefCell::into_inner)
+                        .unwrap_or_else(|rc| rc.borrow().clone());
+                    return (
+                        doc,
+                        vec![EvalOutput {
+                            value: None,
+                            console: Vec::new(),
+                            error: Some(format!("could not build module context: {e}")),
+                        }],
+                    );
+                }
+            };
+
+            let console = Rc::new(RefCell::new(Vec::new()));
+            install_browser_environment(&mut context, &console, &shared, &url);
+
+            // Parse + kick off load/link/evaluate for every entry module, collecting the returned
+            // promises so we can inspect their final state after the event loop drains.
+            let mut results: Vec<EvalOutput> = Vec::with_capacity(entries.len());
+            let mut promises: Vec<(usize, boa_engine::object::builtins::JsPromise)> = Vec::new();
+            for (i, entry) in entries.iter().enumerate() {
+                console.borrow_mut().clear();
+                // Reuse an already-parsed module if a previous entry imported it; otherwise parse
+                // from the source map and seed the cache so transitive imports dedup against it.
+                let cached = loader_ref.cache.borrow().get(entry).cloned();
+                let parsed = match cached {
+                    Some(m) => Ok(m),
+                    None => match loader_ref.sources.get(entry).cloned() {
+                        Some(src) => Module::parse(Source::from_bytes(src.as_bytes()), None, &mut context),
+                        None => {
+                            results.push(EvalOutput {
+                                value: None,
+                                console: std::mem::take(&mut *console.borrow_mut()),
+                                error: Some(format!("entry module not found: {entry}")),
+                            });
+                            continue;
+                        }
+                    },
+                };
+                match parsed {
+                    Ok(module) => {
+                        loader_ref.cache.borrow_mut().insert(entry.clone(), module.clone());
+                        let promise = module.load_link_evaluate(&mut context);
+                        promises.push((i, promise));
+                        results.push(EvalOutput {
+                            value: None,
+                            console: std::mem::take(&mut *console.borrow_mut()),
+                            error: None,
+                        });
+                    }
+                    Err(err) => results.push(EvalOutput {
+                        value: None,
+                        console: std::mem::take(&mut *console.borrow_mut()),
+                        error: Some(err.to_string()),
+                    }),
+                }
+            }
+
+            // Drive the event loop so module top-level await, promise jobs, microtasks, timers,
+            // and the DOM lifecycle events all run to completion (or the safety cap).
+            drain_event_loop(&mut context, &console, &mut results);
+
+            // Surface any module that finished rejected (load/link/evaluate failure).
+            for (i, promise) in promises {
+                if let PromiseState::Rejected(reason) = promise.state() {
+                    let msg = render_value(&reason, &mut context);
+                    if let Some(slot) = results.get_mut(i) {
+                        if slot.error.is_none() {
+                            slot.error = Some(msg);
+                        }
+                    }
+                }
+            }
+
+            drop(context);
+            let doc = match Rc::try_unwrap(shared) {
+                Ok(cell) => cell.into_inner(),
+                Err(rc) => rc.borrow().clone(),
+            };
+            (doc, results)
+        });
+
+    match worker {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            let results = vec![
+                EvalOutput {
+                    value: None,
+                    console: Vec::new(),
+                    error: Some("module execution aborted (panic in JS engine)".to_string()),
+                };
+                count
             ];
             (dom::Document::new(), results)
         }),
@@ -3262,5 +3458,105 @@ mod tests {
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
         assert!(all.iter().any(|l| l == "dcl:interactive"), "got {all:?}");
         assert!(all.iter().any(|l| l == "load:complete"), "got {all:?}");
+    }
+
+    // --- ES modules (`run_modules`) -----------------------------------------------------
+
+    /// Collect every console line across all of `run_modules`'s outputs.
+    fn all_console(out: &[EvalOutput]) -> Vec<String> {
+        out.iter().flat_map(|o| o.console.clone()).collect()
+    }
+
+    #[test]
+    fn two_module_graph_resolves_named_import() {
+        let entry = "https://x/app.js".to_string();
+        let util = "https://x/util.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        // Specifiers are pre-canonicalized (the engine rewrites them to absolute URLs).
+        modules.insert(
+            entry.clone(),
+            r#"import { v } from "https://x/util.js"; console.log("got", v);"#.to_string(),
+        );
+        modules.insert(util, "export const v = 42;".to_string());
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.iter().any(|l| l == "got 42"), "console was {console:?}");
+    }
+
+    #[test]
+    fn export_from_reexport_chain_resolves() {
+        let entry = "https://x/app.js".to_string();
+        let mid = "https://x/mid.js".to_string();
+        let leaf = "https://x/leaf.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"import { hello } from "https://x/mid.js"; console.log(hello());"#.to_string(),
+        );
+        modules.insert(mid, r#"export * from "https://x/leaf.js";"#.to_string());
+        modules.insert(leaf, r#"export function hello() { return "chained"; }"#.to_string());
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.iter().any(|l| l == "chained"), "console was {console:?}");
+    }
+
+    #[test]
+    fn missing_module_surfaces_error_without_panic() {
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        // Imports a module that isn't present in the map.
+        modules.insert(
+            entry.clone(),
+            r#"import { gone } from "https://x/missing.js"; console.log(gone);"#.to_string(),
+        );
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        // Must not panic; the entry's evaluation surfaces an error.
+        assert!(out.iter().any(|o| o.error.is_some()), "expected an error, got {out:?}");
+    }
+
+    #[test]
+    fn side_effect_import_runs_imported_module() {
+        let entry = "https://x/app.js".to_string();
+        let dep = "https://x/dep.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(entry.clone(), r#"import "https://x/dep.js";"#.to_string());
+        modules.insert(dep, r#"console.log("side effect ran");"#.to_string());
+
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(
+            console.iter().any(|l| l == "side effect ran"),
+            "console was {console:?}"
+        );
+    }
+
+    #[test]
+    fn modules_see_document_global() {
+        // A module can touch the shared DOM-wired `document`/`window`, like page scripts.
+        let entry = "https://x/app.js".to_string();
+        let mut modules = std::collections::HashMap::new();
+        modules.insert(
+            entry.clone(),
+            r#"document.title = "from-module"; console.log("title:" + document.title);"#.to_string(),
+        );
+
+        let (doc, _) = doc_with_body("orig");
+        let (doc, out) = run_modules(doc, "https://x/", vec![entry], modules);
+        let console = all_console(&out);
+        assert!(out.iter().all(|o| o.error.is_none()), "errors: {out:?}");
+        assert!(console.iter().any(|l| l == "title:from-module"), "console was {console:?}");
+        // The mutation is visible in the returned document.
+        let title = find_by_tag(&doc, doc.root(), "title").map(|n| text_content(&doc, n));
+        assert_eq!(title.as_deref(), Some("from-module"));
     }
 }

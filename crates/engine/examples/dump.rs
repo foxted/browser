@@ -20,12 +20,39 @@ fn main() {
     let (doc, console) = engine::run_scripts(doc, &base);
     let errs: Vec<&String> = console.iter().filter(|l| l.starts_with('\u{26a0}')).collect();
     let (_n, none_after) = none_count(&doc, &base);
-    println!("AFTER:  {none_after} display:none  (revealed {})", none_before as i64 - none_after as i64);
-    println!("errors: {}", errs.len());
+    println!("AFTER (classic):  {none_after} display:none  (revealed {})", none_before as i64 - none_after as i64);
+    println!("classic errors: {}", errs.len());
     for e in &errs {
         println!("{}", e.lines().next().unwrap_or(""));
         for l in e.lines().skip(1).take(2) {
             println!("{l}");
+        }
+    }
+
+    // --- ES modules (deferred) ---
+    let (entries, sources, notes) = engine::collect_module_graph(&doc, &base);
+    println!(
+        "\nMODULE GRAPH: {} entries, {} modules fetched, {} notes",
+        entries.len(),
+        sources.len(),
+        notes.len()
+    );
+    for n in notes.iter().take(20) {
+        println!("  {n}");
+    }
+    if !entries.is_empty() {
+        let (doc, mconsole) = engine::run_modules(doc, &base);
+        let merrs: Vec<&String> = mconsole.iter().filter(|l| l.starts_with('\u{26a0}')).collect();
+        let logs: Vec<&String> = mconsole.iter().filter(|l| !l.starts_with('\u{26a0}') && !l.starts_with('[')).collect();
+        let (_n2, none_mod) = none_count(&doc, &base);
+        println!("AFTER (modules):  {none_mod} display:none");
+        println!("module console logs: {}", logs.len());
+        for l in logs.iter().take(20) {
+            println!("  log: {l}");
+        }
+        println!("module errors: {}", merrs.len());
+        for e in merrs.iter().take(20) {
+            println!("  {}", e.lines().next().unwrap_or(""));
         }
     }
 }
