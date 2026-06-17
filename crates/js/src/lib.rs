@@ -2132,11 +2132,73 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   function makeRect() { return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: function () { return this; } }; }
 
+  // --- per-node wrapper cache (stable identity + expando persistence) ----------------------
+  // Native DOM methods/accessors return a FRESH wrapper object on every call (each carrying the
+  // hidden `__node` id). Frameworks like Vue stash internal state directly on DOM nodes
+  // (`el.__vnode`, `el._vei`, `el.$once`, ...) and rely on `getElementById(x) === getElementById(x)`
+  // and on those expandos surviving across lookups. To honor that we keep a JS-side map from node
+  // id -> the one canonical enriched wrapper, and route every element the native layer hands back
+  // through `canon()`, which returns the cached wrapper (copying over the fresh wrapper's own
+  // function bindings on first sight). The cache lives entirely on the JS side, so Boa's GC roots
+  // the wrappers for us — no Boa values are held in Rust (same discipline as elsewhere).
+  var __nodeCache = Object.create(null);
+  function canon(el) {
+    if (!el || typeof el !== "object") { return el; }
+    var node = el.__node;
+    if (typeof node !== "number") { return enrichElement(el); }
+    var cached = __nodeCache[node];
+    if (cached) { return cached; }
+    __nodeCache[node] = el;       // record BEFORE enriching so re-entrant lookups dedupe
+    enrichElement(el);
+    return el;
+  }
+  def(globalThis, "__canonNode", canon);
+
+  // Map a tag name to the most specific DOM interface prototype we have, so element wrappers
+  // satisfy `el instanceof HTMLElement/Element/Node` (and SVG/MathML where appropriate). The
+  // wrapper keeps all its own (native) accessors/methods; we only graft the interface prototype
+  // onto its chain via Object.setPrototypeOf, then re-install its own data/accessor props (they
+  // are own properties on the wrapper, so the chain swap doesn't lose them).
+  var svgTags = { svg: 1, path: 1, g: 1, rect: 1, circle: 1, ellipse: 1, line: 1, polyline: 1,
+    polygon: 1, text: 1, tspan: 1, defs: 1, use: 1, symbol: 1, marker: 1, "clippath": 1,
+    mask: 1, pattern: 1, image: 1, "lineargradient": 1, "radialgradient": 1, stop: 1, filter: 1,
+    foreignobject: 1 };
+  var tagIface = {
+    div: "HTMLDivElement", span: "HTMLSpanElement", p: "HTMLParagraphElement", a: "HTMLAnchorElement",
+    img: "HTMLImageElement", input: "HTMLInputElement", button: "HTMLButtonElement",
+    select: "HTMLSelectElement", option: "HTMLOptionElement", textarea: "HTMLTextAreaElement",
+    form: "HTMLFormElement", label: "HTMLLabelElement", ul: "HTMLUListElement", ol: "HTMLOListElement",
+    li: "HTMLLIElement", table: "HTMLTableElement", tr: "HTMLTableRowElement", td: "HTMLTableCellElement",
+    th: "HTMLTableCellElement", canvas: "HTMLCanvasElement", video: "HTMLVideoElement",
+    audio: "HTMLAudioElement", iframe: "HTMLIFrameElement", template: "HTMLTemplateElement",
+    h1: "HTMLHeadingElement", h2: "HTMLHeadingElement", h3: "HTMLHeadingElement",
+    h4: "HTMLHeadingElement", h5: "HTMLHeadingElement", h6: "HTMLHeadingElement",
+    body: "HTMLBodyElement", html: "HTMLHtmlElement", head: "HTMLHeadElement",
+    script: "HTMLScriptElement", style: "HTMLStyleElement", link: "HTMLLinkElement",
+    meta: "HTMLMetaElement", title: "HTMLTitleElement"
+  };
+  function ifaceProtoForTag(tag) {
+    tag = String(tag || "").toLowerCase();
+    if (svgTags[tag]) { return (globalThis.SVGElement && globalThis.SVGElement.prototype) || null; }
+    var name = tagIface[tag];
+    var ctor = name && globalThis[name];
+    if (typeof ctor === "function" && ctor.prototype) { return ctor.prototype; }
+    return (globalThis.HTMLElement && globalThis.HTMLElement.prototype) || null;
+  }
+
   function enrichElement(el) {
     if (!el || typeof el !== "object") { return el; }
     if (el.__enriched) { return el; }
     var node = el.__node;
     def(el, "__enriched", true);
+    // Graft the matching DOM interface prototype onto the wrapper's chain (own props survive).
+    if (typeof node === "number") {
+      try {
+        var tag = el.tagName;
+        var proto = ifaceProtoForTag(tag);
+        if (proto && Object.getPrototypeOf(el) !== proto) { Object.setPrototypeOf(el, proto); }
+      } catch (e) {}
+    }
     if (typeof node === "number") {
       def(el, "style", makeStyle(node));
       def(el, "classList", makeClassList(node));
@@ -2153,30 +2215,30 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     for (var mi = 0; mi < elemMethods.length; mi++) {
       (function (mn) {
         var orig = el[mn];
-        if (typeof orig === "function") { def(el, mn, function () { return enrichElement(orig.apply(this, arguments)); }); }
+        if (typeof orig === "function") { def(el, mn, function () { return canon(orig.apply(this, arguments)); }); }
       })(elemMethods[mi]);
     }
     var listMethods = ["querySelectorAll", "getElementsByTagName", "getElementsByClassName"];
     for (var li = 0; li < listMethods.length; li++) {
       (function (mn) {
         var orig = el[mn];
-        if (typeof orig === "function") { def(el, mn, function () { var r = orig.apply(this, arguments); if (r && typeof r.length === "number") { for (var i = 0; i < r.length; i++) { enrichElement(r[i]); } } return r; }); }
+        if (typeof orig === "function") { def(el, mn, function () { var r = orig.apply(this, arguments); if (r && typeof r.length === "number") { for (var i = 0; i < r.length; i++) { r[i] = canon(r[i]); } } return r; }); }
       })(listMethods[mi]);
     }
-    // Navigation accessors return fresh wrappers each time; re-wrap to enrich on read.
+    // Navigation accessors return fresh wrappers each time; re-wrap to canonicalize on read.
     var navAccessors = ["parentNode", "parentElement", "firstChild", "lastChild", "firstElementChild",
                         "nextSibling", "previousSibling", "nextElementSibling", "previousElementSibling"];
     for (var ni = 0; ni < navAccessors.length; ni++) {
       (function (an) {
         var d = Object.getOwnPropertyDescriptor(el, an);
-        if (d && d.get) { var og = d.get; Object.defineProperty(el, an, { get: function () { return enrichElement(og.call(this)); }, configurable: true, enumerable: d.enumerable }); }
+        if (d && d.get) { var og = d.get; Object.defineProperty(el, an, { get: function () { return canon(og.call(this)); }, configurable: true, enumerable: d.enumerable }); }
       })(navAccessors[ni]);
     }
     var listAccessors = ["children", "childNodes"];
     for (var ci = 0; ci < listAccessors.length; ci++) {
       (function (an) {
         var d = Object.getOwnPropertyDescriptor(el, an);
-        if (d && d.get) { var og = d.get; Object.defineProperty(el, an, { get: function () { var r = og.call(this); if (r && typeof r.length === "number") { for (var i = 0; i < r.length; i++) { enrichElement(r[i]); } } return r; }, configurable: true, enumerable: d.enumerable }); }
+        if (d && d.get) { var og = d.get; Object.defineProperty(el, an, { get: function () { var r = og.call(this); if (r && typeof r.length === "number") { for (var i = 0; i < r.length; i++) { r[i] = canon(r[i]); } } return r; }, configurable: true, enumerable: d.enumerable }); }
       })(listAccessors[ci]);
     }
 
@@ -2210,9 +2272,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var r = orig.apply(this, arguments);
       if (r && typeof r === "object") {
         if (typeof r.length === "number" && typeof r.splice === "function") {
-          for (var i = 0; i < r.length; i++) { enrichElement(r[i]); }
+          for (var i = 0; i < r.length; i++) { r[i] = canon(r[i]); }
         } else {
-          enrichElement(r);
+          return canon(r);
         }
       }
       return r;
@@ -2235,7 +2297,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (!d || !d.get) { return; }
     var origGet = d.get;
     Object.defineProperty(document, name, {
-      get: function () { return enrichElement(origGet.call(this)); },
+      get: function () { return canon(origGet.call(this)); },
       enumerable: d.enumerable, configurable: true
     });
   }
@@ -2360,13 +2422,66 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   if (typeof globalThis.IntersectionObserverEntry !== "function") { def(globalThis, "IntersectionObserverEntry", function () {}); }
   if (typeof globalThis.MutationRecord !== "function") { def(globalThis, "MutationRecord", function () {}); }
-  if (typeof globalThis.Node !== "function") {
-    def(globalThis, "Node", function () {});
-    globalThis.Node.ELEMENT_NODE = 1; globalThis.Node.TEXT_NODE = 3; globalThis.Node.COMMENT_NODE = 8;
-    globalThis.Node.DOCUMENT_NODE = 9; globalThis.Node.DOCUMENT_FRAGMENT_NODE = 11;
+  // --- DOM interface constructors / class hierarchy ----------------------------------------
+  // Vue (and most frameworks) do `el instanceof SVGElement`, read `Node.prototype`, check
+  // `typeof HTMLElement === "function"`, and reference HTMLUnknownElement/Text/Comment/etc.
+  // We define each as a real constructor function carrying a `.prototype` and wire up a
+  // prototype chain (HTMLDivElement -> HTMLElement -> Element -> Node) so prototype walks and
+  // `instanceof` checks behave. The element wrappers' prototype is set to HTMLElement.prototype
+  // (see __wrapNode below) so `el instanceof HTMLElement/Element/Node` returns true.
+  function defClass(name, parentCtor) {
+    if (typeof globalThis[name] === "function") { return globalThis[name]; }
+    var ctor = function () {};
+    if (parentCtor && parentCtor.prototype) {
+      try { Object.setPrototypeOf(ctor.prototype, parentCtor.prototype); } catch (e) {}
+    }
+    def(globalThis, name, ctor);
+    return ctor;
   }
-  if (typeof globalThis.HTMLElement !== "function") { def(globalThis, "HTMLElement", function () {}); }
-  if (typeof globalThis.Element !== "function") { def(globalThis, "Element", function () {}); }
+  var NodeCtor = defClass("Node");
+  NodeCtor.ELEMENT_NODE = 1; NodeCtor.ATTRIBUTE_NODE = 2; NodeCtor.TEXT_NODE = 3;
+  NodeCtor.CDATA_SECTION_NODE = 4; NodeCtor.PROCESSING_INSTRUCTION_NODE = 7; NodeCtor.COMMENT_NODE = 8;
+  NodeCtor.DOCUMENT_NODE = 9; NodeCtor.DOCUMENT_TYPE_NODE = 10; NodeCtor.DOCUMENT_FRAGMENT_NODE = 11;
+  defClass("EventTarget");
+  defClass("CharacterData", NodeCtor);
+  defClass("Text", globalThis.CharacterData);
+  defClass("Comment", globalThis.CharacterData);
+  defClass("CDATASection", globalThis.Text);
+  defClass("ProcessingInstruction", globalThis.CharacterData);
+  defClass("DocumentFragment", NodeCtor);
+  defClass("ShadowRoot", globalThis.DocumentFragment);
+  defClass("DocumentType", NodeCtor);
+  defClass("Attr", NodeCtor);
+  var ElementCtor = defClass("Element", NodeCtor);
+  var HTMLElementCtor = defClass("HTMLElement", ElementCtor);
+  defClass("SVGElement", ElementCtor);
+  defClass("SVGSVGElement", globalThis.SVGElement);
+  defClass("SVGGraphicsElement", globalThis.SVGElement);
+  defClass("MathMLElement", ElementCtor);
+  defClass("HTMLUnknownElement", HTMLElementCtor);
+  // A broad set of concrete HTMLElement subclasses pages feature-detect / reference.
+  var htmlSubclasses = [
+    "HTMLDivElement", "HTMLSpanElement", "HTMLParagraphElement", "HTMLAnchorElement",
+    "HTMLImageElement", "HTMLInputElement", "HTMLButtonElement", "HTMLSelectElement",
+    "HTMLOptionElement", "HTMLOptGroupElement", "HTMLTextAreaElement", "HTMLFormElement",
+    "HTMLLabelElement", "HTMLUListElement", "HTMLOListElement", "HTMLLIElement",
+    "HTMLTableElement", "HTMLTableRowElement", "HTMLTableCellElement", "HTMLTableSectionElement",
+    "HTMLTableColElement", "HTMLTableCaptionElement", "HTMLHeadingElement", "HTMLPreElement",
+    "HTMLQuoteElement", "HTMLHRElement", "HTMLBRElement", "HTMLScriptElement",
+    "HTMLStyleElement", "HTMLLinkElement", "HTMLMetaElement", "HTMLTitleElement",
+    "HTMLHeadElement", "HTMLBodyElement", "HTMLHtmlElement", "HTMLCanvasElement",
+    "HTMLVideoElement", "HTMLAudioElement", "HTMLMediaElement", "HTMLSourceElement",
+    "HTMLTrackElement", "HTMLIFrameElement", "HTMLEmbedElement", "HTMLObjectElement",
+    "HTMLPictureElement", "HTMLTemplateElement", "HTMLSlotElement", "HTMLDataListElement",
+    "HTMLFieldSetElement", "HTMLLegendElement", "HTMLDetailsElement", "HTMLDialogElement",
+    "HTMLMenuElement", "HTMLMapElement", "HTMLAreaElement", "HTMLDListElement",
+    "HTMLDataElement", "HTMLTimeElement", "HTMLOutputElement", "HTMLProgressElement",
+    "HTMLMeterElement", "HTMLModElement", "HTMLFontElement", "HTMLDirectoryElement",
+    "HTMLMarqueeElement"
+  ];
+  // HTMLMediaElement should sit under HTMLElement; audio/video under it. Keep flat-under-HTMLElement
+  // for simplicity except a couple that pages explicitly chain.
+  for (var hi = 0; hi < htmlSubclasses.length; hi++) { defClass(htmlSubclasses[hi], HTMLElementCtor); }
 
   // --- Image / Audio / media element constructors ------------------------------------------
   if (typeof globalThis.Image !== "function") {
@@ -3558,5 +3673,81 @@ mod tests {
         // The mutation is visible in the returned document.
         let title = find_by_tag(&doc, doc.root(), "title").map(|n| text_content(&doc, n));
         assert_eq!(title.as_deref(), Some("from-module"));
+    }
+
+    // --- DOM interface globals + element identity / expandos -----------------------------
+
+    #[test]
+    fn dom_interface_globals_are_constructors_with_prototypes() {
+        let out = env_eval(
+            "https://example.com/",
+            "[typeof Node, typeof Element, typeof HTMLElement, typeof HTMLUnknownElement, \
+              typeof SVGElement, typeof Text, typeof Comment, typeof DocumentFragment, \
+              typeof HTMLDivElement, typeof CharacterData, typeof Event, typeof CustomEvent].join(',') \
+             + '|' + (HTMLElement.prototype && Element.prototype && Node.prototype ? 'protos' : 'no') \
+             + '|' + (Object.getPrototypeOf(HTMLDivElement.prototype) === HTMLElement.prototype) \
+             + '|' + (Object.getPrototypeOf(HTMLElement.prototype) === Element.prototype) \
+             + '|' + (Object.getPrototypeOf(Element.prototype) === Node.prototype)",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("function,function,function,function,function,function,function,function,function,function,function,function|protos|true|true|true")
+        );
+    }
+
+    #[test]
+    fn created_element_is_instanceof_html_element_and_node() {
+        let out = env_eval(
+            "https://example.com/",
+            "var d = document.createElement('div'); \
+             [d instanceof HTMLDivElement, d instanceof HTMLElement, d instanceof Element, \
+              d instanceof Node, d instanceof SVGElement].join(',')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("true,true,true,true,false"));
+    }
+
+    #[test]
+    fn expando_set_on_created_element_persists_and_identity_is_stable() {
+        // Vue stashes internal state directly on DOM nodes (el.__vnode, el._vei). A node looked
+        // up twice must be the SAME JS object so those expandos survive.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let html = doc.append_element(root, "html");
+        let body = doc.append_element(html, "body");
+        let p = doc.append_element(body, "p");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(p).data {
+            e.attrs.insert("id".into(), "t".into());
+        }
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var a = document.getElementById("t");
+                a.__vnode = { stashed: 42 };
+                a._vei = "x";
+                var b = document.getElementById("t");
+                [a === b, b.__vnode && b.__vnode.stashed, b._vei,
+                 document.body.firstElementChild === a].join("|")
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // Same identity, expandos visible on the second lookup, and navigation returns the same obj.
+        assert_eq!(out[0].value.as_deref(), Some("true|42|x|true"));
+    }
+
+    #[test]
+    fn created_element_accepts_arbitrary_expando_properties() {
+        let out = env_eval(
+            "https://example.com/",
+            "var el = document.createElement('div'); \
+             el.$once = function () { return 7; }; el.__custom = { k: 1 }; \
+             document.body.appendChild(el); \
+             var same = document.body.lastChild; \
+             [same.$once ? same.$once() : 'no', same.__custom ? same.__custom.k : 'no', same === el].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("7|1|true"));
     }
 }
