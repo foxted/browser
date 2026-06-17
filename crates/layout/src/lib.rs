@@ -82,6 +82,9 @@ pub enum BoxContent {
     Anonymous,
     /// A run of laid-out text. The string is the (whitespace-collapsed) text to paint.
     Text(String),
+    /// A replaced image box for the given DOM node. Sized from CSS width/height and/or the
+    /// node's intrinsic size; the painter blits the decoded pixels into its content rect.
+    Image(dom::NodeId),
 }
 
 /// A node in the layout tree: geometry + paint info + children.
@@ -125,11 +128,13 @@ pub fn layout_document(
     viewport_width: f32,
     viewport_height: f32,
     measurer: &dyn TextMeasurer,
+    intrinsic_sizes: &HashMap<dom::NodeId, (f32, f32)>,
 ) -> LayoutBox {
     // 1. Build the box tree from the DOM (skipping hidden / non-rendered subtrees), inserting
-    //    anonymous blocks where block and inline siblings mix.
+    //    anonymous blocks where block and inline siblings mix. Image boxes are sized from their
+    //    intrinsic dimensions (and any CSS width/height) during layout.
     let mut root = LayoutBox::new(BoxContent::Block, PaintStyle::default(), None);
-    root.children = build_children(doc, doc.root(), styles);
+    root.children = build_children(doc, doc.root(), styles, intrinsic_sizes);
 
     // 2. The root is the viewport block. Lay it out against a containing block that is the
     //    viewport: origin (0,0), width = viewport_width.
@@ -199,6 +204,60 @@ fn display_of(
     }
 }
 
+/// Compute an image's content-box size (width, height) from any CSS `width`/`height` and its
+/// intrinsic size. Rules:
+///   * both CSS dimensions set → use them;
+///   * one CSS dimension set + an intrinsic aspect ratio known → scale the other to preserve it;
+///   * one CSS dimension set, no intrinsic → use it for that axis, 0 for the other (skipped);
+///   * no CSS dimensions → use the intrinsic size, or (0,0) if unknown.
+fn image_content_size(
+    css_w: Option<f32>,
+    css_h: Option<f32>,
+    intrinsic: Option<(f32, f32)>,
+) -> (f32, f32) {
+    match (css_w, css_h) {
+        (Some(w), Some(h)) => (w.max(0.0), h.max(0.0)),
+        (Some(w), None) => {
+            let h = match intrinsic {
+                Some((iw, ih)) if iw > 0.0 => w * (ih / iw),
+                _ => 0.0,
+            };
+            (w.max(0.0), h.max(0.0))
+        }
+        (None, Some(h)) => {
+            let w = match intrinsic {
+                Some((iw, ih)) if ih > 0.0 => h * (iw / ih),
+                _ => 0.0,
+            };
+            (w.max(0.0), h.max(0.0))
+        }
+        (None, None) => match intrinsic {
+            Some((iw, ih)) => (iw.max(0.0), ih.max(0.0)),
+            None => (0.0, 0.0),
+        },
+    }
+}
+
+/// True if an Image box is block-level (computed display block/flex/grid, the legacy
+/// `display_block` flag, or out-of-flow). Otherwise the image is atomic inline-level.
+fn image_is_block(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+) -> bool {
+    match style_of(boxx, styles) {
+        None => false,
+        Some(cs) => {
+            let block_display = matches!(
+                cs.display,
+                style::Display::Block | style::Display::Flex | style::Display::Grid
+            ) || (cs.display == style::Display::Inline && cs.display_block);
+            let out_of_flow =
+                matches!(cs.position, style::Position::Absolute | style::Position::Fixed);
+            block_display || out_of_flow
+        }
+    }
+}
+
 /// The `position` of a box (defaults to Static).
 fn position_of(
     boxx: &LayoutBox,
@@ -262,18 +321,28 @@ fn build_children(
     doc: &dom::Document,
     parent_id: dom::NodeId,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    intrinsic_sizes: &HashMap<dom::NodeId, (f32, f32)>,
 ) -> Vec<LayoutBox> {
     // First, produce a flat list of child boxes (each tagged block vs inline).
     let mut flat: Vec<LayoutBox> = Vec::new();
     for &child in &doc.get(parent_id).children {
-        build_box(doc, child, styles, &mut flat);
+        build_box(doc, child, styles, intrinsic_sizes, &mut flat);
     }
 
+    // Classify each box as block-level for flow purposes. A block-level Image counts as a block;
+    // an inline-level (atomic) Image counts as inline content.
+    let is_block_level = |b: &LayoutBox| match &b.content {
+        BoxContent::Block => true,
+        BoxContent::Image(_) => image_is_block(b, styles),
+        _ => false,
+    };
+
     // If there are no block-level children, no anonymous wrapping is needed.
-    let has_block = flat.iter().any(|b| matches!(b.content, BoxContent::Block));
-    let has_inline = flat
-        .iter()
-        .any(|b| matches!(b.content, BoxContent::Inline | BoxContent::Text(_)));
+    let has_block = flat.iter().any(&is_block_level);
+    let has_inline = flat.iter().any(|b| {
+        matches!(b.content, BoxContent::Inline | BoxContent::Text(_))
+            || (matches!(b.content, BoxContent::Image(_)) && !image_is_block(b, styles))
+    });
     if !(has_block && has_inline) {
         return flat;
     }
@@ -282,14 +351,13 @@ fn build_children(
     let mut out: Vec<LayoutBox> = Vec::new();
     let mut run: Vec<LayoutBox> = Vec::new();
     for b in flat {
-        match b.content {
-            BoxContent::Block => {
-                if !run.is_empty() {
-                    out.push(make_anonymous(std::mem::take(&mut run)));
-                }
-                out.push(b);
+        if is_block_level(&b) {
+            if !run.is_empty() {
+                out.push(make_anonymous(std::mem::take(&mut run)));
             }
-            _ => run.push(b),
+            out.push(b);
+        } else {
+            run.push(b);
         }
     }
     if !run.is_empty() {
@@ -312,6 +380,7 @@ fn build_box(
     doc: &dom::Document,
     id: dom::NodeId,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    intrinsic_sizes: &HashMap<dom::NodeId, (f32, f32)>,
     out: &mut Vec<LayoutBox>,
 ) {
     let node = doc.get(id);
@@ -338,6 +407,26 @@ fn build_box(
             if cs.display_none {
                 return;
             }
+            // An <img> is a replaced element: build an Image box sized by its CSS width/height
+            // and/or intrinsic dimensions. It is atomic inline-level by default (like
+            // inline-block — it flows on a line and advances the pen), or block-level if its
+            // computed display is block/flex/grid (or it is out-of-flow).
+            if el.tag.eq_ignore_ascii_case("img") {
+                let intrinsic = intrinsic_sizes.get(&id).copied();
+                let (cw, ch) = image_content_size(cs.width, cs.height, intrinsic);
+                if cw <= 0.0 || ch <= 0.0 {
+                    return; // nothing known to draw; skip producing a box
+                }
+                let mut bx = LayoutBox::new(BoxContent::Image(id), paint_style_of(cs), Some(id));
+                bx.dimensions.margin = edges_of(cs.margin);
+                bx.dimensions.padding = edges_of(cs.padding);
+                bx.dimensions.border = edges_of(cs.border);
+                // Pre-size the content box so layout can read the replaced size back.
+                bx.dimensions.content.width = cw;
+                bx.dimensions.content.height = ch;
+                out.push(bx);
+                return;
+            }
             // A box is block-level in its parent's flow if it generates a block-level box
             // (Block/Flex/Grid) or is out-of-flow (Absolute/Fixed are treated as block-level
             // so they aren't merged into inline runs). Inline / inline-block / inline-flex /
@@ -357,7 +446,7 @@ fn build_box(
             bx.dimensions.margin = edges_of(cs.margin);
             bx.dimensions.padding = edges_of(cs.padding);
             bx.dimensions.border = edges_of(cs.border);
-            bx.children = build_children(doc, id, styles);
+            bx.children = build_children(doc, id, styles, intrinsic_sizes);
             out.push(bx);
         }
         _ => {
@@ -462,7 +551,8 @@ fn layout_block(
             let any_block = boxx
                 .children
                 .iter()
-                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous));
+                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+                    || (matches!(c.content, BoxContent::Image(_)) && image_is_block(c, styles)));
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -512,8 +602,9 @@ fn layout_block_children(
         // child stacks below previous siblings. We thread the running y via the containing
         // rect's y, and the child adds its own top margin/border/padding inside layout_block.
         let containing = Rect { x: content.x, y: cursor_y, width: content.width, height: 0.0 };
-        match child.content {
+        match &child.content {
             BoxContent::Block => layout_block(child, containing, ctx, styles, measurer),
+            BoxContent::Image(_) => layout_image_box(child, containing),
             BoxContent::Anonymous => {
                 // Anonymous blocks inherit the establishing block's text-align.
                 layout_anonymous(child, containing, parent_align, ctx, styles, measurer)
@@ -525,6 +616,20 @@ fn layout_block_children(
         cursor_y += child.dimensions.margin_box().height;
     }
     cursor_y - content.y
+}
+
+/// Position a replaced (image) box within `containing`. The content size was pre-computed at
+/// box-tree build time (from CSS width/height and/or the intrinsic size); here we only place the
+/// content origin inside the containing block, offset by the box's own margin/border/padding.
+fn layout_image_box(boxx: &mut LayoutBox, containing: Rect) {
+    let m = boxx.dimensions.margin;
+    let b = boxx.dimensions.border;
+    let p = boxx.dimensions.padding;
+    let x = containing.x + m.left + b.left + p.left;
+    let y = containing.y + m.top + b.top + p.top;
+    boxx.dimensions.content.x = x;
+    boxx.dimensions.content.y = y;
+    // width/height already set at build time; leave them.
 }
 
 /// Resolve out-of-flow (absolute / fixed) children of `boxx`: size and position them against
@@ -622,7 +727,8 @@ fn layout_out_of_flow(
             let any_block = boxx
                 .children
                 .iter()
-                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous));
+                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+                    || (matches!(c.content, BoxContent::Image(_)) && image_is_block(c, styles)));
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -1217,7 +1323,8 @@ fn layout_flex_item_contents(
             let any_block = boxx
                 .children
                 .iter()
-                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous));
+                .any(|c| matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+                    || (matches!(c.content, BoxContent::Image(_)) && image_is_block(c, styles)));
             if any_block {
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
@@ -1825,6 +1932,14 @@ fn collect_inline_items(
             BoxContent::Inline => {
                 collect_inline_items(child.children, ctx, styles, measurer, out);
             }
+            BoxContent::Image(_) => {
+                // An atomic inline image: position its (pre-sized) content box at a tentative
+                // origin so its margin box is well-formed, then emit it as an atomic item. It
+                // advances the line by its margin-box width and is repositioned on its line.
+                let containing = Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 };
+                layout_image_box(&mut child, containing);
+                out.push(InlineItem::Atomic(Box::new(child)));
+            }
             _ => {
                 // Block-level content shouldn't appear in an inline context; ignore defensively.
             }
@@ -1907,7 +2022,7 @@ mod tests {
         styles.insert(a, style::ComputedStyle { display_block: true, height: Some(30.0), ..Default::default() });
         styles.insert(b, style::ComputedStyle { display_block: true, height: Some(50.0), ..Default::default() });
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         assert_eq!(abox.dimensions.content.y, 0.0);
@@ -1938,7 +2053,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let c = abox.dimensions.content;
         // content x = 0 (containing) + margin.left 10 + border.left 2 + padding.left 5 = 17.
@@ -1966,7 +2081,7 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(a, style::ComputedStyle { display_block: true, width: Some(200.0), ..Default::default() });
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         assert_eq!(abox.dimensions.content.width, 200.0);
     }
@@ -1985,7 +2100,7 @@ mod tests {
         styles.insert(p, block_style(true)); // font_size 16 default
 
         // word "three" = 5 chars * 16 * 0.6 = 48px. Width 60 fits ~one word per line.
-        let root_box = layout_document(&doc, &styles, 60.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 60.0, 600.0, &Stub, &HashMap::new());
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
         let lines = count_boxes(pbox, &|x| matches!(x.content, BoxContent::Text(_)));
         assert!(lines > 1, "expected multiple wrapped lines, got {lines}");
@@ -2007,7 +2122,7 @@ mod tests {
         styles.insert(hidden, style::ComputedStyle { display_block: true, display_none: true, ..Default::default() });
         styles.insert(shown, block_style(true));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         assert!(find_box(&root_box, &|x| x.node == Some(hidden)).is_none());
         assert!(find_box(&root_box, &|x| x.node == Some(shown)).is_some());
     }
@@ -2025,7 +2140,7 @@ mod tests {
         styles.insert(body, block_style(true));
         styles.insert(d, block_style(true));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let anon = count_boxes(&root_box, &|x| matches!(x.content, BoxContent::Anonymous));
         assert_eq!(anon, 1);
     }
@@ -2044,7 +2159,7 @@ mod tests {
             parent = child;
         }
         doc.append_child(parent, dom::NodeData::Text("deep".into()));
-        let _ = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let _ = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
     }
 
     #[test]
@@ -2107,7 +2222,7 @@ mod tests {
         styles.insert(b, item(50.0));
         styles.insert(d, item(50.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let dbox = find_box(&root_box, &|x| x.node == Some(d)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(c)).unwrap();
@@ -2159,7 +2274,7 @@ mod tests {
         );
         styles.insert(d, fixed);
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         // free = 300 - 50 - 50 - 0(basis) = 200, all goes to b.
         assert!((bbox.dimensions.content.width - 200.0).abs() < 0.01,
@@ -2188,7 +2303,7 @@ mod tests {
         styles.insert(a, item(30.0));
         styles.insert(b, item(50.0));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         assert!(bbox.dimensions.content.y > abox.dimensions.content.y);
@@ -2228,7 +2343,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let cbox = find_box(&root_box, &|x| x.node == Some(c)).unwrap();
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         // Centered: a.y should be container.y + (100 - 20)/2 = +40.
@@ -2273,7 +2388,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let pbox = find_box(&root_box, &|x| x.node == Some(parent)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
         let pad = pbox.dimensions.padding_box();
@@ -2308,7 +2423,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
         let cb = cbox.dimensions.border_box();
         // Anchored to viewport (0,0): border-box at (15, 10).
@@ -2353,7 +2468,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let pbox = find_box(&root_box, &|x| x.node == Some(badge)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(corner)).unwrap();
         let pad = pbox.dimensions.padding_box();
@@ -2406,7 +2521,7 @@ mod tests {
             },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let pbox = find_box(&root_box, &|x| x.node == Some(parent)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(child)).unwrap();
         let pad = pbox.dimensions.padding_box();
@@ -2444,7 +2559,7 @@ mod tests {
             style::ComputedStyle { display_block: true, height: Some(40.0), ..Default::default() },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         // a shifted by (25, 5).
@@ -2474,7 +2589,7 @@ mod tests {
             style::ComputedStyle { display: style::Display::InlineBlock, ..Default::default() },
         );
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         // The inline-block becomes an atomic box (node == ib) sitting in the line.
         let ibbox = find_box(&root_box, &|x| x.node == Some(ib)).unwrap();
         // Intrinsic width = "XY" = 2 chars * 16 * 0.6 = 19.2.
@@ -2517,7 +2632,7 @@ mod tests {
             );
         }
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         let bbox = find_box(&root_box, &|x| x.node == Some(b)).unwrap();
         let cbox = find_box(&root_box, &|x| x.node == Some(c)).unwrap();
@@ -2552,7 +2667,7 @@ mod tests {
         );
 
         // Narrow width forces the paragraph to wrap to several lines.
-        let root_box = layout_document(&doc, &styles, 60.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 60.0, 600.0, &Stub, &HashMap::new());
         let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
         let sbox = find_box(&root_box, &|x| x.node == Some(sib)).unwrap();
 
@@ -2565,6 +2680,152 @@ mod tests {
             sbox.dimensions.content.y,
             p_bottom
         );
+    }
+
+    #[test]
+    fn image_box_uses_intrinsic_size_when_no_css() {
+        // body > img (no CSS width/height) with intrinsic (100, 50).
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let img = doc.append_element(body, "img");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(img, style::ComputedStyle::default()); // inline by default
+
+        let mut intrinsic = HashMap::new();
+        intrinsic.insert(img, (100.0, 50.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
+        assert_eq!(ibox.dimensions.content.width, 100.0);
+        assert_eq!(ibox.dimensions.content.height, 50.0);
+        assert_eq!(ibox.node, Some(img));
+    }
+
+    #[test]
+    fn image_box_css_width_preserves_intrinsic_aspect_ratio() {
+        // CSS width:200, no height, intrinsic 100x50 (2:1) → height 100.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let img = doc.append_element(body, "img");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            img,
+            style::ComputedStyle { width: Some(200.0), ..Default::default() },
+        );
+
+        let mut intrinsic = HashMap::new();
+        intrinsic.insert(img, (100.0, 50.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
+        assert_eq!(ibox.dimensions.content.width, 200.0);
+        assert!((ibox.dimensions.content.height - 100.0).abs() < 0.01,
+            "aspect-preserved height = {}", ibox.dimensions.content.height);
+    }
+
+    #[test]
+    fn image_box_explicit_both_dimensions() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let img = doc.append_element(body, "img");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            img,
+            style::ComputedStyle { width: Some(40.0), height: Some(30.0), ..Default::default() },
+        );
+
+        // Intrinsic provided but explicit CSS wins.
+        let mut intrinsic = HashMap::new();
+        intrinsic.insert(img, (100.0, 50.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
+        assert_eq!(ibox.dimensions.content.width, 40.0);
+        assert_eq!(ibox.dimensions.content.height, 30.0);
+    }
+
+    #[test]
+    fn block_image_contributes_height_so_sibling_clears_it() {
+        // body > img(display:block, 100x50), div(sibling). Sibling must clear the image.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let img = doc.append_element(body, "img");
+        let sib = doc.append_element(body, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            img,
+            style::ComputedStyle { display: style::Display::Block, display_block: true, ..Default::default() },
+        );
+        styles.insert(
+            sib,
+            style::ComputedStyle { display_block: true, height: Some(10.0), ..Default::default() },
+        );
+
+        let mut intrinsic = HashMap::new();
+        intrinsic.insert(img, (100.0, 50.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
+        let sbox = find_box(&root_box, &|x| x.node == Some(sib)).unwrap();
+        assert_eq!(ibox.dimensions.content.height, 50.0);
+        // Sibling stacks below the image's 50px-tall margin box.
+        assert!((sbox.dimensions.content.y - 50.0).abs() < 0.01,
+            "sibling y = {} (should clear the 50px image)", sbox.dimensions.content.y);
+    }
+
+    #[test]
+    fn inline_image_advances_the_line() {
+        // body > p > [ "ab", img(20x10), "cd" ]: the image is atomic inline, to the right of "ab".
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("ab".into()));
+        let img = doc.append_element(p, "img");
+        doc.append_child(p, dom::NodeData::Text("cd".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(p, block_style(true));
+        styles.insert(img, style::ComputedStyle::default());
+
+        let mut intrinsic = HashMap::new();
+        intrinsic.insert(img, (20.0, 10.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
+        assert_eq!(ibox.dimensions.content.width, 20.0);
+        // Sits to the right of the leading "ab" word.
+        assert!(ibox.dimensions.content.x > 0.0, "image x = {}", ibox.dimensions.content.x);
+    }
+
+    #[test]
+    fn image_with_no_size_known_produces_no_box() {
+        // No CSS size, no intrinsic entry → nothing to draw, no Image box.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let img = doc.append_element(body, "img");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(img, style::ComputedStyle::default());
+
+        let intrinsic: HashMap<dom::NodeId, (f32, f32)> = HashMap::new();
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic);
+        assert!(find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).is_none());
     }
 
     #[test]
@@ -2601,7 +2862,7 @@ mod tests {
         doc.append_child(b, dom::NodeData::Text("beta".into()));
         doc.append_child(d, dom::NodeData::Text("gamma".into()));
 
-        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub);
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
         let cbox = find_box(&root_box, &|x| x.node == Some(c)).unwrap();
         let boxes: Vec<_> = [a, b, d]
             .iter()

@@ -79,6 +79,46 @@ impl Framebuffer {
         }
     }
 
+    /// Blit a decoded straight-alpha RGBA8 image into the destination rect `dst`, scaling with
+    /// nearest-neighbour sampling and source-over compositing each pixel. `src` is
+    /// `src_w * src_h * 4` bytes; out-of-range / empty inputs are ignored. The destination is
+    /// clipped to the framebuffer.
+    pub fn blit_rgba(&mut self, dst: Rect, src: &[u8], src_w: u32, src_h: u32) {
+        if src_w == 0 || src_h == 0 || dst.w <= 0 || dst.h <= 0 {
+            return;
+        }
+        if src.len() < (src_w as usize) * (src_h as usize) * 4 {
+            return;
+        }
+        let x0 = dst.x.max(0);
+        let y0 = dst.y.max(0);
+        let x1 = (dst.x + dst.w).min(self.width as i32);
+        let y1 = (dst.y + dst.h).min(self.height as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        for y in y0..y1 {
+            // Map this destination row back to a source row (nearest-neighbour).
+            let sy = (((y - dst.y) as i64 * src_h as i64) / dst.h as i64) as u32;
+            let sy = sy.min(src_h - 1);
+            let drow = (y as u32 * self.stride) as usize;
+            let srow = (sy * src_w) as usize * 4;
+            for x in x0..x1 {
+                let sx = (((x - dst.x) as i64 * src_w as i64) / dst.w as i64) as u32;
+                let sx = sx.min(src_w - 1);
+                let si = srow + (sx as usize) * 4;
+                let c = Color {
+                    r: src[si],
+                    g: src[si + 1],
+                    b: src[si + 2],
+                    a: src[si + 3],
+                };
+                let di = drow + (x as usize) * 4;
+                blend_over(&mut self.pixels[di..di + 4], c);
+            }
+        }
+    }
+
     /// Blend a single coverage value (0..=255) of `c` at one pixel. Used by text painting
     /// once a [`GlyphRasterizer`] hands us coverage bitmaps.
     pub fn blend_coverage(&mut self, x: i32, y: i32, coverage: u8, c: Color) {
@@ -148,6 +188,39 @@ mod tests {
         // Pixel (2,2) untouched (still opaque black).
         let i = (2 * fb.stride + 2 * 4) as usize;
         assert_eq!(&fb.pixels[i..i + 4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn blit_rgba_scales_with_nearest_neighbour() {
+        // A 2x2 source: red, green / blue, white. Blit it filling a 4x4 buffer.
+        let mut fb = Framebuffer::new(4, 4);
+        fb.clear(Color::BLACK);
+        let src: Vec<u8> = vec![
+            255, 0, 0, 255, /* red   */ 0, 255, 0, 255, /* green */
+            0, 0, 255, 255, /* blue  */ 255, 255, 255, 255, /* white */
+        ];
+        fb.blit_rgba(Rect { x: 0, y: 0, w: 4, h: 4 }, &src, 2, 2);
+        let px = |x: usize, y: usize| {
+            let i = (y as u32 * fb.stride) as usize + x * 4;
+            &fb.pixels[i..i + 4]
+        };
+        // Each source pixel maps to the corresponding 2x2 quadrant.
+        assert_eq!(px(0, 0), &[255, 0, 0, 255]); // top-left = red
+        assert_eq!(px(3, 0), &[0, 255, 0, 255]); // top-right = green
+        assert_eq!(px(0, 3), &[0, 0, 255, 255]); // bottom-left = blue
+        assert_eq!(px(3, 3), &[255, 255, 255, 255]); // bottom-right = white
+    }
+
+    #[test]
+    fn blit_rgba_composites_alpha_and_clips() {
+        let mut fb = Framebuffer::new(2, 2);
+        fb.clear(Color::BLACK);
+        // A 1x1 half-transparent white image blitted over the whole (black) buffer.
+        let src = vec![255u8, 255, 255, 128];
+        // Destination extends past the buffer; must be clipped without panicking.
+        fb.blit_rgba(Rect { x: 0, y: 0, w: 10, h: 10 }, &src, 1, 1);
+        // ~50% white over black.
+        assert!(fb.pixels[0] > 120 && fb.pixels[0] < 135);
     }
 
     #[test]

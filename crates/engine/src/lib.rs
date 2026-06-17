@@ -7,8 +7,22 @@
 
 mod font;
 
+use std::collections::HashMap;
+
 use font::SystemFont;
 use paint::{Color, Framebuffer, GlyphRasterizer, Rect};
+
+/// A decoded raster image ready to blit: straight-alpha RGBA8 pixels plus dimensions.
+struct DecodedImage {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+/// Maximum number of images fetched + decoded per page; the rest are skipped.
+const MAX_IMAGES: usize = 24;
+/// Skip decoding images whose decoded pixel area would exceed this (guards memory / time).
+const MAX_IMAGE_PIXELS: u64 = 32 * 1024 * 1024; // ~32 megapixels
 
 /// Result of the most recent navigation.
 enum LoadState {
@@ -24,6 +38,8 @@ enum LoadState {
         styles: Vec<css::Stylesheet>,
         /// Console output (and error lines) produced by running the page's inline scripts.
         console: Vec<String>,
+        /// Decoded `<img>` images keyed by their DOM node, fetched on the last navigation.
+        images: HashMap<dom::NodeId, DecodedImage>,
     },
     Failed { url: String, error: String },
 }
@@ -111,6 +127,14 @@ impl Engine {
                     }
                     None => None,
                 };
+
+                // Fetch + decode `<img>` images (after scripts, so script-inserted images and
+                // mutated `src` attributes are seen). Reset on every navigation.
+                let images = match &doc {
+                    Some(d) => collect_images(d, &base, &mut console),
+                    None => HashMap::new(),
+                };
+
                 self.state = LoadState::Loaded {
                     url: resp.final_url,
                     status: resp.status,
@@ -119,6 +143,7 @@ impl Engine {
                     doc,
                     styles,
                     console,
+                    images,
                 };
                 0
             }
@@ -154,7 +179,7 @@ impl Engine {
                     draw_text(&mut fb, font, "Enter a URL and press Go.",
                               12.0 * self.scale, 60.0 * self.scale, px, Color::WHITE);
                 }
-                LoadState::Loaded { url, status, content_type, bytes, doc, styles, console } => {
+                LoadState::Loaded { url, status, content_type, bytes, doc, styles, console, images } => {
                     // Header line: HTTP status, content type, size, and URL.
                     let head =
                         format!("HTTP {status}   |   {content_type}   |   {bytes}B   |   {url}");
@@ -180,8 +205,14 @@ impl Engine {
                             let viewport_width = (max_x - left).max(1.0);
                             let viewport_height = (page_max_y - header_h).max(1.0);
                             let measurer = FontMeasurer { font };
+                            // Intrinsic sizes (px) for replaced (image) boxes, from decoded images.
+                            let intrinsic_sizes: HashMap<dom::NodeId, (f32, f32)> = images
+                                .iter()
+                                .map(|(&id, img)| (id, (img.w as f32, img.h as f32)))
+                                .collect();
                             let root = layout::layout_document(
                                 d, &computed, viewport_width, viewport_height, &measurer,
+                                &intrinsic_sizes,
                             );
                             // Clamp the scroll offset to the laid-out document height so we
                             // can't scroll past the end.
@@ -192,7 +223,7 @@ impl Engine {
                             // position, and clip vertically to the page region.
                             paint_box(
                                 &mut fb, font, &root, left, header_h - scroll_y, header_h,
-                                page_max_y,
+                                page_max_y, images,
                             );
                         }
                         None => {
@@ -232,6 +263,24 @@ impl Engine {
     /// Borrow the last-rendered framebuffer, if any.
     pub fn framebuffer(&self) -> Option<&Framebuffer> {
         self.framebuffer.as_ref()
+    }
+
+    /// Test-only: number of decoded `<img>` images for the current page.
+    #[cfg(test)]
+    fn decoded_image_count(&self) -> usize {
+        match &self.state {
+            LoadState::Loaded { images, .. } => images.len(),
+            _ => 0,
+        }
+    }
+
+    /// Test-only: the (w, h) of the first decoded image, if any.
+    #[cfg(test)]
+    fn first_decoded_image_size(&self) -> Option<(u32, u32)> {
+        match &self.state {
+            LoadState::Loaded { images, .. } => images.values().next().map(|i| (i.w, i.h)),
+            _ => None,
+        }
     }
 }
 
@@ -315,6 +364,7 @@ fn paint_box(
     oy: f32,
     clip_top: f32,
     clip_bottom: f32,
+    images: &HashMap<dom::NodeId, DecodedImage>,
 ) {
     let border = b.dimensions.border_box();
     let content = b.dimensions.content;
@@ -359,10 +409,30 @@ fn paint_box(
                 draw_run(fb, font, s, x, baseline, b.style.font_size, color, b.style.bold);
             }
         }
+
+        // (d) Replaced image content: blit the decoded pixels into the content rect, scaled.
+        if let layout::BoxContent::Image(node) = &b.content {
+            if content.y + oy < clip_bottom {
+                let dst = rect_i(content.x + ox, content.y + oy, content.width, content.height);
+                match images.get(node) {
+                    Some(img) => fb.blit_rgba(dst, &img.rgba, img.w, img.h),
+                    None => {
+                        // Missing / undecoded image: draw a faint placeholder border.
+                        let ph = Color { r: 140, g: 140, b: 150, a: 120 };
+                        if dst.w > 0 && dst.h > 0 {
+                            fb.fill_rect(Rect { x: dst.x, y: dst.y, w: dst.w, h: 1 }, ph);
+                            fb.fill_rect(Rect { x: dst.x, y: dst.y + dst.h - 1, w: dst.w, h: 1 }, ph);
+                            fb.fill_rect(Rect { x: dst.x, y: dst.y, w: 1, h: dst.h }, ph);
+                            fb.fill_rect(Rect { x: dst.x + dst.w - 1, y: dst.y, w: 1, h: dst.h }, ph);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     for child in &b.children {
-        paint_box(fb, font, child, ox, oy, clip_top, clip_bottom);
+        paint_box(fb, font, child, ox, oy, clip_top, clip_bottom, images);
     }
 }
 
@@ -523,6 +593,68 @@ pub fn collect_stylesheets(doc: &dom::Document, base: &str) -> (Vec<css::Stylesh
         }
     }
     (sheets, console)
+}
+
+/// Walk the DOM in document order collecting `<img>` elements with a resolvable `src`, then
+/// fetch + decode each into a [`DecodedImage`] keyed by its DOM node. Caps the number fetched
+/// ([`MAX_IMAGES`]) and skips oversized decodes ([`MAX_IMAGE_PIXELS`]). Decode/fetch failures
+/// are skipped (with a console note) and never panic. `data:` URLs are not handled (they are
+/// rejected by `resolve_url`); a base64 data-URL decoder is a future addition.
+fn collect_images(
+    doc: &dom::Document,
+    base: &str,
+    console: &mut Vec<String>,
+) -> HashMap<dom::NodeId, DecodedImage> {
+    // Gather (node, absolute-url) pairs in document order.
+    fn walk(doc: &dom::Document, id: dom::NodeId, base: &str, out: &mut Vec<(dom::NodeId, String)>) {
+        if let dom::NodeData::Element(e) = &doc.get(id).data {
+            if e.tag.eq_ignore_ascii_case("img") {
+                if let Some(src) = e.attrs.get("src") {
+                    if let Some(abs) = resolve_url(base, src) {
+                        out.push((id, abs));
+                    }
+                }
+            }
+        }
+        for &child in &doc.get(id).children {
+            walk(doc, child, base, out);
+        }
+    }
+    let mut targets = Vec::new();
+    walk(doc, doc.root(), base, &mut targets);
+
+    let mut images = HashMap::new();
+    let mut fetched = 0usize;
+    for (node, url) in targets {
+        if fetched >= MAX_IMAGES {
+            console.push(format!("[skipped image (limit {MAX_IMAGES} reached): {url}]"));
+            continue;
+        }
+        fetched += 1;
+        match net::fetch(&url) {
+            Ok(resp) => match decode_image(&resp.body) {
+                Some(img) => {
+                    images.insert(node, img);
+                }
+                None => console.push(format!("[failed to decode image: {url}]")),
+            },
+            Err(e) => console.push(format!("[failed to load image: {url} — {e}]")),
+        }
+    }
+    images
+}
+
+/// Decode raster image bytes into straight-alpha RGBA8. Returns `None` on decode failure or if
+/// the decoded image would exceed [`MAX_IMAGE_PIXELS`]. Never panics.
+fn decode_image(bytes: &[u8]) -> Option<DecodedImage> {
+    let dynimg = image::load_from_memory(bytes).ok()?;
+    let w = dynimg.width();
+    let h = dynimg.height();
+    if (w as u64) * (h as u64) > MAX_IMAGE_PIXELS {
+        return None;
+    }
+    let rgba = dynimg.to_rgba8();
+    Some(DecodedImage { rgba: rgba.into_raw(), w, h })
 }
 
 /// Draw a single run at `(x, baseline)`. If `bold`, approximate bold by drawing each glyph
@@ -1162,7 +1294,9 @@ mod tests {
         let (sheets, _console) = collect_stylesheets(&doc, "https://example.com/");
         let computed = style::cascade(&doc, &sheets);
         let measurer = TestMeasurer;
-        let root = layout::layout_document(&doc, &computed, 400.0, 600.0, &measurer);
+        let no_images = HashMap::new();
+        let root =
+            layout::layout_document(&doc, &computed, 400.0, 600.0, &measurer, &no_images);
 
         // The painter clips to a band; paint into a small framebuffer without a font (text is
         // skipped when no font, but background/border painting still exercises the walk). Using
@@ -1177,7 +1311,8 @@ mod tests {
             }
         }
         let mut fb = Framebuffer::new(400, 300);
-        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0);
+        let images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        paint_box(&mut fb, &NoFont, &root, 16.0, 28.0, 28.0, 300.0, &images);
 
         // The root box should exist; with the parallel layout stub it may have no children yet,
         // so only assert the path completed and the root carries the viewport width.
@@ -1205,5 +1340,82 @@ mod tests {
         let (doc, _console) = run_scripts(doc, "https://example.com/");
         let text = extract_visible_text(&doc);
         assert!(text.contains("injected"), "expected 'injected' in {text:?}");
+    }
+
+    #[test]
+    fn local_png_image_is_decoded_and_produces_an_image_box() {
+        // Generate a tiny PNG with the `image` crate, reference it from an HTML page via file://,
+        // load it through the engine, and assert (a) the image was decoded and (b) layout produces
+        // an Image box of the intrinsic size. No network is used.
+        let dir = std::env::temp_dir().join(format!("engine_img_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png_path = dir.join("tiny.png");
+
+        // A 4x3 opaque-red image.
+        let (iw, ih) = (4u32, 3u32);
+        let buf = image::RgbaImage::from_pixel(iw, ih, image::Rgba([200, 30, 40, 255]));
+        buf.save(&png_path).unwrap();
+
+        let img_url = format!("file://{}", png_path.display());
+        let html = format!(
+            r#"<html><body><img src="{img_url}"></body></html>"#
+        );
+        let html_path = dir.join("page.html");
+        std::fs::write(&html_path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(400, 300, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", html_path.display())), 0);
+
+        // (a) The image was fetched + decoded.
+        assert_eq!(e.decoded_image_count(), 1, "expected one decoded image");
+        assert_eq!(e.first_decoded_image_size(), Some((iw, ih)));
+
+        // (b) Render runs the layout path; verify an Image box of the right size exists by
+        // re-running layout with the same intrinsic map the engine builds.
+        let body = std::fs::read_to_string(&html_path).unwrap();
+        let doc = html::parse(&body);
+        let (sheets, _console) = collect_stylesheets(&doc, &format!("file://{}", html_path.display()));
+        let computed = style::cascade(&doc, &sheets);
+        let base = base_url(&doc, &format!("file://{}", html_path.display()));
+        let mut console = Vec::new();
+        let images = collect_images(&doc, &base, &mut console);
+        assert_eq!(images.len(), 1);
+        let intrinsic: HashMap<dom::NodeId, (f32, f32)> = images
+            .iter()
+            .map(|(&id, img)| (id, (img.w as f32, img.h as f32)))
+            .collect();
+
+        struct M;
+        impl layout::TextMeasurer for M {
+            fn text_width(&self, t: &str, px: f32, _b: bool) -> f32 {
+                t.chars().count() as f32 * px * 0.5
+            }
+            fn line_height(&self, px: f32) -> f32 {
+                px * 1.3
+            }
+        }
+        let root = layout::layout_document(&doc, &computed, 400.0, 300.0, &M, &intrinsic);
+
+        fn find_image(b: &layout::LayoutBox) -> Option<&layout::LayoutBox> {
+            if matches!(b.content, layout::BoxContent::Image(_)) {
+                return Some(b);
+            }
+            for c in &b.children {
+                if let Some(f) = find_image(c) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let ibox = find_image(&root).expect("expected an Image box in the layout tree");
+        assert_eq!(ibox.dimensions.content.width, iw as f32);
+        assert_eq!(ibox.dimensions.content.height, ih as f32);
+
+        // Render must not panic and produces a framebuffer.
+        let fb = e.render();
+        assert_eq!(fb.width, 400);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
