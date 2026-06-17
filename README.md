@@ -110,9 +110,10 @@ two-column layout, cards, and styling, with zero console errors. JS-app sites th
 their UI entirely at runtime (e.g. google.com — 95% `display:none` until its obfuscated JS
 runs) remain out of reach without a near-complete JS/web-platform implementation.
 
-Long pages **scroll** (mouse-wheel, per-tab, clamped to document height).
+Long pages **scroll** (mouse-wheel, per-tab, clamped to document height), and `<img>`
+**images** are fetched, decoded, and blitted (sized by CSS dims or decoded intrinsic size).
 
 Done: networking + external CSS/JS · HTML→DOM · tabs · JS (DOM bindings + timers + browser
-env) · CSS cascade · box-model + flexbox/grid/positioning layout + paint · scrolling.
-Roadmap: **images** · z-index paint order · floats · margin collapsing · fuller grid · DOM
-events on input · `fetch`/XHR · concurrent fetch · GPU rendering.
+env) · CSS cascade · box-model + flexbox/grid/positioning layout + paint · scrolling · images.
+Roadmap: z-index paint order · floats · margin collapsing · fuller grid · `data:`/SVG images ·
+DOM events on input · `fetch`/XHR · concurrent fetch · GPU rendering.
