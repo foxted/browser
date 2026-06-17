@@ -160,6 +160,19 @@ fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
 
 /// Replace all children of `id` with a single `Text` node holding `text`.
 fn set_text_content(doc: &mut dom::Document, id: dom::NodeId, text: &str) {
+    // For a Text/Comment node, mutating `.textContent`/`.data`/`.nodeValue` updates the node's own
+    // string value in place (Vue's `setText` patches text/comment anchors this way).
+    match &mut doc.get_mut(id).data {
+        dom::NodeData::Text(t) => {
+            *t = text.to_string();
+            return;
+        }
+        dom::NodeData::Comment(c) => {
+            *c = text.to_string();
+            return;
+        }
+        _ => {}
+    }
     let old: Vec<dom::NodeId> = std::mem::take(&mut doc.get_mut(id).children);
     for child in old {
         doc.get_mut(child).parent = None;
@@ -1178,6 +1191,17 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
       enumerable: true, configurable: true
     });
+    // `data` / `nodeValue` mirror textContent — used by Vue when patching text/comment anchors.
+    Object.defineProperty(el, "data", {
+      get: function () { return __textContent(id); },
+      set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(el, "nodeValue", {
+      get: function () { var t = __nodeType(id); return (t === 3 || t === 8) ? __textContent(id) : null; },
+      set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
+      enumerable: true, configurable: true
+    });
     Object.defineProperty(el, "innerHTML", {
       get: function () { return __innerHTML(id); },
       set: function (v) { __setInnerHTML(id, v == null ? "" : String(v)); },
@@ -2078,18 +2102,18 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // createTextNode / createComment / createDocumentFragment return lightweight node-ish objects.
   // They aren't backed by the real DOM arena (only createElement is), but they are appendable to
   // real elements as no-ops and carry the properties scripts read, so init code doesn't throw.
+  // Back text + comment nodes with REAL arena nodes (via the native primitives + __wrapNode) so
+  // they have a working parentNode / insertBefore / sibling chain. Vue uses comment + text nodes as
+  // fragment anchors and re-reads their parent on every re-render; a detached stub would make
+  // `parent.insertBefore(...)` throw (`parent` === null) during a component update.
   if (typeof document.createTextNode !== "function") {
     def(document, "createTextNode", function (data) {
-      return { nodeType: 3, nodeName: "" + String.fromCharCode(35) + "text", data: String(data == null ? "" : data),
-               textContent: String(data == null ? "" : data), nodeValue: String(data == null ? "" : data),
-               parentNode: null, childNodes: [], appendChild: function (c) { return c; }, cloneNode: function () { return this; } };
+      return __wrapNode(__createText(String(data == null ? "" : data)));
     });
   }
   if (typeof document.createComment !== "function") {
     def(document, "createComment", function (data) {
-      return { nodeType: 8, nodeName: "" + String.fromCharCode(35) + "comment", data: String(data == null ? "" : data),
-               textContent: String(data == null ? "" : data), nodeValue: String(data == null ? "" : data),
-               parentNode: null, childNodes: [], cloneNode: function () { return this; } };
+      return __wrapNode(__createComment(String(data == null ? "" : data)));
     });
   }
   if (typeof document.createDocumentFragment !== "function") {
@@ -2934,6 +2958,36 @@ fn resolve_module_callback<'s>(
     }
 }
 
+/// Promise reject callback: when a promise is rejected with no handler attached, V8 invokes this.
+/// Vue's dev build re-throws errors from inside reactive effects, which surface here as unhandled
+/// rejections during the microtask drain. Format the rejection value (its `.stack` if it's an
+/// Error, else its string coercion) and push it into the shared console buffer so it reaches the
+/// returned `EvalOutput.console`. Never panics.
+extern "C" fn promise_reject_callback(msg: v8::PromiseRejectMessage) {
+    if msg.get_event() != v8::PromiseRejectEvent::PromiseRejectWithNoHandler {
+        return;
+    }
+    v8::callback_scope!(unsafe scope, &msg);
+    let Some(value) = msg.get_value() else { return };
+    v8::scope!(let scope, scope);
+    // Prefer `.stack` when the rejection is an Error-like object.
+    let mut text = render_value(scope, value);
+    if value.is_object() {
+        if let Ok(obj) = v8::Local::<v8::Object>::try_from(value) {
+            if let Some(key) = v8::String::new(scope, "stack") {
+                if let Some(stack) = obj.get(scope, key.into()) {
+                    if stack.is_string() {
+                        text = render_value(scope, stack);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
+        state.console.borrow_mut().push(format!("⚠ Unhandled rejection: {text}"));
+    }
+}
+
 /// Dynamic `import(specifier)` host callback. The specifier is resolved against the importing
 /// module's URL (recovered from the resource name) and then get-or-(fetch+compile)d on demand —
 /// this is what unblocks runtime imports of modules NOT in the pre-fetched static graph. We
@@ -3042,6 +3096,7 @@ pub fn run_modules(
             let shared: SharedDoc = Rc::new(RefCell::new(doc));
             let mut isolate = v8::Isolate::new(v8::CreateParams::default());
             isolate.set_host_import_module_dynamically_callback(dynamic_import_callback);
+            isolate.set_promise_reject_callback(promise_reject_callback);
 
             let mut results: Vec<EvalOutput> = Vec::with_capacity(entries.len());
             {
@@ -3948,6 +4003,28 @@ mod tests {
         );
         assert_eq!(out.error, None, "{out:?}");
         assert_eq!(out.value.as_deref(), Some("3,hi,11,8"));
+    }
+
+    #[test]
+    fn created_text_comment_have_working_parent_chain() {
+        // Text + comment nodes are real arena nodes: once appended they expose a live parentNode and
+        // can be used as insertBefore anchors (the fragment-anchor pattern Vue relies on).
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var anchor = document.createComment('');
+                document.body.appendChild(anchor);
+                var t = document.createTextNode('x');
+                anchor.parentNode.insertBefore(t, anchor);
+                t.nodeValue = 'y';
+                [anchor.parentNode.nodeName, t.parentNode.__node === anchor.parentNode.__node, t.data].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("BODY|true|y"));
     }
 
     #[test]
