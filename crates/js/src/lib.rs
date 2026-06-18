@@ -2119,6 +2119,39 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       def(el, "style", makeStyle(node));
       def(el, "classList", makeClassList(node));
       def(el, "dataset", makeDataset(node));
+      // Form-control `value` / `checked` reflection: back them by element ATTRIBUTES so that
+      // reading/writing `el.value` (and `el.checked`) is visible to layout, which renders the
+      // input's text from the `value` attribute. Only for <input>/<textarea>/<select>; guard so
+      // page-defined accessors aren't clobbered.
+      try {
+        var __formTag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : "";
+        if (__formTag === "input" || __formTag === "textarea" || __formTag === "select") {
+          var __hasValue = false;
+          try { var __vd = Object.getOwnPropertyDescriptor(el, "value"); __hasValue = !!(__vd && (__vd.get || __vd.set)); } catch (e8) {}
+          if (!__hasValue) {
+            Object.defineProperty(el, "value", {
+              get: function () { var v = __getAttr(node, "value"); return v == null ? "" : String(v); },
+              set: function (v) { __setAttr(node, "value", String(v == null ? "" : v)); },
+              configurable: true, enumerable: true
+            });
+          }
+          // `checked` for checkbox/radio inputs, backed by presence of the `checked` attribute.
+          if (__formTag === "input") {
+            var __ty = String(__getAttr(node, "type") || "").toLowerCase();
+            if (__ty === "checkbox" || __ty === "radio") {
+              var __hasChecked = false;
+              try { var __cd = Object.getOwnPropertyDescriptor(el, "checked"); __hasChecked = !!(__cd && (__cd.get || __cd.set)); } catch (e9) {}
+              if (!__hasChecked) {
+                Object.defineProperty(el, "checked", {
+                  get: function () { return __getAttr(node, "checked") != null; },
+                  set: function (v) { if (v) { __setAttr(node, "checked", ""); } else { __removeAttr(node, "checked"); } },
+                  configurable: true, enumerable: true
+                });
+              }
+            }
+          }
+        }
+      } catch (e10) {}
     } else {
       // Detached/foreign object: fall back to inert stubs so access doesn't throw.
       if (!("style" in el) || el.style == null) { def(el, "style", { getPropertyValue: function () { return ""; }, setProperty: fn, removeProperty: function () { return ""; }, cssText: "" }); }
@@ -2971,6 +3004,63 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       }
     }
     return !ev.defaultPrevented;
+  });
+
+  // --- key input handler (driven from Rust on physical key presses) -------------------------
+  // Fire keydown, mutate the focused text field's value (firing input), then keyup. Returns
+  // nothing; the caller reads back the updated DOM snapshot. Text-like <input>/<textarea> only.
+  var textInputTypes = { text: 1, search: 1, email: 1, url: 1, tel: 1, password: 1, number: 1, "": 1 };
+  def(globalThis, "__handleKeyInput", function (nodeId, key, code) {
+    var el = null;
+    try { el = canon(__wrapNode(nodeId)); } catch (e) { el = null; }
+    if (!el) { return; }
+    key = String(key);
+    code = String(code);
+
+    // keydown — if defaultPrevented, still send keyup but skip the value mutation.
+    var allowMutation = __dispatchSyntheticEvent(nodeId, "keydown", { key: key, code: code });
+
+    if (allowMutation) {
+      var tag = "";
+      try { tag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : ""; } catch (e2) {}
+      var isTextarea = tag === "textarea";
+      var isTextInput = false;
+      if (tag === "input") {
+        var ty = "";
+        try { ty = String(__getAttr(nodeId, "type") || "").toLowerCase(); } catch (e3) {}
+        isTextInput = !!textInputTypes[ty] || ty === undefined;
+      }
+      var disabled = false, readonly = false;
+      try { disabled = __getAttr(nodeId, "disabled") != null; } catch (e4) {}
+      try { readonly = __getAttr(nodeId, "readonly") != null; } catch (e5) {}
+
+      if ((isTextInput || isTextarea) && !disabled && !readonly) {
+        var cur = "";
+        try { cur = el.value == null ? "" : String(el.value); } catch (e6) { cur = ""; }
+        var next = cur;
+        var mutated = false;
+        if (key === "Backspace") {
+          if (cur.length > 0) { next = cur.slice(0, -1); mutated = true; }
+          else { mutated = true; }
+        } else if (key === "Delete") {
+          // Simplified: drop the last char (no caret tracking).
+          if (cur.length > 0) { next = cur.slice(0, -1); mutated = true; }
+          else { mutated = true; }
+        } else if (key === "Enter") {
+          if (isTextarea) { next = cur + "\n"; mutated = true; }
+          // <input>: Enter submits; no value change here.
+        } else if (key.length === 1) {
+          next = cur + key; mutated = true;
+        }
+        if (mutated) {
+          try { el.value = next; } catch (e7) {}
+          __dispatchSyntheticEvent(nodeId, "input", {});
+        }
+      }
+    }
+
+    // keyup always fires.
+    __dispatchSyntheticEvent(nodeId, "keyup", { key: key, code: code });
   });
 })();
 "#;
@@ -3843,6 +3933,14 @@ enum SessionCmd {
         y: f64,
         reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
     },
+    /// Deliver a key press to a node (keydown → value mutation + input → keyup), drain the loop,
+    /// reply with snapshot + console.
+    Key {
+        node_id: usize,
+        key: String,
+        code: String,
+        reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
+    },
     /// Run due timers / microtasks, reply with snapshot + console.
     Tick {
         reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
@@ -3949,6 +4047,28 @@ impl Session {
         reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
     }
 
+    /// Deliver a key press to `node_id`: fires `keydown`, mutates the focused text field's value
+    /// (firing `input`) unless `keydown` was default-prevented, then fires `keyup`. Drains the
+    /// event loop and returns a fresh DOM snapshot + console. Synchronous (blocks on the reply).
+    pub fn dispatch_key(
+        &self,
+        node_id: usize,
+        key: &str,
+        code: &str,
+    ) -> (dom::Document, Vec<String>) {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<(dom::Document, Vec<String>)>();
+        let cmd = SessionCmd::Key {
+            node_id,
+            key: key.to_string(),
+            code: code.to_string(),
+            reply: reply_tx,
+        };
+        if self.tx.send(cmd).is_err() {
+            return (dom::Document::new(), Vec::new());
+        }
+        reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+    }
+
     /// Run due timers / microtasks (e.g. for animations or deferred work) and return a fresh DOM
     /// snapshot + console. Synchronous; empty snapshot/console if the session thread is gone.
     pub fn tick(&self) -> (dom::Document, Vec<String>) {
@@ -4044,6 +4164,22 @@ fn session_thread_main(
                 );
                 // Run the dispatch as one op, then drain the loop, folding console into a result.
                 let mut results = vec![eval_source(scope, &source, "<dispatch>")];
+                drain_event_loop(scope, &mut results);
+                let console = results.into_iter().flat_map(|r| r.console).collect();
+                let _ = reply.send((shared.borrow().clone(), console));
+            }
+            SessionCmd::Key { node_id, key, code, reply } => {
+                let ctx = context.clone();
+                v8::scope!(let handle_scope, &mut isolate);
+                let local_ctx = v8::Local::new(handle_scope, &ctx);
+                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let source = format!(
+                    "__handleKeyInput({}, {}, {})",
+                    node_id,
+                    js_string_literal(&key),
+                    js_string_literal(&code),
+                );
+                let mut results = vec![eval_source(scope, &source, "<key>")];
                 drain_event_loop(scope, &mut results);
                 let console = results.into_iter().flat_map(|r| r.console).collect();
                 let _ = reply.send((shared.borrow().clone(), console));
@@ -5343,5 +5479,53 @@ mod tests {
         let (after, _console) = session.dispatch_event(child.0, "click", 0.0, 0.0);
         let out = find_by_id(&after, after.root(), "out").expect("out node");
         assert_eq!(text_content(&after, out), "bubbled");
+    }
+
+    #[test]
+    fn session_key_input_appends_and_fires_input_handler() {
+        let doc = html::parse("<html><body><input id=f></body></html>");
+        let (session, snapshot, outputs) = Session::new(
+            doc,
+            vec![r#"
+                var i = document.getElementById('f');
+                i.addEventListener('input', function () {
+                    document.body.setAttribute('data-v', i.value);
+                });
+            "#
+            .to_string()],
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
+
+        let f = find_by_id(&snapshot, snapshot.root(), "f").expect("input node");
+        let (_after, _c) = session.dispatch_key(f.0, "a", "KeyA");
+        let (after, _c) = session.dispatch_key(f.0, "b", "KeyB");
+
+        let input = find_by_id(&after, after.root(), "f").expect("input node");
+        assert_eq!(attr_of(&after, input, "value").as_deref(), Some("ab"));
+        let body = find_by_tag(&after, after.root(), "body").expect("body node");
+        assert_eq!(attr_of(&after, body, "data-v").as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn session_key_backspace_drops_last_char() {
+        let doc = html::parse("<input id=f value=hi>");
+        let (session, snapshot, outputs) = Session::new(
+            doc,
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            "https://example.com/",
+            no_fetch(),
+        );
+        assert!(outputs.is_empty() || outputs.iter().all(|o| o.error.is_none()));
+
+        let f = find_by_id(&snapshot, snapshot.root(), "f").expect("input node");
+        let (after, _c) = session.dispatch_key(f.0, "Backspace", "Backspace");
+        let input = find_by_id(&after, after.root(), "f").expect("input node");
+        assert_eq!(attr_of(&after, input, "value").as_deref(), Some("h"));
     }
 }

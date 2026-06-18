@@ -197,3 +197,36 @@ pub unsafe extern "C" fn browser_engine_dispatch_click(engine: *mut Engine, x: f
         _ => 0,
     }
 }
+
+/// Whether a text `<input>`/`<textarea>` is currently focused (so the UI should route keystrokes
+/// into the page via [`browser_engine_dispatch_key`]). Returns 1 if focused, else 0.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_has_text_focus(engine: *mut Engine) -> i32 {
+    let Some(e) = engine.as_mut() else { return 0 };
+    if e.inner.has_text_focus() { 1 } else { 0 }
+}
+
+/// Deliver a key press to the focused text field's page JS. `key` is the DOM key value
+/// (e.g. "a", "Backspace", "Enter") and `code` the physical key code (e.g. "KeyA"), both NUL-
+/// terminated UTF-8. Updates the field value + fires keydown/input/keyup. Returns 1 if the DOM
+/// changed (re-render), else 0.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`]; `key`/`code` valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_dispatch_key(
+    engine: *mut Engine,
+    key: *const c_char,
+    code: *const c_char,
+) -> i32 {
+    let Some(e) = engine.as_mut() else { return 0 };
+    let key = if key.is_null() { return 0 } else { std::ffi::CStr::from_ptr(key).to_string_lossy().into_owned() };
+    let code = if code.is_null() { String::new() } else { std::ffi::CStr::from_ptr(code).to_string_lossy().into_owned() };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_key(&key, &code))) {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}

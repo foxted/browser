@@ -376,6 +376,48 @@ fn is_non_rendered_tag(tag: &str) -> bool {
     )
 }
 
+/// The text a form control (`<input>` / `<textarea>`) should render inside its box, or `None`
+/// if `el` isn't such a control. Returns `Some(String)` (possibly empty → a styled-but-empty box):
+///   * `<textarea>`: its live `value` attribute (or empty);
+///   * text-like `<input>` (text/search/email/url/tel/password/number/no-type): its `value`
+///     (with `type=password` masked to bullets), else its `placeholder`, else empty;
+///   * `<input type=submit|button|reset>`: its `value` as the button label (defaulting to a
+///     conventional label when absent);
+///   * other input types (checkbox/radio/hidden/file/image/color/range/date…): `None` (no text).
+fn input_display_text(el: &dom::ElementData) -> Option<String> {
+    let attr = |name: &str| el.attrs.get(name).map(|s| s.as_str());
+    if el.tag.eq_ignore_ascii_case("textarea") {
+        return Some(attr("value").unwrap_or("").to_string());
+    }
+    if !el.tag.eq_ignore_ascii_case("input") {
+        return None;
+    }
+    let ty = attr("type").unwrap_or("").trim().to_ascii_lowercase();
+    let text_like = matches!(
+        ty.as_str(),
+        "" | "text" | "search" | "email" | "url" | "tel" | "password" | "number"
+    );
+    if text_like {
+        let value = attr("value").unwrap_or("");
+        if !value.is_empty() {
+            if ty == "password" {
+                return Some("\u{2022}".repeat(value.chars().count()));
+            }
+            return Some(value.to_string());
+        }
+        return Some(attr("placeholder").unwrap_or("").to_string());
+    }
+    if matches!(ty.as_str(), "submit" | "button" | "reset") {
+        let default = match ty.as_str() {
+            "submit" => "Submit",
+            "reset" => "Reset",
+            _ => "",
+        };
+        return Some(attr("value").unwrap_or(default).to_string());
+    }
+    None
+}
+
 /// Build the paint style for an element from its computed style.
 fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
     PaintStyle {
@@ -516,6 +558,30 @@ fn build_box(
                 // Pre-size the content box so layout can read the replaced size back.
                 bx.dimensions.content.width = cw;
                 bx.dimensions.content.height = ch;
+                out.push(bx);
+                return;
+            }
+            // Form controls (<input>, <textarea>): build the element's own styled box, then give
+            // it a synthetic Text child rendering the live `value` (or the `placeholder`). The box
+            // still sizes from CSS (the UA stylesheet gives form controls a width); we only add the
+            // text run so typed text / labels / placeholders appear and paint inside the control.
+            if let Some(label) = input_display_text(el) {
+                let out_of_flow =
+                    matches!(cs.position, style::Position::Absolute | style::Position::Fixed);
+                let block_display = matches!(
+                    cs.display,
+                    style::Display::Block | style::Display::Flex | style::Display::Grid
+                ) || (cs.display == style::Display::Inline && cs.display_block);
+                let is_block = out_of_flow || block_display;
+                let ps = paint_style_of(cs);
+                let content = if is_block { BoxContent::Block } else { BoxContent::Inline };
+                let mut bx = LayoutBox::new(content, ps.clone(), Some(id));
+                bx.dimensions.margin = edges_of(cs.margin);
+                bx.dimensions.padding = edges_of(cs.padding);
+                bx.dimensions.border = edges_of(cs.border);
+                if !label.is_empty() {
+                    bx.children.push(LayoutBox::new(BoxContent::Text(label), ps, Some(id)));
+                }
                 out.push(bx);
                 return;
             }
@@ -3091,6 +3157,28 @@ mod tests {
         assert_eq!(ibox.dimensions.content.width, 100.0);
         assert_eq!(ibox.dimensions.content.height, 50.0);
         assert_eq!(ibox.node, Some(img));
+    }
+
+    #[test]
+    fn input_with_value_produces_text_child() {
+        // body > input value="hello" → the input box has a Text("hello") child.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let input = doc.append_element(body, "input");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(input).data {
+            e.attrs.insert("value".to_string(), "hello".to_string());
+        }
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(input, style::ComputedStyle { width: Some(120.0), ..Default::default() });
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new());
+        let txt = find_box(&root_box, &|x| matches!(&x.content, BoxContent::Text(s) if s == "hello"));
+        let txt = txt.expect("input value must render as a Text box");
+        // The rendered text traces back to the input element.
+        assert_eq!(txt.node, Some(input));
     }
 
     #[test]

@@ -69,6 +69,10 @@ pub struct Engine {
     /// handlers fire and timers keep running — i.e. the page is interactive. Replaced (old one
     /// dropped → its thread stops) on each navigation; `None` for pages without scripts.
     session: Option<js::Session>,
+    /// The currently focused editable text field (`<input>` text-like / `<textarea>`), if any.
+    /// Set when a click lands on such a control; key events are routed here. Cleared on navigation
+    /// and when a click lands elsewhere.
+    focused_node: Option<dom::NodeId>,
 }
 
 impl Default for Engine {
@@ -89,6 +93,7 @@ impl Engine {
             layout_cache: None,
             framebuffer: None,
             session: None,
+            focused_node: None,
         }
     }
 
@@ -111,6 +116,7 @@ impl Engine {
     pub fn load_url(&mut self, url: &str) -> i32 {
         self.scroll_y = 0.0; // new navigation starts at the top
         self.layout_cache = None; // invalidate cached layout for the previous page
+        self.focused_node = None; // a new page has no focused field
         match net::fetch(url) {
             Ok(resp) => {
                 // Parse HTML responses into a DOM; other content types just record metadata.
@@ -386,13 +392,59 @@ impl Engine {
         let cy = (y / self.scale) as f64;
         let (mut snapshot, console) = session.dispatch_event(node.0, "click", cx, cy);
         snapshot.prune_invalid();
+        // Update text focus: the nearest ancestor-or-self of the hit node that is an editable
+        // text field (text-like <input> / <textarea>), else clear focus. Computed against the new
+        // snapshot so the node ids are valid in the doc we're about to store.
+        let focus = editable_text_ancestor(&snapshot, node);
         if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
             *doc = Some(snapshot);
             c.extend(console);
+            self.focused_node = focus;
             self.layout_cache = None; // DOM may have changed → re-cascade/layout/paint
             true
         } else {
             false
+        }
+    }
+
+    /// Deliver a physical key press to the focused text field, if any. Routes through the live JS
+    /// session (fires keydown → value mutation + input → keyup), adopts the updated DOM snapshot,
+    /// and invalidates the layout cache. Returns `true` if a focused field consumed the key (a
+    /// re-render is warranted), `false` if there was no focused field or no session.
+    pub fn dispatch_key(&mut self, key: &str, code: &str) -> bool {
+        let node = match self.focused_node {
+            Some(n) => n,
+            None => return false,
+        };
+        let session = match &self.session {
+            Some(s) => s,
+            None => return false,
+        };
+        let (mut snapshot, console) = session.dispatch_key(node.0, key, code);
+        snapshot.prune_invalid();
+        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            *doc = Some(snapshot);
+            c.extend(console);
+            self.layout_cache = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Whether the engine currently has an editable text field (text-like `<input>` / `<textarea>`)
+    /// focused in the live document. The platform layer can use this to decide whether to forward
+    /// key events to the page (vs. treating them as browser shortcuts).
+    pub fn has_text_focus(&self) -> bool {
+        let node = match self.focused_node {
+            Some(n) => n,
+            None => return false,
+        };
+        match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => {
+                node.0 < d.len() && is_editable_text_field(d, node)
+            }
+            _ => false,
         }
     }
 
@@ -421,6 +473,49 @@ impl Engine {
             LoadState::Loaded { doc: Some(d), .. } => extract_visible_text(d),
             _ => String::new(),
         }
+    }
+
+    /// Test-only: focus the first editable text field in the live document (by walking the DOM),
+    /// returning whether one was found. Sidesteps coordinate-precise click-to-focus in tests.
+    #[cfg(test)]
+    fn focus_first_text_field(&mut self) -> bool {
+        let found = match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => {
+                fn walk(doc: &dom::Document, id: dom::NodeId) -> Option<dom::NodeId> {
+                    if is_editable_text_field(doc, id) {
+                        return Some(id);
+                    }
+                    for &c in &doc.get(id).children {
+                        if let Some(f) = walk(doc, c) {
+                            return Some(f);
+                        }
+                    }
+                    None
+                }
+                walk(d, d.root())
+            }
+            _ => None,
+        };
+        self.focused_node = found;
+        found.is_some()
+    }
+
+    /// Test-only: the `value` attribute of a node in the live document.
+    #[cfg(test)]
+    fn node_attr(&self, id: dom::NodeId, name: &str) -> Option<String> {
+        match &self.state {
+            LoadState::Loaded { doc: Some(d), .. } => match &d.get(id).data {
+                dom::NodeData::Element(e) => e.attrs.get(name).cloned(),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Test-only: the node id of the currently focused field.
+    #[cfg(test)]
+    fn focused_node_for_test(&self) -> Option<dom::NodeId> {
+        self.focused_node
     }
 
     /// Test-only: number of decoded `<img>` images for the current page.
@@ -544,6 +639,46 @@ fn deepest_node_at(b: &layout::LayoutBox, x: f32, y: f32) -> Option<dom::NodeId>
     } else {
         None
     }
+}
+
+/// True if `id` is an editable text field: a text-like `<input>` (type text/search/email/url/tel/
+/// password/number/none) or a `<textarea>`, and not `disabled`/`readonly`. These are the controls
+/// that accept typed character input.
+fn is_editable_text_field(doc: &dom::Document, id: dom::NodeId) -> bool {
+    let el = match &doc.get(id).data {
+        dom::NodeData::Element(e) => e,
+        _ => return false,
+    };
+    if el.attrs.contains_key("disabled") || el.attrs.contains_key("readonly") {
+        return false;
+    }
+    if el.tag.eq_ignore_ascii_case("textarea") {
+        return true;
+    }
+    if !el.tag.eq_ignore_ascii_case("input") {
+        return false;
+    }
+    let ty = el.attrs.get("type").map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    matches!(
+        ty.as_str(),
+        "" | "text" | "search" | "email" | "url" | "tel" | "password" | "number"
+    )
+}
+
+/// Walk from `node` up the ancestor chain, returning the first node (including `node` itself) that
+/// is an editable text field (see [`is_editable_text_field`]), or `None` if none is found.
+fn editable_text_ancestor(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
+    let mut cur = Some(node);
+    while let Some(id) = cur {
+        if id.0 >= doc.len() {
+            break;
+        }
+        if is_editable_text_field(doc, id) {
+            return Some(id);
+        }
+        cur = doc.get(id).parent;
+    }
+    None
 }
 
 /// Recursively paint a layout box and its children, translating every box by the fixed
@@ -1983,6 +2118,37 @@ mod tests {
         e.scroll_by(-100000.0);
         let back = center_column(e.render()).clone();
         assert_eq!(top, back, "scrolling back to the top restores the original render");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn typing_into_focused_input_updates_value() {
+        // A page with a text input and a trivial inline script (so a JS session is started).
+        let html = "<html><body><input id=f>\
+            <script>window.__ready = true;</script></body></html>";
+        let path = std::env::temp_dir().join("browser_input_focus_test.html");
+        std::fs::write(&path, html).unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(200, 120, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        // Build the layout cache (also proves the input box lays out without panicking).
+        let _ = e.render();
+
+        // Focus the input (click-to-focus is fiddly for an empty zero-width control in a test).
+        assert!(e.focus_first_text_field(), "page must have an editable text field");
+        let f = e.focused_node_for_test().expect("focused node");
+        assert!(e.has_text_focus(), "an input must report text focus");
+
+        // Type "h" then "i": the input's value attribute reflects the typed text.
+        assert!(e.dispatch_key("h", "KeyH"));
+        assert!(e.dispatch_key("i", "KeyI"));
+        assert_eq!(e.node_attr(f, "value").as_deref(), Some("hi"));
+
+        // Backspace removes the last character.
+        assert!(e.dispatch_key("Backspace", "Backspace"));
+        assert_eq!(e.node_attr(f, "value").as_deref(), Some("h"));
 
         let _ = std::fs::remove_file(&path);
     }

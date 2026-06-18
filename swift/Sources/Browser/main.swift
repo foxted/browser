@@ -16,6 +16,17 @@ final class BitmapView: NSView {
     /// Asked whether a view-local point (points, bottom-left origin) is over a link, so the
     /// cursor can switch to a pointing hand on hover. Returns true if a link is there.
     var isLinkAt: ((CGPoint) -> Bool)?
+    /// Called with a key event when the view has focus. Return true if the page consumed it
+    /// (e.g. typing into a focused field); false to let it propagate (menu shortcuts, etc.).
+    var onKeyDown: ((NSEvent) -> Bool)?
+
+    // Accept keyboard focus so typing into a page text field routes here.
+    override var acceptsFirstResponder: Bool { true }
+
+    override func keyDown(with event: NSEvent) {
+        if onKeyDown?(event) == true { return }
+        super.keyDown(with: event)
+    }
 
     private static let emptyColor = NSColor(calibratedRed: 0.07, green: 0.07, blue: 0.08, alpha: 1.0)
 
@@ -175,6 +186,14 @@ final class Tab {
     var pendingLoads: Int = 0
     /// Set when the tab is closed but a load is still running; the engine is freed once it drains.
     var freeWhenIdle: Bool = false
+
+    /// Serial queue for ALL engine mutations (loads) on this tab, so two navigations can never
+    /// run `browser_engine_load_url` on the same engine concurrently (that would be a data race),
+    /// and they apply in order — the latest navigation wins.
+    let engineQueue = DispatchQueue(label: "browser.tab.engine")
+    /// Bumped on every navigation. A load's completion only applies its result if it's still the
+    /// current generation, so a slow earlier load can't clobber a newer navigation.
+    var loadGeneration: Int = 0
 
     init() {
         engine = browser_engine_new()
@@ -494,6 +513,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.onScroll = { [weak self] dyPoints in self?.scrollActiveTab(dyPoints) }
         bitmapView.onClick = { [weak self] point in self?.handleContentClick(point) }
         bitmapView.isLinkAt = { [weak self] point in self?.linkURL(at: point) != nil }
+        bitmapView.onKeyDown = { [weak self] event in self?.handleKeyDown(event) ?? false }
         content.addSubview(bitmapView)
 
         // MARK: Auto Layout
@@ -901,14 +921,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     /// page's own handlers run — interactivity); then, if the click landed on a link, navigates
     /// (recording history so Back works). If JS mutated the DOM but it wasn't a link, re-renders.
     private func handleContentClick(_ localPoint: CGPoint) {
-        guard let engine = activeTab?.engine, let bitmapView = bitmapView else { return }
+        guard let tab = activeTab, let engine = tab.engine, let bitmapView = bitmapView else { return }
         let scale = CGFloat(window?.backingScaleFactor ?? 1)
         let fyTop = bitmapView.bounds.height - localPoint.y
         let fxDevice = Float(localPoint.x * scale)
         let fyDevice = Float(fyTop * scale)
 
-        // 1. Fire the page's JS click handlers (bubbling). Returns 1 if the DOM changed.
-        let changed = browser_engine_dispatch_click(engine, fxDevice, fyDevice)
+        // 1. Fire the page's JS click handlers (bubbling). Returns 1 if the DOM changed. Skip while
+        // a load is running on the engine queue (would race the background mutation).
+        let changed = tab.pendingLoads == 0 ? browser_engine_dispatch_click(engine, fxDevice, fyDevice) : 0
 
         // 2. If it landed on a link, navigate (supersedes a re-render).
         if let cstr = browser_engine_link_at(engine, fxDevice, fyDevice) {
@@ -919,8 +940,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
-        // 3. Otherwise, repaint if the JS handler changed the page.
+        // 3. If the click focused a text field, take keyboard focus so typing routes to the page.
+        if browser_engine_has_text_focus(engine) != 0 {
+            window?.makeFirstResponder(bitmapView)
+        }
+
+        // 4. Otherwise, repaint if the JS handler changed the page.
         if changed != 0 { refresh() }
+    }
+
+    /// Route a key event to the focused page text field. Returns true if consumed. Lets anything
+    /// with a Command modifier (menu shortcuts) propagate, and only acts when a field is focused.
+    private func handleKeyDown(_ event: NSEvent) -> Bool {
+        guard let tab = activeTab, let engine = tab.engine, tab.pendingLoads == 0 else { return false }
+        if event.modifierFlags.contains(.command) { return false }
+        guard browser_engine_has_text_focus(engine) != 0 else { return false }
+
+        // Map the AppKit key event to a DOM key name + a rough physical code.
+        let (key, code) = Self.domKey(for: event)
+        guard !key.isEmpty else { return false }
+
+        let changed = key.withCString { k in code.withCString { c in
+            browser_engine_dispatch_key(engine, k, c)
+        } }
+        if changed != 0 { refresh() }
+        return true
+    }
+
+    /// Translate an NSEvent into a (DOM `key`, DOM `code`) pair.
+    private static func domKey(for event: NSEvent) -> (String, String) {
+        switch event.keyCode {
+        case 51: return ("Backspace", "Backspace")
+        case 117: return ("Delete", "Delete")
+        case 36, 76: return ("Enter", "Enter")
+        case 48: return ("Tab", "Tab")
+        case 53: return ("Escape", "Escape")
+        case 123: return ("ArrowLeft", "ArrowLeft")
+        case 124: return ("ArrowRight", "ArrowRight")
+        case 125: return ("ArrowDown", "ArrowDown")
+        case 126: return ("ArrowUp", "ArrowUp")
+        case 49: return (" ", "Space")
+        default:
+            // Printable characters: use what the keyboard produced (respects shift/layout).
+            let chars = event.characters ?? ""
+            if let scalar = chars.unicodeScalars.first, scalar.value >= 0x20, chars.count == 1 {
+                let ignoring = (event.charactersIgnoringModifiers ?? chars).uppercased()
+                let code: String
+                if let c = ignoring.first, c.isLetter { code = "Key\(c)" }
+                else if let c = ignoring.first, c.isNumber { code = "Digit\(c)" }
+                else { code = "" }
+                return (chars, code)
+            }
+            return ("", "")
+        }
     }
 
     // MARK: Rendering
@@ -1032,8 +1104,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         tab.pendingLoads += 1
         inFlightLoads += 1
         progress.startAnimation(nil)
+        // This navigation supersedes any earlier in-flight one on this tab.
+        tab.loadGeneration += 1
+        let generation = tab.loadGeneration
 
-        DispatchQueue.global().async { [weak self] in
+        // Run on the tab's SERIAL engine queue: loads never overlap on one engine, and they apply
+        // in navigation order. A superseded load (generation mismatch) still runs to completion
+        // but does not touch the UI.
+        tab.engineQueue.async { [weak self] in
             // `tab` is captured strongly so the engine stays alive for the whole call;
             // closeTab() defers the actual free until pendingLoads drains (see freeEngine()).
             _ = urlCopy.withCString { cstr in
@@ -1052,6 +1130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                     self.inFlightLoads = 0
                     self.progress.stopAnimation(nil)
                 }
+                // A newer navigation has superseded this one: don't clobber its title/render.
+                if tab.loadGeneration != generation { return }
                 // Use the page's <title> for the tab label (fall back to the host title).
                 if let cstr = browser_engine_title(engine) {
                     let pageTitle = String(cString: cstr)

@@ -117,6 +117,26 @@ const char *browser_engine_link_at(struct Engine *engine, float x, float y);
  */
 int32_t browser_engine_dispatch_click(struct Engine *engine, float x, float y);
 
+/**
+ * Whether a text `<input>`/`<textarea>` is currently focused (so the UI should route keystrokes
+ * into the page via [`browser_engine_dispatch_key`]). Returns 1 if focused, else 0.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+int32_t browser_engine_has_text_focus(struct Engine *engine);
+
+/**
+ * Deliver a key press to the focused text field's page JS. `key` is the DOM key value
+ * (e.g. "a", "Backspace", "Enter") and `code` the physical key code (e.g. "KeyA"), both NUL-
+ * terminated UTF-8. Updates the field value + fires keydown/input/keyup. Returns 1 if the DOM
+ * changed (re-render), else 0.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`]; `key`/`code` valid C strings.
+ */
+int32_t browser_engine_dispatch_key(struct Engine *engine, const char *key, const char *code);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus
