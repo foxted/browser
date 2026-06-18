@@ -331,12 +331,97 @@ pub fn cascade(
 ) -> HashMap<dom::NodeId, ComputedStyle> {
     let ua = user_agent_stylesheet();
     let mut out = HashMap::new();
+    // Build the selector index ONCE over UA + author sheets, so every node shares it instead
+    // of re-scanning (and re-parsing) all rules per element.
+    let index = SelectorIndex::build(&ua, sheets);
     // The root inherits from a fresh default style.
     let initial = ComputedStyle::default();
     // Custom properties (`--name`) inherit; the root starts with an empty environment.
     let initial_vars: HashMap<String, String> = HashMap::new();
-    cascade_node(doc, doc.root(), &initial, &initial_vars, false, &ua, sheets, &mut out);
+    cascade_node(doc, doc.root(), &initial, &initial_vars, false, &index, &mut out);
     out
+}
+
+/// One indexed selector. Points back at the rule's declarations and carries everything needed
+/// to confirm a full compound match and slot the result into the cascade ordering.
+struct Entry<'a> {
+    /// 0 = UA origin, 1 = author origin (matches `MatchEntry.origin`).
+    origin: u8,
+    /// Global source order, incremented across UA rules then author rules in sheet/rule order
+    /// — identical to the `order` the brute-force scan assigns.
+    order: usize,
+    /// The compiled selector this entry was indexed under (used to verify the full compound).
+    compiled: Compiled,
+    /// The rule's declarations (applied as a unit when any of its selectors match).
+    decls: &'a [(String, String)],
+}
+
+/// An index over all UA + author selectors, bucketed most-selective-key-first so a given
+/// element only has to test the handful of rules that could plausibly match it (those keyed
+/// by its id, one of its classes, its tag, or the universal/`:root` catch-all) instead of
+/// every rule in every sheet.
+///
+/// Built once per [`cascade`]. Rules whose `@media`/`@container` doesn't apply are dropped at
+/// build time (those conditions don't depend on the element). Selectors that the matcher would
+/// never match (combinators etc.) are dropped entirely.
+struct SelectorIndex<'a> {
+    by_id: HashMap<String, Vec<Entry<'a>>>,
+    by_class: HashMap<String, Vec<Entry<'a>>>,
+    by_type: HashMap<String, Vec<Entry<'a>>>,
+    universal: Vec<Entry<'a>>,
+}
+
+impl<'a> SelectorIndex<'a> {
+    fn build(ua: &'a css::Stylesheet, author: &'a [css::Stylesheet]) -> SelectorIndex<'a> {
+        let mut idx = SelectorIndex {
+            by_id: HashMap::new(),
+            by_class: HashMap::new(),
+            by_type: HashMap::new(),
+            universal: Vec::new(),
+        };
+        let mut order = 0usize;
+        // UA rules first, then author rules — preserving the exact global ordering the
+        // brute-force scan assigns (order increments across every rule whether or not it is
+        // indexed).
+        for rule in &ua.rules {
+            idx.add_rule(rule, 0, order);
+            order += 1;
+        }
+        for sheet in author {
+            for rule in &sheet.rules {
+                idx.add_rule(rule, 1, order);
+                order += 1;
+            }
+        }
+        idx
+    }
+
+    /// Index every (indexable) selector of one rule, unless its media/container precludes it.
+    fn add_rule(&mut self, rule: &'a css::Rule, origin: u8, order: usize) {
+        // media/container don't depend on the element, so evaluate once here and skip the
+        // whole rule if it doesn't apply (it can never contribute to any element).
+        if !(media_applies(rule.media.as_deref()) && container_applies(rule.container.as_deref())) {
+            return;
+        }
+        for sel in &rule.selectors {
+            let Some(compiled) = compile_selector(sel) else {
+                continue; // unsupported selector — never matches, drop it
+            };
+            let entry = Entry { origin, order, compiled: compiled.clone(), decls: &rule.declarations };
+            // Bucket under the single most-selective key available.
+            if let Some(id) = compiled.ids.first() {
+                self.by_id.entry(id.clone()).or_default().push(entry);
+            } else if let Some(class) = compiled.classes.first() {
+                self.by_class.entry(class.clone()).or_default().push(entry);
+            } else if let Some(t) = &compiled.type_part {
+                // `type_part` is already lowercased — the query side lowercases the tag too.
+                self.by_type.entry(t.clone()).or_default().push(entry);
+            } else {
+                // `*` or `:root` — no id/class/type key.
+                self.universal.push(entry);
+            }
+        }
+    }
 }
 
 /// Assumed viewport width (px) used to evaluate `min-width`/`max-width` media queries during
@@ -362,14 +447,13 @@ fn cascade_node(
     parent: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
     parent_hidden: bool,
-    ua: &css::Stylesheet,
-    author: &[css::Stylesheet],
+    index: &SelectorIndex,
     out: &mut HashMap<dom::NodeId, ComputedStyle>,
 ) {
     let node = doc.get(id);
     let (computed, vars) = if let dom::NodeData::Element(el) = &node.data {
         let (style, vars) =
-            compute_element_style(el, parent, parent_vars, parent_hidden, ua, author);
+            compute_element_style(el, parent, parent_vars, parent_hidden, index);
         out.insert(id, style.clone());
         (style, vars)
     } else {
@@ -379,19 +463,18 @@ fn cascade_node(
     };
     let hidden = parent_hidden || computed.display_none;
     for &child in &node.children {
-        cascade_node(doc, child, &computed, &vars, hidden, ua, author, out);
+        cascade_node(doc, child, &computed, &vars, hidden, index, out);
     }
 }
 
 /// Resolve one element's computed style: gather matching declarations from all origins in
 /// precedence order, apply them, then layer inheritance.
-fn compute_element_style(
+fn compute_element_style<'a>(
     el: &dom::ElementData,
     parent: &ComputedStyle,
     parent_vars: &HashMap<String, String>,
     parent_hidden: bool,
-    ua: &css::Stylesheet,
-    author: &[css::Stylesheet],
+    index: &'a SelectorIndex<'a>,
 ) -> (ComputedStyle, HashMap<String, String>) {
     // Start from inherited values; non-inherited properties get reset below.
     let mut style = ComputedStyle {
@@ -462,25 +545,51 @@ fn compute_element_style(
         decls: &'a [(String, String)],
     }
     let mut matches: Vec<MatchEntry> = Vec::new();
-    let mut order = 0usize;
 
-    for rule in &ua.rules {
-        if media_applies(rule.media.as_deref()) && container_applies(rule.container.as_deref()) {
-            if let Some(spec) = rule_specificity(&rule.selectors, el) {
-                matches.push(MatchEntry { origin: 0, specificity: spec, order, decls: &rule.declarations });
+    // Gather only the rules that could match this element via the index, instead of scanning
+    // every rule in every sheet. We dedup per rule (keyed by its unique global `order`),
+    // keeping the MAX specificity across that rule's matching selectors — exactly what the
+    // brute-force `rule_specificity` (max over comma selectors) produced.
+    //
+    // `best_by_order` maps a rule's `order` to its (origin, max-specificity, decls). A rule's
+    // origin and decls are constant for a given order, so the only thing we fold is the max
+    // specificity.
+    let mut best_by_order: HashMap<usize, (u8, u32, &[(String, String)])> = HashMap::new();
+    let mut consider = |entry: &Entry<'a>| {
+        if matches_compiled(&entry.compiled, el) {
+            best_by_order
+                .entry(entry.order)
+                .and_modify(|(_, spec, _)| *spec = (*spec).max(entry.compiled.specificity))
+                .or_insert((entry.origin, entry.compiled.specificity, entry.decls));
+        }
+    };
+
+    if let Some(id) = el.id() {
+        if let Some(bucket) = index.by_id.get(id) {
+            for e in bucket {
+                consider(e);
             }
         }
-        order += 1;
     }
-    for sheet in author {
-        for rule in &sheet.rules {
-            if media_applies(rule.media.as_deref()) && container_applies(rule.container.as_deref()) {
-                if let Some(spec) = rule_specificity(&rule.selectors, el) {
-                    matches.push(MatchEntry { origin: 1, specificity: spec, order, decls: &rule.declarations });
-                }
+    for class in el.classes() {
+        if let Some(bucket) = index.by_class.get(class) {
+            for e in bucket {
+                consider(e);
             }
-            order += 1;
         }
+    }
+    let tag_lower = el.tag.to_lowercase();
+    if let Some(bucket) = index.by_type.get(&tag_lower) {
+        for e in bucket {
+            consider(e);
+        }
+    }
+    for e in &index.universal {
+        consider(e);
+    }
+
+    for (order, (origin, specificity, decls)) in best_by_order {
+        matches.push(MatchEntry { origin, specificity, order, decls });
     }
 
     // Inline style is its own origin with highest precedence.
@@ -490,7 +599,10 @@ fn compute_element_style(
         .map(|s| css::parse_declarations(s))
         .unwrap_or_default();
     if !inline_decls.is_empty() {
-        matches.push(MatchEntry { origin: 2, specificity: 0, order, decls: &inline_decls });
+        // Inline is the sole origin-2 entry; the sort tiebreaks on `order` only within the
+        // same origin/specificity, so the exact value is immaterial. Use MAX to keep the
+        // "applied last" intent explicit.
+        matches.push(MatchEntry { origin: 2, specificity: 0, order: usize::MAX, decls: &inline_decls });
     }
 
     // Sort by (origin, specificity, order) ascending so the winner is applied last.
@@ -2162,6 +2274,10 @@ fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
 
 /// If any selector in `selectors` matches `el`, return the highest specificity among the
 /// matching ones (encoded as id*100 + class*10 + type). `None` if none match.
+///
+/// The cascade now matches via [`SelectorIndex`] rather than calling this per rule, but it is
+/// retained as the reference single-rule matcher (used by tests / external callers).
+#[allow(dead_code)]
 fn rule_specificity(selectors: &[String], el: &dom::ElementData) -> Option<u32> {
     let mut best: Option<u32> = None;
     for sel in selectors {
@@ -2172,21 +2288,52 @@ fn rule_specificity(selectors: &[String], el: &dom::ElementData) -> Option<u32> 
     best
 }
 
-/// Match a *simple* selector against an element. Supports a single tag, a single class
-/// (`.x`), a single id (`#id`), the universal `*`, and one compound of a tag plus one
-/// class/id (e.g. `p.note`, `a#home`). Returns the selector's specificity if it matches.
-fn match_simple_selector(sel: &str, el: &dom::ElementData) -> Option<u32> {
+/// A pre-parsed simple/compound selector. Produced once by [`compile_selector`] and reused
+/// both by [`match_simple_selector`] and the cascade's selector index. Holding the parsed
+/// components avoids re-parsing the selector string on every element.
+#[derive(Debug, Clone)]
+struct Compiled {
+    /// The leading type, lowercased (matched case-insensitively against the element tag). A
+    /// universal `*` prefix is represented as `None` (matches any type, no type specificity).
+    type_part: Option<String>,
+    /// Required classes (matched case-sensitively, like the original matcher).
+    classes: Vec<String>,
+    /// Required ids (matched case-sensitively).
+    ids: Vec<String>,
+    /// Precomputed specificity = ids*100 + classes*10 + (has_type?1:0).
+    specificity: u32,
+    /// True for the `:root` pseudo (matches an `html` element with specificity 10).
+    matches_root: bool,
+}
+
+/// Parse a single COMPOUND selector into a [`Compiled`], or `None` if the selector uses
+/// syntax this engine never matches (combinators, spaces, attributes, pseudos other than
+/// `:root`). This is the SINGLE source of truth for selector parsing — [`match_simple_selector`]
+/// and the cascade index both go through it, so matching behavior stays byte-identical.
+fn compile_selector(sel: &str) -> Option<Compiled> {
     let sel = sel.trim();
     if sel.is_empty() {
         return None;
     }
     if sel == "*" {
-        return Some(0);
+        return Some(Compiled {
+            type_part: None,
+            classes: Vec::new(),
+            ids: Vec::new(),
+            specificity: 0,
+            matches_root: false,
+        });
     }
     // `:root` matches the document root element (the `<html>` element). We approximate by
     // matching any `html` element. Specificity of a pseudo-class is class-level (10).
     if sel.eq_ignore_ascii_case(":root") {
-        return if el.tag.eq_ignore_ascii_case("html") { Some(10) } else { None };
+        return Some(Compiled {
+            type_part: None,
+            classes: Vec::new(),
+            ids: Vec::new(),
+            specificity: 10,
+            matches_root: true,
+        });
     }
 
     // Split a compound selector into its components: a leading optional type, then a run of
@@ -2207,7 +2354,7 @@ fn match_simple_selector(sel: &str, el: &dom::ElementData) -> Option<u32> {
         if t == "*" {
             // universal prefix; contributes no specificity, matches any type
         } else if is_ident(&t) {
-            type_part = Some(t);
+            type_part = Some(t.to_lowercase());
         } else {
             // Unsupported selector syntax (combinators, attributes, pseudo, etc.).
             return None;
@@ -2235,28 +2382,52 @@ fn match_simple_selector(sel: &str, el: &dom::ElementData) -> Option<u32> {
         }
     }
 
-    // Now test the components against the element.
-    if let Some(t) = &type_part {
-        if !el.tag.eq_ignore_ascii_case(t) {
-            return None;
-        }
-    }
-    for id in &ids {
-        match el.id() {
-            Some(eid) if eid == id => {}
-            _ => return None,
-        }
-    }
-    for class in &classes {
-        if !el.classes().any(|c| c == class) {
-            return None;
-        }
-    }
-
-    let spec = (ids.len() as u32) * 100
+    let specificity = (ids.len() as u32) * 100
         + (classes.len() as u32) * 10
         + (type_part.is_some() as u32);
-    Some(spec)
+    Some(Compiled { type_part, classes, ids, specificity, matches_root: false })
+}
+
+/// Test an already-compiled selector against an element. Returns its specificity if every
+/// component matches. Mirrors the original [`match_simple_selector`] tests exactly.
+fn matches_compiled(c: &Compiled, el: &dom::ElementData) -> bool {
+    if c.matches_root {
+        return el.tag.eq_ignore_ascii_case("html");
+    }
+    if let Some(t) = &c.type_part {
+        // `type_part` is already lowercased; compare case-insensitively against the tag.
+        if !el.tag.eq_ignore_ascii_case(t) {
+            return false;
+        }
+    }
+    for id in &c.ids {
+        match el.id() {
+            Some(eid) if eid == id => {}
+            _ => return false,
+        }
+    }
+    for class in &c.classes {
+        if !el.classes().any(|cl| cl == class) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Match a *simple* selector against an element. Supports a single tag, a single class
+/// (`.x`), a single id (`#id`), the universal `*`, and one compound of a tag plus one
+/// class/id (e.g. `p.note`, `a#home`). Returns the selector's specificity if it matches.
+///
+/// Thin wrapper over [`compile_selector`] + [`matches_compiled`] so its behavior stays
+/// byte-identical to the indexed path.
+#[allow(dead_code)]
+fn match_simple_selector(sel: &str, el: &dom::ElementData) -> Option<u32> {
+    let c = compile_selector(sel)?;
+    if matches_compiled(&c, el) {
+        Some(c.specificity)
+    } else {
+        None
+    }
 }
 
 /// A valid CSS identifier for our purposes: letters, digits, `-`, `_`, not starting empty.
@@ -3042,6 +3213,177 @@ mod tests {
         assert_eq!(map[&span].margin, Edges::default());
         assert_eq!(map[&span].padding, Edges::default());
         assert_eq!(map[&span].width, None);
+    }
+
+    /// Brute-force reference: for one element, the set of `(origin, order, max_specificity)`
+    /// the *original* O(all-rules) scan would have produced — one entry per rule, max
+    /// specificity over its comma selectors, media/container gated, exactly as the pre-index
+    /// code did. Used to cross-check the index produces the identical match set.
+    fn naive_matches(
+        el: &dom::ElementData,
+        ua: &css::Stylesheet,
+        author: &[css::Stylesheet],
+    ) -> Vec<(u8, usize, u32)> {
+        let mut out = Vec::new();
+        let mut order = 0usize;
+        for rule in &ua.rules {
+            if media_applies(rule.media.as_deref())
+                && container_applies(rule.container.as_deref())
+            {
+                if let Some(spec) = rule_specificity(&rule.selectors, el) {
+                    out.push((0u8, order, spec));
+                }
+            }
+            order += 1;
+        }
+        for sheet in author {
+            for rule in &sheet.rules {
+                if media_applies(rule.media.as_deref())
+                    && container_applies(rule.container.as_deref())
+                {
+                    if let Some(spec) = rule_specificity(&rule.selectors, el) {
+                        out.push((1u8, order, spec));
+                    }
+                }
+                order += 1;
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The same query the indexed cascade runs, surfaced as `(origin, order, max_spec)` so it
+    /// can be compared against `naive_matches`.
+    fn indexed_matches(el: &dom::ElementData, index: &SelectorIndex) -> Vec<(u8, usize, u32)> {
+        let mut best: HashMap<usize, (u8, u32)> = HashMap::new();
+        let mut consider = |e: &Entry| {
+            if matches_compiled(&e.compiled, el) {
+                best.entry(e.order)
+                    .and_modify(|(_, s)| *s = (*s).max(e.compiled.specificity))
+                    .or_insert((e.origin, e.compiled.specificity));
+            }
+        };
+        if let Some(id) = el.id() {
+            if let Some(b) = index.by_id.get(id) {
+                for e in b {
+                    consider(e);
+                }
+            }
+        }
+        for class in el.classes() {
+            if let Some(b) = index.by_class.get(class) {
+                for e in b {
+                    consider(e);
+                }
+            }
+        }
+        if let Some(b) = index.by_type.get(&el.tag.to_lowercase()) {
+            for e in b {
+                consider(e);
+            }
+        }
+        for e in &index.universal {
+            consider(e);
+        }
+        let mut out: Vec<_> =
+            best.into_iter().map(|(order, (origin, spec))| (origin, order, spec)).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn indexed_match_set_equals_naive_for_varied_selectors() {
+        // Exercise id / class / type / universal / :root / multi-class / comma / div.foo.
+        let sheet = css::parse(
+            "* { color: #111111 }
+             :root { color: #222222 }
+             div { color: #333333 }
+             .foo { color: #444444 }
+             div.foo { color: #555555 }
+             .foo.bar { color: #666666 }
+             #hero, .promo { color: #777777 }
+             #hero { font-size: 20px }
+             p, .foo, #hero { letter-spacing: 1px }
+             a > b { color: #888888 }
+             [data-x] { color: #999999 }",
+        );
+        let ua = user_agent_stylesheet();
+        let author = [sheet];
+        let index = SelectorIndex::build(&ua, &author);
+
+        let doc = html::parse(
+            r#"<html><body>
+                 <div id="hero" class="foo bar promo">A</div>
+                 <div class="foo">B</div>
+                 <p class="promo">C</p>
+                 <span>D</span>
+                 <a><b>E</b></a>
+               </body></html>"#,
+        );
+        // Check every element in the tree, not just a handful.
+        fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut Vec<dom::NodeId>) {
+            if let NodeData::Element(_) = &doc.get(id).data {
+                out.push(id);
+            }
+            for &c in &doc.get(id).children {
+                walk(doc, c, out);
+            }
+        }
+        let mut ids = Vec::new();
+        walk(&doc, doc.root(), &mut ids);
+        assert!(ids.len() >= 7);
+        for id in ids {
+            if let NodeData::Element(el) = &doc.get(id).data {
+                assert_eq!(
+                    indexed_matches(el, &index),
+                    naive_matches(el, &ua, &author),
+                    "match set diverged for <{}>",
+                    el.tag
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn varied_selector_cascade_values() {
+        let sheet = css::parse(
+            ":root { color: #010101 }
+             * { letter-spacing: 0 }
+             div { color: #020202 }
+             .foo { color: #030303 }
+             div.foo { color: #0a0b0c }
+             .foo.bar { font-size: 21px }
+             #hero, .promo { font-weight: bold }",
+        );
+        let doc = html::parse(
+            r#"<html><body>
+                 <div id="hero" class="foo bar promo">A</div>
+                 <div class="foo">B</div>
+                 <span class="bar">C</span>
+               </body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        // <div id=hero class="foo bar promo">: div.foo (spec 11) beats .foo (10) and div (1)
+        // → color #0a0b0c; .foo.bar sets font-size 21; #hero/.promo → bold.
+        let hero = elem(&doc, |e| e.id() == Some("hero"));
+        assert_eq!(map[&hero].color, (10, 11, 12));
+        assert_eq!(map[&hero].font_size, 21.0);
+        assert!(map[&hero].bold);
+        // <div class="foo">: div.foo doesn't match (needs tag div — it does), wait it's a div
+        // so div.foo matches → #0a0b0c too.
+        // <span class="bar">: only `*` and `.foo.bar` (no, needs foo) — none color it, so it
+        // inherits the html/body UA color.
+        let span = elem(&doc, |e| e.tag == "span");
+        assert_eq!(map[&span].color, (216, 216, 216));
+        assert!(!span_is_bold(&map, &doc));
+    }
+
+    fn span_is_bold(
+        map: &HashMap<dom::NodeId, ComputedStyle>,
+        doc: &dom::Document,
+    ) -> bool {
+        let span = elem(doc, |e| e.tag == "span");
+        map[&span].bold
     }
 }
 
