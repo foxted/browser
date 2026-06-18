@@ -455,7 +455,11 @@ impl Engine {
             Some(s) => s,
             None => return false,
         };
-        let (mut snapshot, console) = session.tick();
+        // `None` => nothing was due this tick; cheap no-op (no snapshot clone, no re-render).
+        let (mut snapshot, console) = match session.tick() {
+            Some(r) => r,
+            None => return false,
+        };
         snapshot.prune_invalid();
         if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
             *doc = Some(snapshot);

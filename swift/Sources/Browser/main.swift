@@ -596,7 +596,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if let url = activeTab?.urlString, !url.isEmpty {
             load(urlString: url, recordHistory: true)
         }
+
+        // Pump the active page's JS event loop (~20fps): runs due setTimeout/setInterval/rAF
+        // callbacks in the live runtime. A cheap no-op when nothing is due; repaints only when
+        // the DOM actually changed. Skipped while a load is running (engine busy on its queue).
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self = self, let tab = self.activeTab, let engine = tab.engine,
+                  tab.pendingLoads == 0 else { return }
+            if browser_engine_tick(engine) != 0 { self.refresh() }
+        }
     }
+
+    /// Repeating timer that pumps the active page's JS event loop. Retained for the app's lifetime.
+    private var tickTimer: Timer?
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         true

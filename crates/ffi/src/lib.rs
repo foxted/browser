@@ -230,3 +230,18 @@ pub unsafe extern "C" fn browser_engine_dispatch_key(
         _ => 0,
     }
 }
+
+/// Run any due timers / animation callbacks in the live page JS (drives `setTimeout`/`setInterval`/
+/// `requestAnimationFrame` after load). Cheap no-op when nothing is due. Returns 1 if the DOM
+/// changed (the caller should re-render), else 0.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_tick(engine: *mut Engine) -> i32 {
+    let Some(e) = engine.as_mut() else { return 0 };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.tick())) {
+        Ok(true) => 1,
+        _ => 0,
+    }
+}

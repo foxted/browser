@@ -137,6 +137,16 @@ int32_t browser_engine_has_text_focus(struct Engine *engine);
  */
 int32_t browser_engine_dispatch_key(struct Engine *engine, const char *key, const char *code);
 
+/**
+ * Run any due timers / animation callbacks in the live page JS (drives `setTimeout`/`setInterval`/
+ * `requestAnimationFrame` after load). Cheap no-op when nothing is due. Returns 1 if the DOM
+ * changed (the caller should re-render), else 0.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+int32_t browser_engine_tick(struct Engine *engine);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif  // __cplusplus

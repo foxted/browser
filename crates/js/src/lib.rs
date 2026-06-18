@@ -1518,16 +1518,21 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
 /// All scheduling lives here; Rust only drives via `__runDueTimers()` and reads `__timerErrors`.
 const TIMERS_BOOTSTRAP: &str = r#"
 (function () {
-  var loop = { timers: [], micro: [], nextId: 1, now: 0 };
+  // Two-phase clock: VIRTUAL at load (fast-forward to fire pending one-shots so the first paint is
+  // complete; intervals may spin, bounded by the cap), and the REAL wall clock once the page is
+  // live (driven by Engine::tick) so setInterval/setTimeout/rAF fire on actual elapsed time.
+  var loop = { timers: [], micro: [], nextId: 1, now: 0, realBase: 0, realtime: false, firedThisDrain: Object.create(null) };
   Object.defineProperty(globalThis, "__eventLoop", { value: loop, enumerable: false, configurable: true, writable: true });
   Object.defineProperty(globalThis, "__timerErrors", { value: [], enumerable: false, configurable: true, writable: true });
+  function nowMs() { try { return Date.now(); } catch (e) { return 0; } }
+  function currentTime() { return loop.realtime ? (loop.now + (nowMs() - loop.realBase)) : loop.now; }
 
   function schedule(fn, delay, args, repeat) {
     if (typeof fn !== "function") { return 0; }
     var d = Number(delay) || 0;
     if (d < 0 || d !== d) { d = 0; }
     var id = loop.nextId++;
-    loop.timers.push({ id: id, fn: fn, delay: d, args: args, when: loop.now + d, repeat: repeat });
+    loop.timers.push({ id: id, fn: fn, delay: d, args: args, when: currentTime() + d, repeat: repeat });
     return id;
   }
 
@@ -1558,12 +1563,24 @@ const TIMERS_BOOTSTRAP: &str = r#"
 
   define("requestAnimationFrame", function (fn) {
     // No real frames; schedule ~16ms out (one 60fps frame) so rAF runs after 0ms timers.
-    return schedule(fn, 16, [loop.now + 16], false);
+    return schedule(fn, 16, [currentTime() + 16], false);
   });
   define("cancelAnimationFrame", globalThis.clearTimeout);
 
-  // Driver called from Rust. Returns true if it ran a task (microtask or timer), false if the
-  // whole queue was empty. One throwing task does not kill the loop: errors are collected.
+  // Reset the per-drain "already fired" set (Rust calls at each drain start) so an interval can't
+  // spin within a single realtime tick.
+  define("__beginDrain", function () { loop.firedThisDrain = Object.create(null); });
+  // Switch from the load-time virtual clock to the real wall clock (Rust calls once the page is
+  // live); re-arm surviving repeating timers to fire `delay` ms from now (real time).
+  define("__enterRealtime", function () {
+    if (loop.realtime) { return; }
+    loop.realtime = true;
+    loop.realBase = nowMs();
+    for (var i = 0; i < loop.timers.length; i++) { if (loop.timers[i].repeat) { loop.timers[i].when = loop.now + loop.timers[i].delay; } }
+  });
+
+  // Driver called from Rust. Returns true if it ran a task (microtask or timer), false if nothing
+  // is currently runnable. One throwing task does not kill the loop: errors are collected.
   define("__runDueTimers", function () {
     // 1. Drain ALL microtasks first (FIFO), including ones queued while draining.
     var ranSomething = false;
@@ -1574,19 +1591,26 @@ const TIMERS_BOOTSTRAP: &str = r#"
     }
     if (ranSomething) { return true; }
 
-    // 2. Pick the single timer with the smallest `when`; ties broken by smallest id.
+    // 2. Pick the smallest-`when` timer (skipping a repeat already fired this realtime tick).
     if (loop.timers.length === 0) { return false; }
-    var bestIdx = 0;
-    for (var i = 1; i < loop.timers.length; i++) {
-      var t = loop.timers[i], b = loop.timers[bestIdx];
-      if (t.when < b.when || (t.when === b.when && t.id < b.id)) { bestIdx = i; }
+    var bestIdx = -1, best = null;
+    for (var i = 0; i < loop.timers.length; i++) {
+      var t = loop.timers[i];
+      if (t.repeat && loop.realtime && loop.firedThisDrain[t.id]) { continue; }
+      if (bestIdx < 0 || t.when < best.when || (t.when === best.when && t.id < best.id)) { bestIdx = i; best = t; }
     }
+    if (bestIdx < 0) { return false; }
     var timer = loop.timers[bestIdx];
-    loop.now = timer.when;
-    if (timer.repeat) {
-      timer.when = loop.now + timer.delay; // reschedule before running so clearInterval inside works
+    if (loop.realtime) {
+      // Real clock: fire only once the scheduled instant has actually elapsed.
+      if (timer.when > currentTime()) { return false; }
+      if (timer.repeat) { timer.when = timer.when + timer.delay; loop.firedThisDrain[timer.id] = true; }
+      else { loop.timers.splice(bestIdx, 1); }
     } else {
-      loop.timers.splice(bestIdx, 1);
+      // Load-time: fast-forward virtual time to this timer and fire it (repeats may re-fire).
+      if (timer.when > loop.now) { loop.now = timer.when; }
+      if (timer.repeat) { timer.when = loop.now + timer.delay; }
+      else { loop.timers.splice(bestIdx, 1); }
     }
     try { timer.fn.apply(undefined, timer.args); }
     catch (e) { globalThis.__timerErrors.push(String(e)); }
@@ -3145,21 +3169,26 @@ fn format_exception(tc: &mut v8::PinnedRef<'_, v8::TryCatch<v8::HandleScope>>) -
 /// Fires the DOM lifecycle events, then alternates V8 microtask checkpoints with the JS
 /// `__runDueTimers()` driver. Folds any console output + `__timerErrors` produced during the
 /// drain into the last result (matching the prior behavior).
-fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) {
+/// Returns whether any timer/microtask actually fired (so `tick` can skip a DOM snapshot when
+/// nothing happened).
+fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) -> bool {
     if let Some(state) = scope.get_current_context().get_slot::<HostState>() {
         state.console.borrow_mut().clear();
     }
 
-    // Fire lifecycle events (readystatechange/DOMContentLoaded/load); a no-op on the non-DOM path.
+    // Reset the per-drain interval-fired set, then fire lifecycle events
+    // (readystatechange/DOMContentLoaded/load) — idempotent, so re-running on a tick costs nothing.
     eval_internal(
         scope,
-        "if (typeof __fireLifecycleEvents === 'function') { __fireLifecycleEvents(); }",
+        "if (typeof __beginDrain === 'function') { __beginDrain(); } \
+         if (typeof __fireLifecycleEvents === 'function') { __fireLifecycleEvents(); }",
         "<lifecycle>",
     );
 
     let start = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(3000);
     let mut iterations = 0usize;
+    let mut did_work = false;
     loop {
         if iterations >= EVENT_LOOP_CAP || start.elapsed() >= budget {
             break;
@@ -3170,11 +3199,15 @@ fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) {
         // Then run one due timer/microtask from the JS event loop.
         let ran = run_due_timers(scope);
         iterations += 1;
-        if !ran {
+        if ran {
+            did_work = true;
+        } else {
             // Nothing left in the JS loop; one more microtask checkpoint in case the last timer
             // queued a job, then stop if still empty.
             scope.perform_microtask_checkpoint();
-            if !run_due_timers(scope) {
+            if run_due_timers(scope) {
+                did_work = true;
+            } else {
                 break;
             }
         }
@@ -3200,12 +3233,13 @@ fn drain_event_loop(scope: &mut v8::PinScope, results: &mut [EvalOutput]) {
         .unwrap_or_default();
 
     if drained.is_empty() && extra.is_empty() {
-        return;
+        return did_work;
     }
     if let Some(last) = results.last_mut() {
         last.console.extend(drained);
         last.console.extend(extra);
     }
+    did_work
 }
 
 /// Run `globalThis.__runDueTimers()` and return its boolean result (false if absent/empty).
@@ -3941,9 +3975,9 @@ enum SessionCmd {
         code: String,
         reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
     },
-    /// Run due timers / microtasks, reply with snapshot + console.
+    /// Run due timers / microtasks; reply `Some(snapshot, console)` if work ran, else `None`.
     Tick {
-        reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
+        reply: std::sync::mpsc::Sender<Option<(dom::Document, Vec<String>)>>,
     },
     /// Stop the loop; the isolate is torn down on the thread it lives on.
     Stop,
@@ -4071,12 +4105,15 @@ impl Session {
 
     /// Run due timers / microtasks (e.g. for animations or deferred work) and return a fresh DOM
     /// snapshot + console. Synchronous; empty snapshot/console if the session thread is gone.
-    pub fn tick(&self) -> (dom::Document, Vec<String>) {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<(dom::Document, Vec<String>)>();
+    /// Run any due timers/microtasks. Returns the updated DOM snapshot + console ONLY if work
+    /// actually ran (so an idle tick is cheap — no DOM clone, no re-render). `None` = nothing due.
+    pub fn tick(&self) -> Option<(dom::Document, Vec<String>)> {
+        let (reply_tx, reply_rx) =
+            std::sync::mpsc::channel::<Option<(dom::Document, Vec<String>)>>();
         if self.tx.send(SessionCmd::Tick { reply: reply_tx }).is_err() {
-            return (dom::Document::new(), Vec::new());
+            return None;
         }
-        reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+        reply_rx.recv().unwrap_or(None)
     }
 }
 
@@ -4141,6 +4178,9 @@ fn session_thread_main(
             results.push(run_one_entry(scope, entry));
         }
         drain_event_loop(scope, &mut results);
+        // Load drain done; switch the timer clock to real time so subsequent ticks/events run
+        // setInterval/setTimeout/rAF over actual elapsed time.
+        eval_internal(scope, "if (typeof __enterRealtime === 'function') { __enterRealtime(); }", "<realtime>");
 
         // Send the initial snapshot back to Session::new's caller.
         let _ = init_tx.send((shared.borrow().clone(), results));
@@ -4190,9 +4230,14 @@ fn session_thread_main(
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
                 let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![EvalOutput::default()];
-                drain_event_loop(scope, &mut results);
-                let console = results.into_iter().flat_map(|r| r.console).collect();
-                let _ = reply.send((shared.borrow().clone(), console));
+                let did_work = drain_event_loop(scope, &mut results);
+                // Only snapshot+report when something actually ran, so idle ticks are cheap.
+                if did_work {
+                    let console = results.into_iter().flat_map(|r| r.console).collect();
+                    let _ = reply.send(Some((shared.borrow().clone(), console)));
+                } else {
+                    let _ = reply.send(None);
+                }
             }
             SessionCmd::Stop => break,
         }
@@ -5436,9 +5481,10 @@ mod tests {
     #[test]
     fn session_timer_runs_on_tick() {
         let doc = html::parse("<body></body>");
-        let (session, _snapshot, outputs) = Session::new(
+        // An interval fires during load, then again over real time as ticks pump the loop.
+        let (session, snapshot, outputs) = Session::new(
             doc,
-            vec![r#"setTimeout(function () { document.body.setAttribute('data-t', 'fired'); }, 0);"#
+            vec![r#"globalThis.__c = 0; setInterval(function () { globalThis.__c++; document.body.setAttribute('data-c', String(globalThis.__c)); }, 30);"#
                 .to_string()],
             Vec::new(),
             HashMap::new(),
@@ -5446,12 +5492,17 @@ mod tests {
             no_fetch(),
         );
         assert_eq!(outputs[0].error, None, "{:?}", outputs[0]);
+        // Ran at least once during load.
+        let body0 = find_by_tag(&snapshot, snapshot.root(), "body").expect("body node");
+        let initial: i32 = attr_of(&snapshot, body0, "data-c").unwrap_or_default().parse().unwrap_or(0);
+        assert!(initial >= 1, "interval should run during load, got {initial}");
 
-        // A timer scheduled at 0ms is drained during the initial load already; a tick is a no-op
-        // here but must still produce a valid snapshot. Assert the attribute fired either way.
-        let (after, _console) = session.tick();
+        // After real time elapses, a tick fires it again (real-clock cadence) → count increases.
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let (after, _console) = session.tick().expect("interval should fire again on tick");
         let body = find_by_tag(&after, after.root(), "body").expect("body node");
-        assert_eq!(attr_of(&after, body, "data-t").as_deref(), Some("fired"));
+        let c: i32 = attr_of(&after, body, "data-c").unwrap_or_default().parse().unwrap_or(0);
+        assert!(c > initial, "interval should have fired again on tick: {initial} -> {c}");
     }
 
     #[test]
