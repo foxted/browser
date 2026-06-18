@@ -65,16 +65,21 @@ pub fn fetch(url: &str) -> Result<Response, String> {
 
     // Present a mainstream browser User-Agent. Many sites (Google, etc.) serve a stripped
     // or blocked page to unknown clients like ureq's default UA, so we look like a browser.
-    // Retry transient transport failures (connection reset/timeout under heavy concurrency, or
-    // 429/5xx) a few times with backoff — fetching a 200+ module graph concurrently otherwise
-    // drops the occasional connection, and a single missing module breaks the whole JS app.
+    //
+    // Retry policy is asymmetric, because retry cost differs hugely by failure type:
+    //   * A non-2xx STATUS (403/429/5xx) comes back fast, so retrying with backoff is cheap and
+    //     worthwhile — CDNs use 403/429 for bot/rate limiting and a 200+ module burst trips it.
+    //   * A TRANSPORT error that is a stall hits the full read timeout first; retrying it 4×
+    //     would block a single dead sub-resource (image/script) for ~a minute and freeze the
+    //     page load. So transport errors get ONE quick retry (catches a transient reset) and a
+    //     modest timeout, never the multiply-the-timeout loop.
     let mut attempt = 0;
     let resp = loop {
         let result = agent()
             .get(url)
             // Bound the whole request (DNS + connect + read) so one stalled connection can't
-            // hang the engine.
-            .timeout(std::time::Duration::from_secs(15))
+            // hang the engine. Kept modest so a dead sub-resource fails fast.
+            .timeout(std::time::Duration::from_secs(8))
             .set("User-Agent", BROWSER_USER_AGENT)
             .set(
                 "Accept",
@@ -82,23 +87,22 @@ pub fn fetch(url: &str) -> Result<Response, String> {
             )
             .set("Accept-Language", "en-US,en;q=0.9")
             .call();
-        // Exponential-ish backoff: 200ms, 500ms, 1s, 2s.
-        let backoff = |a: u32| std::time::Duration::from_millis(match a { 1 => 200, 2 => 500, 3 => 1000, _ => 2000 });
+        let backoff = |a: u32| std::time::Duration::from_millis(match a { 1 => 200, 2 => 500, _ => 1000 });
         match result {
             Ok(resp) => break resp,
-            // Retry rate-limit / transient statuses. CDNs often use 403 for bot/rate limiting,
-            // so retry it too (with backoff) — a 200+ module burst can trip it mid-load.
+            // Fast status failures: retry rate-limit/server statuses with backoff (up to 3×).
             Err(ureq::Error::Status(code, _)) => {
-                if (code == 403 || code == 429 || code >= 500) && attempt < 4 {
+                if (code == 403 || code == 429 || code >= 500) && attempt < 3 {
                     attempt += 1;
                     std::thread::sleep(backoff(attempt));
                     continue;
                 }
                 return Err(format!("HTTP error status {code} for {url}"));
             }
-            // Transport/connection error (reset, timeout, DNS) — retry a few times.
+            // Transport/connection error (reset, timeout, DNS): a single quick retry only, so a
+            // stalled resource can't multiply an 8s timeout into a minute-long page-load freeze.
             Err(e) => {
-                if attempt < 4 {
+                if attempt < 1 {
                     attempt += 1;
                     std::thread::sleep(backoff(attempt));
                     continue;
