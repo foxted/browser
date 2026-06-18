@@ -1192,6 +1192,33 @@ fn eval_internal(scope: &mut v8::PinScope, source: &str, name: &str) -> bool {
 /// primitives + JS `document`/element layer, the timer/event loop, and the navigator/location/etc.
 /// bootstrap. `__pageURL` is set as a real string value (no source interpolation) before the
 /// browser-env bootstrap reads it.
+/// Live display metrics (logical viewport size + backing scale), set by the engine via
+/// [`set_device_metrics`] so JS sees the real `window.innerWidth/innerHeight` and
+/// `devicePixelRatio` instead of hardcoded defaults. Stored as atomics so the engine (any thread)
+/// can update them and the JS worker reads them when building the environment.
+static VP_W: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1200);
+static VP_H: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(780);
+static DPR_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Set the logical viewport size (px) and device pixel ratio surfaced to page JS.
+pub fn set_device_metrics(width: u32, height: u32, device_pixel_ratio: f32) {
+    use std::sync::atomic::Ordering;
+    VP_W.store(width.max(1), Ordering::Relaxed);
+    VP_H.store(height.max(1), Ordering::Relaxed);
+    DPR_BITS.store(device_pixel_ratio.max(0.1).to_bits(), Ordering::Relaxed);
+}
+
+fn device_metrics() -> (f64, f64, f64) {
+    use std::sync::atomic::Ordering;
+    let bits = DPR_BITS.load(Ordering::Relaxed);
+    let dpr = if bits == 0 { 2.0 } else { f32::from_bits(bits) };
+    (
+        VP_W.load(Ordering::Relaxed) as f64,
+        VP_H.load(Ordering::Relaxed) as f64,
+        dpr as f64,
+    )
+}
+
 fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
     let global = scope.get_current_context().global(scope);
     install_console_sink(scope, global);
@@ -1204,6 +1231,14 @@ fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
     let key = v8::String::new(scope, "__pageURL").unwrap();
     let val = js_str(scope, url);
     global.set(scope, key.into(), val);
+    // Inject the live viewport metrics so the bootstrap can set window.innerWidth/innerHeight and
+    // devicePixelRatio from the real values rather than hardcoded defaults.
+    let (vw, vh, dpr) = device_metrics();
+    for (name, num) in [("__innerWidth", vw), ("__innerHeight", vh), ("__devicePixelRatio", dpr)] {
+        let k = v8::String::new(scope, name).unwrap();
+        let n = v8::Number::new(scope, num);
+        global.set(scope, k.into(), n.into());
+    }
     eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
 }
 
@@ -1686,9 +1721,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   };
 
   // --- window metrics + no-op window methods -----------------------------------------------
-  globalThis.innerWidth = 1200; globalThis.innerHeight = 780;
-  globalThis.outerWidth = 1200; globalThis.outerHeight = 820;
-  globalThis.devicePixelRatio = 2;
+  // Real viewport + scale injected by the engine (fall back to defaults if absent).
+  var __iw = (typeof globalThis.__innerWidth === "number" && globalThis.__innerWidth > 0) ? globalThis.__innerWidth : 1200;
+  var __ih = (typeof globalThis.__innerHeight === "number" && globalThis.__innerHeight > 0) ? globalThis.__innerHeight : 780;
+  globalThis.innerWidth = __iw; globalThis.innerHeight = __ih;
+  globalThis.outerWidth = __iw; globalThis.outerHeight = __ih + 40;
+  globalThis.devicePixelRatio = (typeof globalThis.__devicePixelRatio === "number" && globalThis.__devicePixelRatio > 0) ? globalThis.__devicePixelRatio : 2;
   globalThis.scrollX = 0; globalThis.scrollY = 0;
   globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
   globalThis.screenX = 0; globalThis.screenY = 0; globalThis.screenLeft = 0; globalThis.screenTop = 0;

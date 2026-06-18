@@ -97,6 +97,9 @@ impl Engine {
         self.vp_w = w.max(1);
         self.vp_h = h.max(1);
         self.scale = if scale > 0.0 { scale } else { 1.0 };
+        // Surface the real viewport + scale to page JS (window.innerWidth/innerHeight,
+        // devicePixelRatio) so responsive/HiDPI code sees true values.
+        js::set_device_metrics(self.vp_w, self.vp_h, self.scale);
     }
 
     /// Fetch `url` and remember the outcome. Returns 0 on success, negative on error.
