@@ -119,16 +119,9 @@ impl Engine {
                     None => resp.final_url.clone(),
                 };
 
-                // Fetch + parse external CSS interleaved with inline <style> in document order
-                // (BEFORE scripts so the cascade has author sheets; scripts may still mutate the
-                // DOM, but our `<link>`/`<style>` collection is a one-shot snapshot of the parse).
-                let (styles, mut console) = match &doc {
-                    Some(d) => collect_stylesheets(d, &base),
-                    None => (Vec::new(), Vec::new()),
-                };
-
                 // Execute the page's scripts (inline + external `<script src>`, fetched and run
                 // in document order through the real DOM so mutations stick) and capture console.
+                let mut console: Vec<String> = Vec::new();
                 let doc = match doc {
                     Some(d) => {
                         let (d, script_console) = run_scripts(d, &base);
@@ -140,6 +133,18 @@ impl Engine {
                         Some(d)
                     }
                     None => None,
+                };
+
+                // Collect stylesheets AFTER scripts/modules run, so CSS injected at runtime
+                // (SPA frameworks add component `<style>` tags and fetch+inject CSS, e.g. Vue)
+                // is included in the cascade, not just the static `<style>`/`<link>` from parse.
+                let styles = match &doc {
+                    Some(d) => {
+                        let (s, style_console) = collect_stylesheets(d, &base);
+                        console.extend(style_console);
+                        s
+                    }
+                    None => Vec::new(),
                 };
 
                 // Fetch + decode `<img>` images (after scripts, so script-inserted images and
