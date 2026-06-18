@@ -2158,6 +2158,50 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         if (!("preserveAspectRatio" in el)) { def(el, "preserveAspectRatio", { baseVal: { align: 0, meetOrSlice: 0 }, animVal: { align: 0, meetOrSlice: 0 } }); }
       }
     } catch (e) {}
+    // <canvas>: provide a non-throwing 2D context stub (we don't rasterize canvas, but pages
+    // feature-detect and measure text through it). '2d' returns a stub whose methods are no-ops
+    // and whose measureText returns an approximate width; 'webgl'/'webgl2' return null so callers
+    // fall back gracefully.
+    try {
+      var __cvTag = typeof el.tagName === "string" ? el.tagName.toLowerCase() : "";
+      if (__cvTag === "canvas" && typeof el.getContext !== "function") {
+        if (!("width" in el)) { def(el, "width", 300); }
+        if (!("height" in el)) { def(el, "height", 150); }
+        var noop = function () {};
+        def(el, "getContext", function (type) {
+          if (type !== "2d") { return null; }
+          if (el.__ctx2d) { return el.__ctx2d; }
+          var ctx = {
+            canvas: el, fillStyle: '#000', strokeStyle: '#000', lineWidth: 1, lineCap: "butt",
+            lineJoin: "miter", miterLimit: 10, font: "10px sans-serif", textAlign: "start",
+            textBaseline: "alphabetic", direction: "ltr", globalAlpha: 1,
+            globalCompositeOperation: "source-over", imageSmoothingEnabled: true,
+            shadowBlur: 0, shadowColor: "rgba(0,0,0,0)", shadowOffsetX: 0, shadowOffsetY: 0,
+            save: noop, restore: noop, scale: noop, rotate: noop, translate: noop, transform: noop,
+            setTransform: noop, resetTransform: noop, getTransform: function () { return {}; },
+            beginPath: noop, closePath: noop, moveTo: noop, lineTo: noop, bezierCurveTo: noop,
+            quadraticCurveTo: noop, arc: noop, arcTo: noop, ellipse: noop, rect: noop, roundRect: noop,
+            fill: noop, stroke: noop, clip: noop, isPointInPath: function () { return false; },
+            isPointInStroke: function () { return false; }, fillRect: noop, strokeRect: noop,
+            clearRect: noop, fillText: noop, strokeText: noop,
+            measureText: function (s) { var w = (s ? String(s).length : 0) * 6; return { width: w, actualBoundingBoxLeft: 0, actualBoundingBoxRight: w, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2, fontBoundingBoxAscent: 8, fontBoundingBoxDescent: 2 }; },
+            setLineDash: noop, getLineDash: function () { return []; }, drawImage: noop, drawFocusIfNeeded: noop,
+            createImageData: function (w, h) { var ww = w | 0, hh = h | 0; return { width: ww, height: hh, data: new Uint8ClampedArray(ww * hh * 4) }; },
+            getImageData: function (x, y, w, h) { var ww = w | 0, hh = h | 0; return { width: ww, height: hh, data: new Uint8ClampedArray(ww * hh * 4) }; },
+            putImageData: noop,
+            createLinearGradient: function () { return { addColorStop: noop }; },
+            createRadialGradient: function () { return { addColorStop: noop }; },
+            createConicGradient: function () { return { addColorStop: noop }; },
+            createPattern: function () { return null; },
+            getContextAttributes: function () { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; },
+          };
+          def(el, "__ctx2d", ctx);
+          return ctx;
+        });
+        if (typeof el.toDataURL !== "function") { def(el, "toDataURL", function () { return "data:,"; }); }
+        if (typeof el.toBlob !== "function") { def(el, "toBlob", function (cb) { if (typeof cb === "function") { cb(null); } }); }
+      }
+    } catch (e) {}
     installEvents(el);
     return el;
   }
@@ -2519,6 +2563,75 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
 
   if (typeof globalThis.structuredClone !== "function") {
     def(globalThis, "structuredClone", function (v) { try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; } });
+  }
+
+  // NodeFilter constants (used with createTreeWalker / createNodeIterator below).
+  if (typeof globalThis.NodeFilter === "undefined") {
+    def(globalThis, "NodeFilter", {
+      FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+      SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 0x1, SHOW_ATTRIBUTE: 0x2, SHOW_TEXT: 0x4,
+      SHOW_CDATA_SECTION: 0x8, SHOW_ENTITY_REFERENCE: 0x10, SHOW_ENTITY: 0x20,
+      SHOW_PROCESSING_INSTRUCTION: 0x40, SHOW_COMMENT: 0x80, SHOW_DOCUMENT: 0x100,
+      SHOW_DOCUMENT_TYPE: 0x200, SHOW_DOCUMENT_FRAGMENT: 0x400, SHOW_NOTATION: 0x800,
+    });
+  }
+
+  // createTreeWalker / createNodeIterator — snapshot the accepted descendants of `root` in
+  // document order (whatToShow bitmask + optional NodeFilter callback / {acceptNode}); FILTER_REJECT
+  // prunes a subtree, FILTER_SKIP / a whatToShow miss skips the node but keeps descending.
+  function __makeWalkerNodes(root, whatToShow, filterArg) {
+    var mask = (whatToShow === undefined || whatToShow === null) ? 0xFFFFFFFF : (whatToShow >>> 0);
+    var filterFn = null;
+    if (typeof filterArg === "function") { filterFn = filterArg; }
+    else if (filterArg && typeof filterArg.acceptNode === "function") { filterFn = function (n) { return filterArg.acceptNode(n); }; }
+    function verdict(n) {
+      var t = n.nodeType || 0;
+      var shown = t > 0 && (mask & (1 << (t - 1))) !== 0;
+      if (!shown) { return 3; }
+      if (filterFn) { try { return filterFn(n) || 1; } catch (e) { return 2; } }
+      return 1;
+    }
+    var out = [];
+    function visit(n) {
+      var v = verdict(n);
+      if (v === 2) { return; }
+      if (v === 1) { out.push(n); }
+      var kids = n.childNodes;
+      if (kids) { for (var i = 0; i < kids.length; i++) { visit(kids[i]); } }
+    }
+    var kids = root && root.childNodes;
+    if (kids) { for (var i = 0; i < kids.length; i++) { visit(kids[i]); } }
+    return out;
+  }
+  function __makeTreeWalker(root, whatToShow, filterArg) {
+    var nodes = __makeWalkerNodes(root, whatToShow, filterArg);
+    var idx = -1;
+    var w = { root: root, whatToShow: (whatToShow >>> 0) || 0xFFFFFFFF, filter: filterArg || null, currentNode: root };
+    w.nextNode = function () { if (idx + 1 < nodes.length) { idx++; w.currentNode = nodes[idx]; return nodes[idx]; } return null; };
+    w.previousNode = function () { if (idx > 0) { idx--; w.currentNode = nodes[idx]; return nodes[idx]; } idx = -1; w.currentNode = root; return null; };
+    w.parentNode = function () { var p = w.currentNode && w.currentNode.parentNode; if (p && p !== root) { w.currentNode = p; return p; } return null; };
+    w.firstChild = function () { return w.nextNode(); };
+    w.lastChild = function () { if (nodes.length) { idx = nodes.length - 1; w.currentNode = nodes[idx]; return nodes[idx]; } return null; };
+    w.nextSibling = function () { return null; };
+    w.previousSibling = function () { return null; };
+    return w;
+  }
+  function __makeNodeIterator(root, whatToShow, filterArg) {
+    var nodes = __makeWalkerNodes(root, whatToShow, filterArg);
+    var idx = -1;
+    var it = { root: root, whatToShow: (whatToShow >>> 0) || 0xFFFFFFFF, filter: filterArg || null, referenceNode: root, pointerBeforeReferenceNode: true };
+    it.nextNode = function () { if (idx + 1 < nodes.length) { idx++; it.referenceNode = nodes[idx]; return nodes[idx]; } return null; };
+    it.previousNode = function () { if (idx >= 0) { var n = nodes[idx]; idx--; it.referenceNode = idx >= 0 ? nodes[idx] : root; return n; } return null; };
+    it.detach = function () {};
+    return it;
+  }
+  if (typeof globalThis.document !== "undefined" && globalThis.document) {
+    if (typeof globalThis.document.createTreeWalker !== "function") {
+      def(globalThis.document, "createTreeWalker", function (root, whatToShow, filter) { return __makeTreeWalker(root, whatToShow, filter); });
+    }
+    if (typeof globalThis.document.createNodeIterator !== "function") {
+      def(globalThis.document, "createNodeIterator", function (root, whatToShow, filter) { return __makeNodeIterator(root, whatToShow, filter); });
+    }
   }
 
   // TextEncoder / TextDecoder — UTF-8 only (the common case). Pure JS over Uint8Array.
