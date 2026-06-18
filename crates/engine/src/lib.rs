@@ -128,8 +128,11 @@ impl Engine {
                         console.extend(script_console);
                         // ES modules are deferred: run them after classic scripts, sharing the
                         // same DOM. Builds + rewrites the module graph and executes it.
-                        let (d, module_console) = run_modules(d, &base);
+                        let (mut d, module_console) = run_modules(d, &base);
                         console.extend(module_console);
+                        // Page JS can leave stale/garbage node ids in the tree; drop any that
+                        // point outside the arena so layout/paint can't hit an out-of-bounds id.
+                        d.prune_invalid();
                         Some(d)
                     }
                     None => None,

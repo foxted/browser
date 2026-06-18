@@ -79,6 +79,22 @@ impl Document {
         self.nodes.len()
     }
 
+    /// Drop any child/parent references that point outside the arena. Page JS (via the engine's
+    /// DOM bindings) can, in pathological cases, leave a stale or garbage node id in a `children`
+    /// list; walking it later would panic with an out-of-bounds index. Call this once after
+    /// scripts run, before layout/paint, so the renderer only ever sees valid ids. O(nodes).
+    pub fn prune_invalid(&mut self) {
+        let len = self.nodes.len();
+        for node in &mut self.nodes {
+            node.children.retain(|c| c.0 < len);
+            if let Some(p) = node.parent {
+                if p.0 >= len {
+                    node.parent = None;
+                }
+            }
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
