@@ -1314,6 +1314,49 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; if (c && typeof c.__node === "number") { __insertBefore(id, c.__node, first); } }
     });
 
+    def(el, "insertAdjacentElement", function (position, node) {
+      var pos = String(position == null ? "" : position).toLowerCase();
+      if (!node || typeof node.__node !== "number") { return null; }
+      var nid = node.__node;
+      var p;
+      if (pos === "beforebegin") { p = __parent(id); if (p >= 0) { __insertBefore(p, nid, id); } }
+      else if (pos === "afterbegin") { var k = __children(id); __insertBefore(id, nid, k.length ? k[0] : -1); }
+      else if (pos === "beforeend") { __appendChild(id, nid); }
+      else if (pos === "afterend") { p = __parent(id); if (p >= 0) { var sibs = __children(p); var idx = sibs.indexOf(id); var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1; __insertBefore(p, nid, ref); } }
+      else { throw new SyntaxError("Failed to execute 'insertAdjacentElement': '" + position + "' is not a valid value."); }
+      return node;
+    });
+
+    def(el, "insertAdjacentHTML", function (position, html) {
+      var pos = String(position == null ? "" : position).toLowerCase();
+      if (pos !== "beforebegin" && pos !== "afterbegin" && pos !== "beforeend" && pos !== "afterend") {
+        throw new SyntaxError("Failed to execute 'insertAdjacentHTML': '" + position + "' is not a valid value.");
+      }
+      // Parse the HTML fragment into real nodes via a temp container, then move them.
+      var tmp = __createElement("template");
+      __setInnerHTML(tmp, html == null ? "" : String(html));
+      var parsed = __children(tmp).slice();
+      if (pos === "beforebegin") {
+        var p = __parent(id); if (p < 0) { return; }
+        for (var i = 0; i < parsed.length; i++) { __insertBefore(p, parsed[i], id); }
+      } else if (pos === "afterbegin") {
+        var k = __children(id); var ref = k.length ? k[0] : -1;
+        for (var i = 0; i < parsed.length; i++) { __insertBefore(id, parsed[i], ref); }
+      } else if (pos === "beforeend") {
+        for (var i = 0; i < parsed.length; i++) { __appendChild(id, parsed[i]); }
+      } else { // afterend
+        var p2 = __parent(id); if (p2 < 0) { return; }
+        var sibs = __children(p2); var idx = sibs.indexOf(id);
+        var ref2 = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
+        for (var i = 0; i < parsed.length; i++) { __insertBefore(p2, parsed[i], ref2); }
+      }
+    });
+
+    def(el, "insertAdjacentText", function (position, text) {
+      var t = document.createTextNode(text == null ? "" : String(text));
+      return el.insertAdjacentElement(position, t);
+    });
+
     def(el, "contains", function (other) {
       if (!other || typeof other.__node !== "number") { return false; }
       var cur = other.__node;
@@ -4194,6 +4237,29 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("BODY|true|y"));
+    }
+
+    #[test]
+    fn insert_adjacent_html_inserts_parsed_nodes() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var el = document.createElement('div');
+                document.body.appendChild(el);
+                el.insertAdjacentHTML('beforeend', '<b>x</b>');
+                var a = el.children[0].tagName;
+                el.insertAdjacentHTML('afterbegin', '<i>y</i>');
+                var b = el.children[0].tagName;
+                var c = el.children[1].tagName;
+                [a, b, c].join('|')
+            "#
+            .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // beforeend appended B; afterbegin then put I first, B second.
+        assert_eq!(out[0].value.as_deref(), Some("B|I|B"));
     }
 
     #[test]
