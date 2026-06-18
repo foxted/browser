@@ -2513,6 +2513,51 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     def(globalThis, "structuredClone", function (v) { try { return JSON.parse(JSON.stringify(v)); } catch (e) { return v; } });
   }
 
+  // TextEncoder / TextDecoder — UTF-8 only (the common case). Pure JS over Uint8Array.
+  if (typeof globalThis.TextEncoder !== "function") {
+    def(globalThis, "TextEncoder", function () { this.encoding = "utf-8"; });
+    globalThis.TextEncoder.prototype.encode = function (str) {
+      str = str === undefined ? "" : String(str);
+      var bytes = [];
+      for (var i = 0; i < str.length; i++) {
+        var c = str.charCodeAt(i);
+        if (c < 0x80) { bytes.push(c); }
+        else if (c < 0x800) { bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f)); }
+        else if (c >= 0xd800 && c <= 0xdbff && i + 1 < str.length) {
+          var c2 = str.charCodeAt(++i);
+          var cp = 0x10000 + ((c & 0x3ff) << 10) + (c2 & 0x3ff);
+          bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f), 0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+        } else { bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f)); }
+      }
+      return new Uint8Array(bytes);
+    };
+    globalThis.TextEncoder.prototype.encodeInto = function (str, dest) {
+      var enc = this.encode(str), n = Math.min(enc.length, dest.length);
+      for (var i = 0; i < n; i++) dest[i] = enc[i];
+      return { read: str.length, written: n };
+    };
+  }
+  if (typeof globalThis.TextDecoder !== "function") {
+    def(globalThis, "TextDecoder", function (label) { this.encoding = label || "utf-8"; });
+    globalThis.TextDecoder.prototype.decode = function (buf) {
+      if (!buf) return "";
+      var b = buf.buffer ? new Uint8Array(buf.buffer, buf.byteOffset || 0, buf.byteLength) : new Uint8Array(buf);
+      var out = "", i = 0;
+      while (i < b.length) {
+        var c = b[i++];
+        if (c < 0x80) { out += String.fromCharCode(c); }
+        else if (c < 0xe0) { out += String.fromCharCode(((c & 0x1f) << 6) | (b[i++] & 0x3f)); }
+        else if (c < 0xf0) { out += String.fromCharCode(((c & 0x0f) << 12) | ((b[i++] & 0x3f) << 6) | (b[i++] & 0x3f)); }
+        else {
+          var cp = ((c & 0x07) << 18) | ((b[i++] & 0x3f) << 12) | ((b[i++] & 0x3f) << 6) | (b[i++] & 0x3f);
+          cp -= 0x10000;
+          out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+        }
+      }
+      return out;
+    };
+  }
+
   // base64 (btoa/atob) — pure JS implementation.
   var B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
   def(globalThis, "btoa", function (input) {
@@ -2885,12 +2930,17 @@ pub fn run_with_dom(
     sources: Vec<String>,
     url: &str,
 ) -> (dom::Document, Vec<EvalOutput>) {
-    let count = sources.len();
     let url = url.to_string();
+    // Channel + timeout (like run_modules): heavy classic-script sites (e.g. youtube.com runs
+    // hundreds of KB of script) must not block the page load forever. On timeout we render the
+    // pre-script DOM rather than hang. `fallback` is that pre-script DOM.
+    let (tx, rx) = std::sync::mpsc::channel::<(dom::Document, Vec<EvalOutput>)>();
+    let fallback = doc.clone();
     let worker = std::thread::Builder::new()
         .name("js-eval-dom".to_string())
         .stack_size(256 * 1024 * 1024)
         .spawn(move || {
+            let result: (dom::Document, Vec<EvalOutput>) = (move || {
             ensure_v8_initialized();
             let shared: SharedDoc = Rc::new(RefCell::new(doc));
             let mut isolate = v8::Isolate::new(v8::CreateParams::default());
@@ -2916,22 +2966,29 @@ pub fn run_with_dom(
                 Err(rc) => rc.borrow().clone(),
             };
             (doc, results)
+            })();
+            let _ = tx.send(result);
         });
 
     match worker {
-        Ok(handle) => handle.join().unwrap_or_else(|_| {
-            let results = vec![
-                EvalOutput {
-                    value: None,
-                    console: Vec::new(),
-                    error: Some("script execution aborted (panic in JS engine)".to_string()),
-                };
-                count.max(1)
-            ];
-            (dom::Document::new(), results)
-        }),
+        Ok(_handle) => {
+            // Wait a bounded slice; if scripts don't finish (slow/looping), render the pre-script
+            // DOM. The detached worker finishes on its own. A panic drops `tx`, so recv also Errs.
+            let budget = std::time::Duration::from_secs(10);
+            match rx.recv_timeout(budget) {
+                Ok(result) => result,
+                Err(_) => (
+                    fallback,
+                    vec![EvalOutput {
+                        value: None,
+                        console: Vec::new(),
+                        error: Some("script execution timed out or aborted".to_string()),
+                    }],
+                ),
+            }
+        }
         Err(e) => (
-            dom::Document::new(),
+            fallback,
             vec![EvalOutput {
                 value: None,
                 console: Vec::new(),
