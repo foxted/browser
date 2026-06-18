@@ -1593,10 +1593,12 @@ const TIMERS_BOOTSTRAP: &str = r#"
 
     // 2. Pick the smallest-`when` timer (skipping a repeat already fired this realtime tick).
     if (loop.timers.length === 0) { return false; }
+    // A repeating timer fires at most once per drain (load OR tick) so an interval can't spin to
+    // the cap — its callback runs once at load, then once per real-time tick thereafter.
     var bestIdx = -1, best = null;
     for (var i = 0; i < loop.timers.length; i++) {
       var t = loop.timers[i];
-      if (t.repeat && loop.realtime && loop.firedThisDrain[t.id]) { continue; }
+      if (t.repeat && loop.firedThisDrain[t.id]) { continue; }
       if (bestIdx < 0 || t.when < best.when || (t.when === best.when && t.id < best.id)) { bestIdx = i; best = t; }
     }
     if (bestIdx < 0) { return false; }
@@ -1607,9 +1609,10 @@ const TIMERS_BOOTSTRAP: &str = r#"
       if (timer.repeat) { timer.when = timer.when + timer.delay; loop.firedThisDrain[timer.id] = true; }
       else { loop.timers.splice(bestIdx, 1); }
     } else {
-      // Load-time: fast-forward virtual time to this timer and fire it (repeats may re-fire).
+      // Load-time: fast-forward virtual time to this timer and fire it (one-shots and rAF chains
+      // run freely; a repeating timer fires once and is parked for the real-time ticks).
       if (timer.when > loop.now) { loop.now = timer.when; }
-      if (timer.repeat) { timer.when = loop.now + timer.delay; }
+      if (timer.repeat) { timer.when = loop.now + timer.delay; loop.firedThisDrain[timer.id] = true; }
       else { loop.timers.splice(bestIdx, 1); }
     }
     try { timer.fn.apply(undefined, timer.args); }
@@ -4514,37 +4517,24 @@ mod tests {
 
     #[test]
     fn set_interval_is_bounded_and_does_not_hang() {
-        // A self-perpetuating interval that never clears itself would loop forever without the
-        // cap. The test completing (quickly) proves the cap works; the interval also has a
-        // self-clearing variant below to verify ordinary intervals run.
+        // A repeating timer fires AT MOST ONCE per drain — so even a self-perpetuating interval
+        // can never spin or hang during a load (it continues over real time via Engine::tick;
+        // see `session_timer_runs_on_tick`). One-shots and rAF still run freely.
         let (doc, _) = doc_with_body("");
-        // An interval that never clears: it MUST be bounded by the cap, and the test must return.
         let (_doc, out) = run_with_dom(
             doc,
-            vec![r#"globalThis.n = 0; setInterval(() => { globalThis.n++; if (globalThis.n === 12) console.log("ran " + globalThis.n); }, 1);"#
+            vec![r#"globalThis.n = 0; setInterval(() => { globalThis.n++; console.log("tick" + globalThis.n); }, 1);"#
                 .to_string()],
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        // The interval ran at least 12 times (logged during the drain) before the cap halted it.
         let all: Vec<String> = out.iter().flat_map(|o| o.console.clone()).collect();
-        assert!(all.iter().any(|l| l == "ran 12"), "interval did not run repeatedly: {all:?}");
-
-        // A self-clearing interval: stop after 3 ticks. Should not be cut off by the cap.
-        let (doc2, _) = doc_with_body("");
-        let (_doc2, out2) = run_with_dom(
-            doc2,
-            vec![r#"var k = 0; var h = setInterval(() => { k++; console.log("k" + k); if (k >= 3) clearInterval(h); }, 5);"#
-                .to_string()],
-            "https://example.com/",
-        );
-        assert_eq!(out2[0].error, None, "{:?}", out2[0]);
-        let all2: Vec<String> = out2.iter().flat_map(|o| o.console.clone()).collect();
         assert_eq!(
-            all2.iter().filter(|l| l.starts_with('k')).count(),
-            3,
-            "self-clearing interval should tick exactly 3 times: {all2:?}"
+            all.iter().filter(|l| l.starts_with("tick")).count(),
+            1,
+            "interval should fire exactly once per load drain: {all:?}"
         );
+        assert!(all.iter().any(|l| l == "tick1"), "interval should fire once: {all:?}");
     }
 
     #[test]
