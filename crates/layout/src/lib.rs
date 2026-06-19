@@ -454,6 +454,86 @@ fn checkable_glyph(el: &dom::ElementData) -> Option<String> {
     }
 }
 
+/// The label a `<select>` (id `select_id`) should display in its (single-line) dropdown control:
+/// the text of its selected `<option>`. Walks all descendant `<option>` elements depth-first
+/// (including those nested inside `<optgroup>`), and picks, in priority order:
+///   1. the `<option>` carrying a `selected` attribute;
+///   2. else, if the `<select>` has a `value` attribute, the `<option>` whose value
+///      (its `value` attr, or — when it has no `value` attr — its collapsed text) equals it;
+///   3. else the FIRST `<option>`.
+/// Returns the chosen option's collapsed text, or `""` when the `<select>` has no options.
+/// (A `<select multiple>` / `size>1` is a multi-row listbox in real browsers; for v1 we still
+/// render the single selected/first label, which is acceptable.)
+fn selected_option_text(doc: &dom::Document, select_id: dom::NodeId) -> String {
+    // Collect descendant <option> ids depth-first.
+    let mut options: Vec<dom::NodeId> = Vec::new();
+    fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut Vec<dom::NodeId>) {
+        for &child in &doc.get(id).children {
+            if child.0 >= doc.len() {
+                continue;
+            }
+            if let dom::NodeData::Element(el) = &doc.get(child).data {
+                if el.tag.eq_ignore_ascii_case("option") {
+                    out.push(child);
+                }
+            }
+            walk(doc, child, out);
+        }
+    }
+    walk(doc, select_id, &mut options);
+    if options.is_empty() {
+        return String::new();
+    }
+
+    // The collapsed text content of an <option> (its descendant text nodes).
+    let option_text = |opt: dom::NodeId| -> String {
+        let mut s = String::new();
+        fn gather(doc: &dom::Document, id: dom::NodeId, s: &mut String) {
+            for &child in &doc.get(id).children {
+                if child.0 >= doc.len() {
+                    continue;
+                }
+                match &doc.get(child).data {
+                    dom::NodeData::Text(t) => s.push_str(t),
+                    dom::NodeData::Element(_) => gather(doc, child, s),
+                    _ => {}
+                }
+            }
+        }
+        gather(doc, opt, &mut s);
+        collapse_whitespace(&s)
+    };
+
+    // 1. An <option selected>.
+    for &opt in &options {
+        if let dom::NodeData::Element(el) = &doc.get(opt).data {
+            if el.attrs.contains_key("selected") {
+                return option_text(opt);
+            }
+        }
+    }
+
+    // 2. The <option> whose value matches the <select>'s `value` attribute.
+    if let dom::NodeData::Element(sel) = &doc.get(select_id).data {
+        if let Some(want) = sel.attrs.get("value") {
+            for &opt in &options {
+                if let dom::NodeData::Element(el) = &doc.get(opt).data {
+                    let val = match el.attrs.get("value") {
+                        Some(v) => v.clone(),
+                        None => option_text(opt),
+                    };
+                    if &val == want {
+                        return option_text(opt);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. The first option.
+    option_text(options[0])
+}
+
 /// True if `el` is a field that should show a text caret when focused: a `<textarea>` or a
 /// text-like `<input>` (mirrors `input_display_text`'s text-like set; excludes button-like inputs).
 fn is_caret_field(el: &dom::ElementData) -> bool {
@@ -583,6 +663,7 @@ fn make_anonymous(children: Vec<LayoutBox>) -> LayoutBox {
 /// `#[inline(never)]`) so its locals don't enlarge the recursive box-builder stack frame.
 #[inline(never)]
 fn build_replaced_or_control(
+    doc: &dom::Document,
     el: &dom::ElementData,
     id: dom::NodeId,
     cs: &style::ComputedStyle,
@@ -626,6 +707,20 @@ fn build_replaced_or_control(
             gps.font_size = 13.0;
         }
         bx.children.push(LayoutBox::new(BoxContent::Text(glyph), gps, Some(id)));
+        return Some(bx);
+    }
+
+    // <select>: render as a single-line dropdown control showing the selected option's label
+    // plus a trailing dropdown arrow. The <option>/<optgroup> children are NOT laid out (the
+    // caller stops recursing for <select>), so only the chosen label shows.
+    if el.tag.eq_ignore_ascii_case("select") {
+        let label = selected_option_text(doc, id);
+        let mut sps = ps;
+        if sps.font_size <= 0.0 {
+            sps.font_size = 13.0;
+        }
+        let text = format!("{label}  \u{25BE}"); // U+25BE ▾
+        bx.children.push(LayoutBox::new(BoxContent::Text(text), sps, Some(id)));
         return Some(bx);
     }
 
@@ -691,14 +786,16 @@ fn build_box(
             if el.tag.eq_ignore_ascii_case("img")
                 || el.tag.eq_ignore_ascii_case("input")
                 || el.tag.eq_ignore_ascii_case("textarea")
+                || el.tag.eq_ignore_ascii_case("select")
             {
                 if let Some(produced) =
-                    build_replaced_or_control(el, id, cs, intrinsic_sizes, focused)
+                    build_replaced_or_control(doc, el, id, cs, intrinsic_sizes, focused)
                 {
                     out.push(produced);
                 }
                 // For these tags we never fall through to generic element layout (img has no
-                // rendered children; inputs/textareas render their value, not their DOM subtree).
+                // rendered children; inputs/textareas render their value, not their DOM subtree;
+                // a <select> renders only the selected option's label, not its <option> subtree).
                 // A `None` from the helper (e.g. a zero-sized image, or `type=hidden`) drops the box.
                 return;
             }
@@ -3539,6 +3636,117 @@ mod tests {
         let ibox = find_box(&root_box, &|x| x.node == Some(input)).unwrap();
         assert!(has_text(ibox, "\u{2610}"), "expected ☐ unchecked indicator");
         assert!(!has_text(ibox, "\u{2611}"));
+    }
+
+    /// Build a `<select>` with the given options. Each option is `(value_attr, text, selected)`;
+    /// `value_attr = None` means no `value` attribute. Returns `(doc, select_id, body)`.
+    fn build_select(
+        options: &[(Option<&str>, &str, bool)],
+        select_value: Option<&str>,
+    ) -> (dom::Document, dom::NodeId, dom::NodeId) {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let select = doc.append_element(body, "select");
+        if let Some(v) = select_value {
+            set_attr(&mut doc, select, "value", v);
+        }
+        for &(val, text, selected) in options {
+            let opt = doc.append_element(select, "option");
+            if let Some(v) = val {
+                set_attr(&mut doc, opt, "value", v);
+            }
+            if selected {
+                set_attr(&mut doc, opt, "selected", "");
+            }
+            doc.append_child(opt, dom::NodeData::Text(text.to_string()));
+        }
+        (doc, select, body)
+    }
+
+    fn layout_select(
+        doc: &dom::Document,
+        select: dom::NodeId,
+        body: dom::NodeId,
+    ) -> LayoutBox {
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(select, style::ComputedStyle::default());
+        // Style the options + their text so they would lay out if (wrongly) recursed into.
+        for &child in &doc.get(select).children {
+            styles.insert(child, style::ComputedStyle::default());
+        }
+        layout_document(doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None)
+    }
+
+    #[test]
+    fn select_renders_selected_option_as_dropdown() {
+        // Three options, the 2nd is `selected`.
+        let (doc, select, body) = build_select(
+            &[(None, "First", false), (None, "Second", true), (None, "Third", false)],
+            None,
+        );
+        let root_box = layout_select(&doc, select, body);
+        let sbox = find_box(&root_box, &|x| x.node == Some(select)).unwrap();
+        // Shows the selected label and the dropdown arrow.
+        assert!(has_text(sbox, "Second"), "expected selected option label");
+        assert!(has_text(sbox, "\u{25BE}"), "expected dropdown arrow ▾");
+        // Does NOT show the other options.
+        assert!(!has_text(sbox, "First"), "unselected option leaked");
+        assert!(!has_text(sbox, "Third"), "unselected option leaked");
+    }
+
+    #[test]
+    fn select_value_attr_selects_matching_option() {
+        // No `selected`; `value` attr matches the 3rd option's value.
+        let (doc, select, body) = build_select(
+            &[
+                (Some("a"), "Apple", false),
+                (Some("b"), "Banana", false),
+                (Some("c"), "Cherry", false),
+            ],
+            Some("c"),
+        );
+        let root_box = layout_select(&doc, select, body);
+        let sbox = find_box(&root_box, &|x| x.node == Some(select)).unwrap();
+        assert!(has_text(sbox, "Cherry"), "value=c should select the Cherry option");
+        assert!(!has_text(sbox, "Apple"));
+        assert!(!has_text(sbox, "Banana"));
+    }
+
+    #[test]
+    fn select_defaults_to_first_option() {
+        // No `selected`, no `value` → first option shows.
+        let (doc, select, body) = build_select(
+            &[(None, "One", false), (None, "Two", false), (None, "Three", false)],
+            None,
+        );
+        let root_box = layout_select(&doc, select, body);
+        let sbox = find_box(&root_box, &|x| x.node == Some(select)).unwrap();
+        assert!(has_text(sbox, "One"), "first option should show by default");
+        assert!(!has_text(sbox, "Two"));
+        assert!(!has_text(sbox, "Three"));
+    }
+
+    #[test]
+    fn select_options_are_not_separate_inline_boxes() {
+        // The <option> DOM subtree must be suppressed: no Text box should carry an option node id,
+        // and the unselected options' text must not appear anywhere in the layout tree.
+        let (doc, select, body) = build_select(
+            &[(None, "Alpha", true), (None, "Beta", false), (None, "Gamma", false)],
+            None,
+        );
+        let option_ids: Vec<dom::NodeId> = doc.get(select).children.clone();
+        let root_box = layout_select(&doc, select, body);
+        // No box anywhere is owned by an <option> element/text node.
+        for opt in option_ids {
+            assert!(
+                find_box(&root_box, &|x| x.node == Some(opt)).is_none(),
+                "an <option> produced its own box (should be suppressed)"
+            );
+        }
+        assert!(!has_text(&root_box, "Beta"), "unselected option text leaked into layout");
+        assert!(!has_text(&root_box, "Gamma"), "unselected option text leaked into layout");
     }
 
     #[test]
