@@ -4082,7 +4082,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       this.searchParams = new globalThis.URLSearchParams(p.search);
       this.toString = function () { return this.href; }; this.toJSON = function () { return this.href; };
     });
-    globalThis.URL.createObjectURL = function () { return "blob:null/0"; };
+    // Encode the Blob's bytes as a self-contained data: URL so it actually works as an <img> src /
+    // fetch target (we don't keep a blob: registry). revoke is a no-op (data: needs no cleanup).
+    globalThis.URL.createObjectURL = function (obj) {
+      try {
+        if (obj && obj.__blobBytes) {
+          var bytes = obj.__blobBytes, s = "";
+          for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+          var b64 = (typeof btoa === "function") ? btoa(s) : "";
+          return "data:" + (obj.type || "application/octet-stream") + ";base64," + b64;
+        }
+      } catch (e) {}
+      return "blob:null/0";
+    };
     globalThis.URL.revokeObjectURL = fn;
   }
   if (typeof globalThis.queueMicrotask !== "function") { /* installed by timers */ }
