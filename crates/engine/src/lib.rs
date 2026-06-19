@@ -509,11 +509,30 @@ impl Engine {
         }
         let json = session.canvas_lists();
         let font = self.font.as_ref();
+        // Source pixels for drawImage: decoded <img> bitmaps (by node id) plus PREVIOUS-frame canvas
+        // bitmaps (canvas-draws-canvas uses last frame — a one-frame lag, acceptable).
+        let empty_images: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
+        let images: &HashMap<dom::NodeId, DecodedImage> = match &self.state {
+            LoadState::Loaded { images, .. } => images,
+            _ => &empty_images,
+        };
+        let mut sources: HashMap<usize, (&[u8], u32, u32)> = HashMap::new();
+        for (id, img) in images.iter() {
+            sources.insert(id.0, (img.rgba.as_slice(), img.w, img.h));
+        }
+        for (id, img) in self.canvas_bitmaps.iter() {
+            sources.entry(id.0).or_insert((img.rgba.as_slice(), img.w, img.h));
+        }
         let mut next: HashMap<dom::NodeId, DecodedImage> = HashMap::new();
         for cv in canvas::parse_canvas_lists(&json) {
-            let bmp = canvas::rasterize_canvas(&cv, font);
+            let bmp = canvas::rasterize_canvas(&cv, font, &sources);
             next.insert(dom::NodeId(cv.id), bmp);
         }
+        // Push the freshly-rasterized pixels back to the JS Session so getImageData reads real RGBA
+        // (one-render lag — the next getImageData call sees these). Fire-and-forget.
+        let pixels: Vec<(usize, u32, u32, Vec<u8>)> =
+            next.iter().map(|(id, img)| (id.0, img.w, img.h, img.rgba.clone())).collect();
+        session.set_canvas_pixels(pixels);
         self.canvas_bitmaps = next;
     }
 

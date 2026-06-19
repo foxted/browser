@@ -294,15 +294,29 @@ struct Canvas {
     w: u32,
     h: u32,
     px: Vec<u8>, // RGBA8, starts transparent (all zero)
+    /// Active clip rect in device pixels `(x0, y0, x1, y1)` (exclusive upper bound); `None` = none.
+    /// Set per-command from the display-list `clip` field; `blend`/`erase` reject pixels outside it.
+    clip: Option<(i32, i32, i32, i32)>,
 }
 
 impl Canvas {
     fn new(w: u32, h: u32) -> Self {
-        Canvas { w, h, px: vec![0u8; (w as usize) * (h as usize) * 4] }
+        Canvas { w, h, px: vec![0u8; (w as usize) * (h as usize) * 4], clip: None }
+    }
+    /// True if (x,y) is inside the active clip rect (or no clip is set).
+    #[inline]
+    fn in_clip(&self, x: i32, y: i32) -> bool {
+        match self.clip {
+            Some((x0, y0, x1, y1)) => x >= x0 && y >= y0 && x < x1 && y < y1,
+            None => true,
+        }
     }
     #[inline]
     fn blend(&mut self, x: i32, y: i32, c: Color) {
         if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 || c.a == 0 {
+            return;
+        }
+        if !self.in_clip(x, y) {
             return;
         }
         let i = ((y as usize) * (self.w as usize) + (x as usize)) * 4;
@@ -327,9 +341,31 @@ impl Canvas {
         if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
             return;
         }
+        if !self.in_clip(x, y) {
+            return;
+        }
         let i = ((y as usize) * (self.w as usize) + (x as usize)) * 4;
         self.px[i..i + 4].fill(0);
     }
+}
+
+/// Read a command's optional `clip` field into a device-pixel rect `(x0, y0, x1, y1)` (exclusive
+/// upper bound). Returns `None` when absent (no clip).
+fn read_clip(cmd: &Json) -> Option<(i32, i32, i32, i32)> {
+    let c = cmd.get("clip")?.as_arr();
+    if c.len() < 4 {
+        return None;
+    }
+    let x = c[0].num() as f32;
+    let y = c[1].num() as f32;
+    let w = c[2].num() as f32;
+    let h = c[3].num() as f32;
+    Some((
+        x.floor() as i32,
+        y.floor() as i32,
+        (x + w).ceil() as i32,
+        (y + h).ceil() as i32,
+    ))
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -626,11 +662,17 @@ fn named_color(name: &str) -> Option<Color> {
 
 /// Rasterize one canvas's display list into a straight-alpha RGBA [`DecodedImage`] of
 /// `width`×`height` pixels (the canvas's pixel buffer; the engine scales it to the box's CSS size).
-pub fn rasterize_canvas(cv: &CanvasList, font: Option<&SystemFont>) -> DecodedImage {
+pub fn rasterize_canvas(
+    cv: &CanvasList,
+    font: Option<&SystemFont>,
+    sources: &HashMap<usize, (&[u8], u32, u32)>,
+) -> DecodedImage {
     let mut cnv = Canvas::new(cv.width, cv.height);
     for cmd in &cv.commands {
         let op = cmd.get("op").map(|o| o.as_str()).unwrap_or("");
         let alpha = cmd.f("alpha", 1.0) as f32;
+        // Each command may carry a clip rect (bounding box of the clip path); set it for this op.
+        cnv.clip = read_clip(cmd);
         match op {
             "fillRect" => {
                 let paint = Paint::from_cmd(cmd, alpha);
@@ -651,9 +693,15 @@ pub fn rasterize_canvas(cv: &CanvasList, font: Option<&SystemFont>) -> DecodedIm
             "stroke" => {
                 let paint = Paint::from_cmd(cmd, alpha);
                 let width = cmd.f("width", 1.0) as f32;
+                let dash = read_dash(cmd);
+                let dash_off = cmd.f("dashOffset", 0.0) as f32;
                 let polys = read_polylines(cmd, "polylines");
                 for poly in &polys {
-                    stroke_polyline(&mut cnv, poly, width, &paint);
+                    if dash.is_empty() {
+                        stroke_polyline(&mut cnv, poly, width, &paint);
+                    } else {
+                        stroke_polyline_dashed(&mut cnv, poly, width, &paint, &dash, dash_off);
+                    }
                 }
             }
             "text" => {
@@ -662,10 +710,250 @@ pub fn rasterize_canvas(cv: &CanvasList, font: Option<&SystemFont>) -> DecodedIm
                     draw_text(&mut cnv, font, cmd, text, &paint);
                 }
             }
+            "drawImage" => {
+                draw_image(&mut cnv, cmd, alpha, sources);
+            }
+            "putImageData" => {
+                put_image_data(&mut cnv, cmd);
+            }
             _ => {}
         }
     }
     DecodedImage { rgba: cnv.px, w: cv.width, h: cv.height }
+}
+
+/// Read a stroke command's `dash` field (device-px on/off lengths).
+fn read_dash(cmd: &Json) -> Vec<f32> {
+    cmd.get("dash")
+        .map(|d| d.as_arr().iter().map(|v| (v.num() as f32).max(0.0)).collect())
+        .unwrap_or_default()
+}
+
+/// Blit a `drawImage` source into the destination quad. The source is the decoded `<img>` /
+/// previous-frame canvas pixels keyed by `src` node id. Samples the `(sx,sy,sw,sh)` sub-rect with
+/// nearest-neighbor, mapping into the (axis-aligned bounding box of the) device-space dest quad and
+/// honoring globalAlpha + the active clip. Rotation/skew is approximated by the dest quad's AABB.
+fn draw_image(
+    cnv: &mut Canvas,
+    cmd: &Json,
+    alpha: f32,
+    sources: &HashMap<usize, (&[u8], u32, u32)>,
+) {
+    let src_id = cmd.f("src", -1.0);
+    if src_id < 0.0 {
+        return;
+    }
+    let (px, sw_img, sh_img) = match sources.get(&(src_id as usize)) {
+        Some(v) => *v,
+        None => return,
+    };
+    if sw_img == 0 || sh_img == 0 {
+        return;
+    }
+    let quad = match read_quad(cmd) {
+        Some(q) => q,
+        None => return,
+    };
+    // Source sub-rect (defaults to the whole image).
+    let sx = cmd.f("sx", 0.0) as f32;
+    let sy = cmd.f("sy", 0.0) as f32;
+    let sw = cmd.f("sw", sw_img as f64) as f32;
+    let sh = cmd.f("sh", sh_img as f64) as f32;
+    if sw <= 0.0 || sh <= 0.0 {
+        return;
+    }
+    // Dest = bounding box of the (transformed) dest quad.
+    let (dx0, dx1, dy0, dy1) = poly_bounds(&quad, cnv.w, cnv.h);
+    if dx1 <= dx0 || dy1 <= dy0 {
+        return;
+    }
+    let dw = (dx1 - dx0) as f32;
+    let dh = (dy1 - dy0) as f32;
+    let a = alpha.clamp(0.0, 1.0);
+    for y in dy0..dy1 {
+        // Fractional vertical position within the dest box → source row.
+        let fy = (y - dy0) as f32 + 0.5;
+        let srcy = sy + (fy / dh) * sh;
+        let iy = srcy.floor() as i32;
+        if iy < 0 || iy >= sh_img as i32 {
+            continue;
+        }
+        for x in dx0..dx1 {
+            let fx = (x - dx0) as f32 + 0.5;
+            let srcx = sx + (fx / dw) * sw;
+            let ix = srcx.floor() as i32;
+            if ix < 0 || ix >= sw_img as i32 {
+                continue;
+            }
+            let si = ((iy as usize) * (sw_img as usize) + (ix as usize)) * 4;
+            let sa = px[si + 3] as f32 * a;
+            if sa <= 0.0 {
+                continue;
+            }
+            let c = Color { r: px[si], g: px[si + 1], b: px[si + 2], a: sa.round().clamp(0.0, 255.0) as u8 };
+            cnv.blend(x, y, c);
+        }
+    }
+}
+
+/// Write a `putImageData` pixel block into the canvas surface at `(dx,dy)` device pixels. The block
+/// is base64 RGBA (`iw*ih*4` bytes). putImageData REPLACES pixels (it ignores alpha compositing and
+/// the transform/clip per spec, but we still honor the canvas bounds). A `dirty*` sub-rect, if
+/// present, restricts the written region.
+fn put_image_data(cnv: &mut Canvas, cmd: &Json) {
+    let dx = cmd.f("dx", 0.0) as i32;
+    let dy = cmd.f("dy", 0.0) as i32;
+    let iw = cmd.f("iw", 0.0) as i32;
+    let ih = cmd.f("ih", 0.0) as i32;
+    if iw <= 0 || ih <= 0 {
+        return;
+    }
+    let b64 = cmd.get("b64").map(|v| v.as_str()).unwrap_or("");
+    let data = base64_decode(b64);
+    if data.len() < (iw as usize) * (ih as usize) * 4 {
+        return;
+    }
+    // Dirty sub-rect (defaults to the whole block), clamped to the block.
+    let (drx, dry, drw, drh) = if cmd.get("dirtyW").is_some() {
+        (
+            cmd.f("dirtyX", 0.0) as i32,
+            cmd.f("dirtyY", 0.0) as i32,
+            cmd.f("dirtyW", iw as f64) as i32,
+            cmd.f("dirtyH", ih as f64) as i32,
+        )
+    } else {
+        (0, 0, iw, ih)
+    };
+    let rx0 = drx.max(0);
+    let ry0 = dry.max(0);
+    let rx1 = (drx + drw).min(iw);
+    let ry1 = (dry + drh).min(ih);
+    for sy in ry0..ry1 {
+        let ty = dy + sy;
+        if ty < 0 || ty >= cnv.h as i32 {
+            continue;
+        }
+        for sx in rx0..rx1 {
+            let tx = dx + sx;
+            if tx < 0 || tx >= cnv.w as i32 {
+                continue;
+            }
+            let si = ((sy as usize) * (iw as usize) + (sx as usize)) * 4;
+            let di = ((ty as usize) * (cnv.w as usize) + (tx as usize)) * 4;
+            cnv.px[di..di + 4].copy_from_slice(&data[si..si + 4]);
+        }
+    }
+}
+
+/// Minimal standard-base64 encoder (no deps). Counterpart to [`base64_decode`]; used by tests.
+#[cfg(test)]
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Minimal standard-base64 decoder (no deps), for `putImageData` pixel blocks. Ignores whitespace;
+/// stops at padding. Returns the decoded bytes.
+fn base64_decode(s: &str) -> Vec<u8> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        let v = match val(c) {
+            Some(v) => v,
+            None => continue, // skip '=' / whitespace / newlines
+        };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+/// Draw a polyline as a dashed thick stroke: walk the path by arc length, alternating on/off
+/// segments per the `dash` pattern (offset by `dash_offset`). On-segments are stroked as the normal
+/// thick polyline; off-segments are skipped.
+fn stroke_polyline_dashed(
+    cnv: &mut Canvas,
+    pts: &[(f32, f32)],
+    width: f32,
+    paint: &Paint,
+    dash: &[f32],
+    dash_offset: f32,
+) {
+    let total: f32 = dash.iter().sum();
+    if total <= 1e-3 {
+        stroke_polyline(cnv, pts, width, paint);
+        return;
+    }
+    // Fast-forward to where the (wrapped) dash offset lands: `seg` = current pattern index, `rem` =
+    // remaining length in that segment.
+    let mut d = dash_offset.rem_euclid(total);
+    let mut seg = 0usize;
+    let mut rem;
+    loop {
+        if d < dash[seg] {
+            rem = dash[seg] - d;
+            break;
+        }
+        d -= dash[seg];
+        seg = (seg + 1) % dash.len();
+    }
+    let mut on = seg % 2 == 0; // even indices are "on" dashes
+    for w in pts.windows(2) {
+        let (ax, ay) = w[0];
+        let (bx, by) = w[1];
+        let dx = bx - ax;
+        let dy = by - ay;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len <= 1e-4 {
+            continue;
+        }
+        let ux = dx / len;
+        let uy = dy / len;
+        let mut pos = 0.0f32; // distance walked along this segment
+        while pos < len {
+            let step = rem.min(len - pos);
+            if on && step > 0.0 {
+                let x0 = ax + ux * pos;
+                let y0 = ay + uy * pos;
+                let x1 = ax + ux * (pos + step);
+                let y1 = ay + uy * (pos + step);
+                stroke_polyline(cnv, &[(x0, y0), (x1, y1)], width, paint);
+            }
+            pos += step;
+            rem -= step;
+            if rem <= 1e-4 {
+                seg = (seg + 1) % dash.len();
+                rem = dash[seg];
+                on = !on;
+            }
+        }
+    }
 }
 
 /// Read a `quad` field (8 numbers: 4 corners) into device-space points.
@@ -919,5 +1207,100 @@ mod tests {
         assert_eq!(lists[0].id, 3);
         assert_eq!(lists[0].width, 40);
         assert_eq!(lists[0].commands.len(), 1);
+    }
+
+    /// Pixel at (x,y) of a freshly-rasterized canvas.
+    fn px(img: &DecodedImage, x: u32, y: u32) -> (u8, u8, u8, u8) {
+        let i = ((y * img.w + x) * 4) as usize;
+        (img.rgba[i], img.rgba[i + 1], img.rgba[i + 2], img.rgba[i + 3])
+    }
+
+    fn rasterize(json: &str, sources: &HashMap<usize, (&[u8], u32, u32)>) -> DecodedImage {
+        let lists = parse_canvas_lists(json);
+        rasterize_canvas(&lists[0], None, sources)
+    }
+
+    #[test]
+    fn base64_roundtrips() {
+        for data in [&b"\x00\x01\x02\x03"[..], &b"hello world"[..], &b"\xff\xff"[..]] {
+            let enc = base64_encode(data);
+            assert_eq!(base64_decode(&enc), data);
+        }
+    }
+
+    #[test]
+    fn draw_image_blits_source_pixels() {
+        // A 2x2 source: solid red. drawImage it into a 4x4 canvas at the whole canvas dest rect.
+        let red: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255]).take(4).flatten().collect();
+        let mut sources = HashMap::new();
+        sources.insert(9usize, (red.as_slice(), 2u32, 2u32));
+        let json = r##"[{"id":1,"width":4,"height":4,"commands":[
+            {"op":"drawImage","src":9,"sx":0,"sy":0,"sw":2,"sh":2,"quad":[0,0,4,0,4,4,0,4],"alpha":1}]}]"##;
+        let img = rasterize(json, &sources);
+        // Every pixel should be red (the 2x2 source upscaled to 4x4).
+        assert_eq!(px(&img, 0, 0), (255, 0, 0, 255));
+        assert_eq!(px(&img, 3, 3), (255, 0, 0, 255));
+    }
+
+    #[test]
+    fn draw_image_honors_global_alpha() {
+        let red: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255]).take(4).flatten().collect();
+        let mut sources = HashMap::new();
+        sources.insert(9usize, (red.as_slice(), 2u32, 2u32));
+        let json = r##"[{"id":1,"width":4,"height":4,"commands":[
+            {"op":"drawImage","src":9,"sx":0,"sy":0,"sw":2,"sh":2,"quad":[0,0,4,0,4,4,0,4],"alpha":0.5}]}]"##;
+        let img = rasterize(json, &sources);
+        let (_r, _, _, a) = px(&img, 1, 1);
+        // Straight-alpha source-over onto a transparent canvas yields a half-alpha red pixel.
+        assert!((120..=136).contains(&a), "alpha {a} ~= 128");
+    }
+
+    #[test]
+    fn put_image_data_writes_block() {
+        // A 2x2 red block (base64 of 16 bytes RGBA) put at (1,1) in a 4x4 canvas.
+        let block: Vec<u8> = std::iter::repeat([255u8, 0, 0, 255]).take(4).flatten().collect();
+        let b64 = base64_encode(&block);
+        let json = format!(
+            r##"[{{"id":1,"width":4,"height":4,"commands":[
+            {{"op":"putImageData","dx":1,"dy":1,"iw":2,"ih":2,"b64":"{b64}"}}]}}]"##
+        );
+        let sources = HashMap::new();
+        let img = rasterize(&json, &sources);
+        assert_eq!(px(&img, 1, 1), (255, 0, 0, 255));
+        assert_eq!(px(&img, 2, 2), (255, 0, 0, 255));
+        // Outside the 2x2 block at (1,1) stays transparent.
+        assert_eq!(px(&img, 0, 0), (0, 0, 0, 0));
+        assert_eq!(px(&img, 3, 3), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn clip_constrains_fill() {
+        // Fill the whole 10x10 canvas red, but clip to the left 4px column.
+        let json = r##"[{"id":1,"width":10,"height":10,"commands":[
+            {"op":"fillRect","quad":[0,0,10,0,10,10,0,10],"color":"#ff0000","alpha":1,"clip":[0,0,4,10]}]}]"##;
+        let sources = HashMap::new();
+        let img = rasterize(json, &sources);
+        assert_eq!(px(&img, 1, 5), (255, 0, 0, 255)); // inside clip → painted
+        assert_eq!(px(&img, 8, 5), (0, 0, 0, 0)); // outside clip → untouched
+    }
+
+    #[test]
+    fn dashed_stroke_has_gaps() {
+        // A horizontal line y=5 from x=0..20, dash [4,4]: expect some on and some off pixels.
+        let json = r##"[{"id":1,"width":20,"height":10,"commands":[
+            {"op":"stroke","polylines":[[0,5,20,5]],"width":2,"color":"#000000","alpha":1,"dash":[4,4],"dashOffset":0}]}]"##;
+        let sources = HashMap::new();
+        let img = rasterize(json, &sources);
+        let mut on = 0;
+        let mut off = 0;
+        for x in 0..20u32 {
+            if px(&img, x, 5).3 > 0 {
+                on += 1;
+            } else {
+                off += 1;
+            }
+        }
+        assert!(on > 0, "dashed stroke painted no pixels");
+        assert!(off > 0, "dashed stroke had no gaps");
     }
 }

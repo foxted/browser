@@ -177,6 +177,12 @@ struct HostState {
     /// the `__naturalSize` primitive backing `img.naturalWidth` / `img.naturalHeight`. Empty until
     /// the first push; a missing/broken image has no entry (reports 0).
     image_natural: RefCell<HashMap<usize, (f32, f32)>>,
+    /// Rasterized RGBA pixels of each `<canvas>` (and decoded `<img>`), keyed by node id, pushed by
+    /// the engine after it rasterizes the display lists. `(width, height, rgba8)` — straight-alpha,
+    /// row-major, 4 bytes/pixel. Backs `ctx.getImageData` and `ctx.drawImage` sizing checks. Empty
+    /// until the first push; reflects the PREVIOUS frame's pixels (a one-render lag — `getImageData`
+    /// after a draw sees the right pixels on the next render).
+    canvas_pixels: RefCell<HashMap<usize, (u32, u32, Vec<u8>)>>,
     /// Vertical scroll offset (CSS px) at the last push. `__rect` subtracts this to make
     /// `getBoundingClientRect` viewport-relative. No horizontal scroll is tracked.
     viewport_scroll_y: Cell<f32>,
@@ -229,6 +235,7 @@ impl HostState {
             computed_cache: RefCell::new(None),
             layout_rects: RefCell::new(HashMap::new()),
             image_natural: RefCell::new(HashMap::new()),
+            canvas_pixels: RefCell::new(HashMap::new()),
             viewport_scroll_y: Cell::new(0.0),
             doc_height: Cell::new(0.0),
         })
@@ -1387,6 +1394,88 @@ fn prim_rect(
     rv.set(obj.into());
 }
 
+/// Minimal standard-base64 encoder (no deps): RGBA pixel blocks are bridged to JS as a base64
+/// string which JS decodes with the built-in `atob`. Used by `__canvasPixels` for `getImageData`.
+fn base64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// `__canvasPixels(id, sx, sy, sw, sh) -> { w, h, b64 } | null`
+///
+/// Read a sub-rect of a `<canvas>`'s (or `<img>`'s) rasterized RGBA pixels, pushed back by the
+/// engine after it rasterized the display list. Returns the clipped width/height plus a base64
+/// string of `w*h*4` RGBA bytes (out-of-bounds pixels are transparent). `null` if no pixels exist
+/// yet for that node (canvas not rendered — `getImageData` then returns a zeroed buffer). Reflects
+/// the PREVIOUS frame's pixels (a one-render lag).
+fn prim_canvas_pixels(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let sx = args.get(1).number_value(scope).unwrap_or(0.0) as i64;
+    let sy = args.get(2).number_value(scope).unwrap_or(0.0) as i64;
+    let sw = (args.get(3).number_value(scope).unwrap_or(0.0) as i64).max(0);
+    let sh = (args.get(4).number_value(scope).unwrap_or(0.0) as i64).max(0);
+    if id < 0.0 || sw == 0 || sh == 0 {
+        rv.set_null();
+        return;
+    }
+    let state = host_state(scope);
+    let map = state.canvas_pixels.borrow();
+    let (cw, ch, px) = match map.get(&(id as usize)) {
+        Some(v) => v,
+        None => {
+            rv.set_null();
+            return;
+        }
+    };
+    let cw = *cw as i64;
+    let ch = *ch as i64;
+    // Copy the requested sub-rect, filling out-of-bounds with transparent black.
+    let mut out = vec![0u8; (sw * sh * 4) as usize];
+    for row in 0..sh {
+        let srcy = sy + row;
+        if srcy < 0 || srcy >= ch {
+            continue;
+        }
+        for col in 0..sw {
+            let srcx = sx + col;
+            if srcx < 0 || srcx >= cw {
+                continue;
+            }
+            let si = ((srcy * cw + srcx) * 4) as usize;
+            let di = ((row * sw + col) * 4) as usize;
+            out[di..di + 4].copy_from_slice(&px[si..si + 4]);
+        }
+    }
+    let obj = v8::Object::new(scope);
+    let put_num = |scope: &mut v8::PinScope, obj: v8::Local<v8::Object>, k: &str, v: f64| {
+        let key = v8::String::new(scope, k).unwrap();
+        let val = v8::Number::new(scope, v);
+        obj.set(scope, key.into(), val.into());
+    };
+    put_num(scope, obj, "w", sw as f64);
+    put_num(scope, obj, "h", sh as f64);
+    let b64 = base64_encode(&out);
+    let key = v8::String::new(scope, "b64").unwrap();
+    let val = js_str(scope, &b64);
+    obj.set(scope, key.into(), val);
+    rv.set(obj.into());
+}
+
 /// `__naturalSize(id) -> { w, h }`
 ///
 /// The decoded intrinsic size of an `<img>` (CSS px), pushed by the engine alongside the layout
@@ -2072,6 +2161,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__nodeType", prim_node_type);
     set_fn(scope, global, "__rect", prim_rect);
     set_fn(scope, global, "__naturalSize", prim_natural_size);
+    set_fn(scope, global, "__canvasPixels", prim_canvas_pixels);
     set_fn(scope, global, "__elemMetrics", prim_elem_metrics);
     set_fn(scope, global, "__textContent", prim_text_content);
     set_fn(scope, global, "__setTextContent", prim_set_text_content);
@@ -5376,6 +5466,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       fillStyle: '#000000', strokeStyle: '#000000', lineWidth: 1, globalAlpha: 1,
       font: "10px sans-serif", fontSize: 10, textAlign: "start", textBaseline: "alphabetic",
       m: [1, 0, 0, 1, 0, 0],
+      lineDash: [], lineDashOffset: 0,
+      shadowBlur: 0, shadowColor: "rgba(0,0,0,0)", shadowOffsetX: 0, shadowOffsetY: 0,
+      clip: null,                  // device-space clip rect [x,y,w,h] (bounding box of clip path)
     };
     var stack = [];                // save/restore stack
     var subpaths = [];             // array of polylines; each polyline is [x0,y0,x1,y1,...] (device)
@@ -5385,10 +5478,18 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     function clone(s) {
       return { fillStyle: s.fillStyle, strokeStyle: s.strokeStyle, lineWidth: s.lineWidth,
         globalAlpha: s.globalAlpha, font: s.font, fontSize: s.fontSize, textAlign: s.textAlign,
-        textBaseline: s.textBaseline, m: s.m.slice() };
+        textBaseline: s.textBaseline, m: s.m.slice(),
+        lineDash: s.lineDash.slice(), lineDashOffset: s.lineDashOffset,
+        shadowBlur: s.shadowBlur, shadowColor: s.shadowColor,
+        shadowOffsetX: s.shadowOffsetX, shadowOffsetY: s.shadowOffsetY,
+        clip: s.clip ? s.clip.slice() : null };
     }
     // Resolve a fill/stroke style: a CSS color string passes through; a gradient object is encoded.
     function resolveStyle(style) {
+      // A pattern (createPattern) is approximated as a solid fallback color (see __pattern below).
+      if (style && typeof style === "object" && style.__pattern) {
+        return { color: style.fallback || '#808080' };
+      }
       if (style && typeof style === "object" && style.__grad) {
         var g = style;
         var stops = g.stops.map(function (s) { return { offset: s.offset, color: s.color }; });
@@ -5419,12 +5520,56 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       cur.push(p[0], p[1]);
       penX = ux; penY = uy;
     }
+    // Is a drop-shadow currently active? (non-transparent shadowColor AND a nonzero offset/blur).
+    function shadowActive() {
+      if (!state.shadowOffsetX && !state.shadowOffsetY && !state.shadowBlur) { return false; }
+      var c = String(state.shadowColor);
+      // Quick transparent checks (rgba(...,0) / transparent / #..00). Anything else is opaque-ish.
+      if (c === "transparent") { return false; }
+      var m = /rgba?\([^)]*?,\s*([0-9.]+)\s*\)/.exec(c);
+      if (m && parseFloat(m[1]) === 0) { return false; }
+      return true;
+    }
+    // Offset every geometry field of a command (device space) by (dx,dy). Used for shadow copies.
+    function offsetCmd(cmd, dx, dy) {
+      var o = {};
+      for (var k in cmd) { o[k] = cmd[k]; }
+      if (o.quad) { o.quad = o.quad.slice(); for (var i = 0; i < o.quad.length; i += 2) { o.quad[i] += dx; o.quad[i + 1] += dy; } }
+      function off(arr) { return arr.map(function (poly) { var p = poly.slice(); for (var j = 0; j < p.length; j += 2) { p[j] += dx; p[j + 1] += dy; } return p; }); }
+      if (o.polygons) { o.polygons = off(o.polygons); }
+      if (o.polylines) { o.polylines = off(o.polylines); }
+      if (typeof o.x === "number") { o.x += dx; }
+      if (typeof o.y === "number") { o.y += dy; }
+      if (o.clip) { o.clip = o.clip.slice(); o.clip[0] += dx; o.clip[1] += dy; }
+      return o;
+    }
+    // Push a draw command, applying the current clip rect and (best-effort) drop shadow. The shadow
+    // is an offset copy painted in shadowColor BEFORE the main command (blur approximated by the
+    // engine spreading the shadow color over a small radius).
+    function emit(cmd) {
+      if (state.clip) { cmd.clip = state.clip.slice(); }
+      if (shadowActive()) {
+        var sc = __cnvScale(state.m);
+        var sh = offsetCmd(cmd, state.shadowOffsetX * sc, state.shadowOffsetY * sc);
+        // Recolor the shadow: flat shadowColor, drop any gradient.
+        delete sh.gradient; delete sh.stops; delete sh.x0; delete sh.y0; delete sh.x1; delete sh.y1; delete sh.r0; delete sh.r1;
+        sh.color = String(state.shadowColor);
+        sh.blur = state.shadowBlur * sc;
+        list.push(sh);
+      }
+      list.push(cmd);
+    }
     var ctx = {
       canvas: el, lineCap: "butt", lineJoin: "miter", miterLimit: 10, direction: "ltr",
       globalCompositeOperation: "source-over", imageSmoothingEnabled: true,
-      shadowBlur: 0, shadowColor: "rgba(0,0,0,0)", shadowOffsetX: 0, shadowOffsetY: 0,
       __nodeId: nodeId, __list: list,
     };
+    // Shadow + dash properties are save/restore-aware (kept on `state`), exposed live.
+    Object.defineProperty(ctx, "shadowBlur", { get: function () { return state.shadowBlur; }, set: function (v) { var n = +v; if (n >= 0 && isFinite(n)) { state.shadowBlur = n; } }, enumerable: true });
+    Object.defineProperty(ctx, "shadowColor", { get: function () { return state.shadowColor; }, set: function (v) { state.shadowColor = String(v); }, enumerable: true });
+    Object.defineProperty(ctx, "shadowOffsetX", { get: function () { return state.shadowOffsetX; }, set: function (v) { var n = +v; if (isFinite(n)) { state.shadowOffsetX = n; } }, enumerable: true });
+    Object.defineProperty(ctx, "shadowOffsetY", { get: function () { return state.shadowOffsetY; }, set: function (v) { var n = +v; if (isFinite(n)) { state.shadowOffsetY = n; } }, enumerable: true });
+    Object.defineProperty(ctx, "lineDashOffset", { get: function () { return state.lineDashOffset; }, set: function (v) { var n = +v; if (isFinite(n)) { state.lineDashOffset = n; } }, enumerable: true });
     // Styled state exposed as live properties.
     Object.defineProperty(ctx, "fillStyle", { get: function () { return state.fillStyle; }, set: function (v) { state.fillStyle = v; }, enumerable: true });
     Object.defineProperty(ctx, "strokeStyle", { get: function () { return state.strokeStyle; }, set: function (v) { state.strokeStyle = v; }, enumerable: true });
@@ -5512,8 +5657,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var p0 = __cnvApply(state.m, x, y), p1 = __cnvApply(state.m, x + w, y),
           p2 = __cnvApply(state.m, x + w, y + h), p3 = __cnvApply(state.m, x, y + h);
       var cmd = { op: op, quad: [p0[0], p0[1], p1[0], p1[1], p2[0], p2[1], p3[0], p3[1]], alpha: state.globalAlpha };
-      if (op !== "clearRect") { var r = resolveStyle(style); for (var k in r) { cmd[k] = r[k]; } }
-      list.push(cmd);
+      if (op !== "clearRect") { var r = resolveStyle(style); for (var k in r) { cmd[k] = r[k]; } emit(cmd); }
+      else { if (state.clip) { cmd.clip = state.clip.slice(); } list.push(cmd); } // clearRect: clip but no shadow
     }
     ctx.fillRect = function (x, y, w, h) { rectCmd("fillRect", x, y, w, h, state.fillStyle); };
     ctx.clearRect = function (x, y, w, h) {
@@ -5532,7 +5677,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var r = resolveStyle(state.strokeStyle);
       var cmd = { op: "stroke", polylines: [dev], width: state.lineWidth * __cnvScale(state.m), alpha: state.globalAlpha };
       for (var k in r) { cmd[k] = r[k]; }
-      list.push(cmd);
+      attachDash(cmd);
+      emit(cmd);
     };
     ctx.fill = function () {
       var polys = devicePaths();
@@ -5540,7 +5686,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var r = resolveStyle(state.fillStyle);
       var cmd = { op: "fill", polygons: polys, alpha: state.globalAlpha };
       for (var k in r) { cmd[k] = r[k]; }
-      list.push(cmd);
+      emit(cmd);
     };
     ctx.stroke = function () {
       var polys = devicePaths();
@@ -5548,8 +5694,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var r = resolveStyle(state.strokeStyle);
       var cmd = { op: "stroke", polylines: polys, width: state.lineWidth * __cnvScale(state.m), alpha: state.globalAlpha };
       for (var k in r) { cmd[k] = r[k]; }
-      list.push(cmd);
+      attachDash(cmd);
+      emit(cmd);
     };
+    // Attach the current line-dash pattern (scaled to device space) to a stroke command.
+    function attachDash(cmd) {
+      if (state.lineDash && state.lineDash.length) {
+        var sc = __cnvScale(state.m);
+        cmd.dash = state.lineDash.map(function (d) { return d * sc; });
+        cmd.dashOffset = state.lineDashOffset * sc;
+      }
+    }
     function textCmd(op, text, x, y, style) {
       var p = __cnvApply(state.m, +x || 0, +y || 0);
       var r = resolveStyle(style);
@@ -5557,7 +5712,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         size: state.fontSize * __cnvScale(state.m), align: state.textAlign,
         baseline: state.textBaseline, alpha: state.globalAlpha };
       for (var k in r) { cmd[k] = r[k]; }
-      list.push(cmd);
+      emit(cmd);
     }
     ctx.fillText = function (t, x, y) { textCmd("fillText", t, x, y, state.fillStyle); };
     ctx.strokeText = function (t, x, y) { textCmd("strokeText", t, x, y, state.strokeStyle); };
@@ -5578,16 +5733,141 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     ctx.createRadialGradient = function (x0, y0, r0, x1, y1, r1) { return makeGradient("radial", x0, y0, x1, y1, r0, r1); };
     ctx.createConicGradient = function () { return makeGradient("linear", 0, 0, 0, 0, 0, 0); };
 
-    // No-ops (documented): clip, shadows, drawImage, image data, patterns, line dash.
     var noop = function () {};
-    ctx.clip = noop; ctx.drawImage = noop; ctx.putImageData = noop; ctx.drawFocusIfNeeded = noop;
-    ctx.setLineDash = noop; ctx.getLineDash = function () { return []; };
+    ctx.drawFocusIfNeeded = noop;
     ctx.isPointInPath = function () { return false; }; ctx.isPointInStroke = function () { return false; };
-    ctx.createPattern = function () { return null; };
-    ctx.createImageData = function (w, h) { var ww = w | 0, hh = h | 0; return { width: ww, height: hh, data: new Uint8ClampedArray(ww * hh * 4) }; };
-    ctx.getImageData = function (x, y, w, h) { var ww = w | 0, hh = h | 0; return { width: ww, height: hh, data: new Uint8ClampedArray(ww * hh * 4) }; };
+
+    // clip(): constrain subsequent draws to the bounding box of the current path (a documented
+    // simplification — real clip is the path shape; we track its device-space AABB). Intersects with
+    // any existing clip and is save/restore-aware (clip lives on `state`).
+    ctx.clip = function () {
+      var polys = devicePaths();
+      if (!polys.length) { return; }
+      var minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+      for (var i = 0; i < polys.length; i++) {
+        var p = polys[i];
+        for (var j = 0; j + 1 < p.length; j += 2) {
+          if (p[j] < minx) { minx = p[j]; } if (p[j] > maxx) { maxx = p[j]; }
+          if (p[j + 1] < miny) { miny = p[j + 1]; } if (p[j + 1] > maxy) { maxy = p[j + 1]; }
+        }
+      }
+      if (!isFinite(minx)) { return; }
+      var nx = minx, ny = miny, nw = maxx - minx, nh = maxy - miny;
+      if (state.clip) { // intersect with the existing clip rect
+        var cx = Math.max(state.clip[0], nx), cy = Math.max(state.clip[1], ny);
+        var cw = Math.min(state.clip[0] + state.clip[2], nx + nw) - cx;
+        var chh = Math.min(state.clip[1] + state.clip[3], ny + nh) - cy;
+        state.clip = [cx, cy, Math.max(0, cw), Math.max(0, chh)];
+      } else {
+        state.clip = [nx, ny, nw, nh];
+      }
+    };
+
+    // Line dash. Pattern is in user-space units; scaled to device space at stroke time (attachDash).
+    ctx.setLineDash = function (segs) {
+      if (!segs || typeof segs.length !== "number") { return; }
+      var out = [];
+      for (var i = 0; i < segs.length; i++) { var n = +segs[i]; if (isFinite(n) && n >= 0) { out.push(n); } else { return; } }
+      // An odd-length pattern is doubled (per spec).
+      if (out.length % 2 === 1) { out = out.concat(out); }
+      state.lineDash = out;
+    };
+    ctx.getLineDash = function () { return state.lineDash.slice(); };
+
+    // createPattern: best-effort. We cannot tile in the engine, so return an object usable as a
+    // fillStyle/strokeStyle that resolveStyle falls back to a solid color (documented simplification).
+    ctx.createPattern = function (image, repetition) {
+      return { __pattern: true, repetition: String(repetition || "repeat"), fallback: '#808080' };
+    };
+
+    // ---- Image data ----
+    function makeImageData(w, h, src) {
+      var ww = Math.max(1, w | 0), hh = Math.max(1, h | 0);
+      var data = src || new Uint8ClampedArray(ww * hh * 4);
+      return { width: ww, height: hh, data: data, colorSpace: "srgb" };
+    }
+    ctx.createImageData = function (a, b) {
+      // createImageData(w,h) | createImageData(imagedata)
+      if (a && typeof a === "object" && a.width != null) { return makeImageData(a.width, a.height); }
+      return makeImageData(a, b);
+    };
+    // getImageData reads the engine's pushed pixels (previous frame) for this canvas node. Returns a
+    // zeroed buffer if the canvas has not been rasterized yet (one-render lag — documented).
+    ctx.getImageData = function (x, y, w, h) {
+      var ww = Math.max(1, w | 0), hh = Math.max(1, h | 0);
+      var data = new Uint8ClampedArray(ww * hh * 4);
+      try {
+        if (nodeId >= 0 && typeof __canvasPixels === "function") {
+          var got = __canvasPixels(nodeId, x | 0, y | 0, ww, hh);
+          if (got && got.b64) {
+            var bin = (typeof atob === "function") ? atob(got.b64) : "";
+            var n = Math.min(bin.length, data.length);
+            for (var i = 0; i < n; i++) { data[i] = bin.charCodeAt(i) & 0xff; }
+          }
+        }
+      } catch (e) {}
+      return makeImageData(ww, hh, data);
+    };
+    // putImageData records a command that writes the pixel block into the canvas surface at (dx,dy).
+    // The pixels are base64-bridged to the engine. Dirty-rect args are honored (subset of the block).
+    ctx.putImageData = function (imagedata, dx, dy, dirtyX, dirtyY, dirtyW, dirtyH) {
+      if (!imagedata || !imagedata.data) { return; }
+      var iw = imagedata.width | 0, ih = imagedata.height | 0;
+      if (iw <= 0 || ih <= 0) { return; }
+      var d = imagedata.data, s = "";
+      for (var i = 0; i < d.length; i++) { s += String.fromCharCode(d[i] & 0xff); }
+      var b64 = (typeof btoa === "function") ? btoa(s) : "";
+      // putImageData ignores the transform; (dx,dy) are device (canvas) pixels directly.
+      var cmd = { op: "putImageData", dx: dx | 0, dy: dy | 0, iw: iw, ih: ih, b64: b64 };
+      if (dirtyW != null) { cmd.dirtyX = dirtyX | 0; cmd.dirtyY = dirtyY | 0; cmd.dirtyW = dirtyW | 0; cmd.dirtyH = dirtyH | 0; }
+      list.push(cmd);
+    };
+
+    // drawImage(src, dx,dy) | (src, dx,dy,dw,dh) | (src, sx,sy,sw,sh, dx,dy,dw,dh). `src` is an
+    // HTMLImageElement or HTMLCanvasElement; the engine blits its pixels (by node id) into the dest
+    // rect, honoring globalAlpha + clip. The dest rect is transformed by the current matrix (as a
+    // quad); source sub-rect sampling is nearest-neighbor.
+    ctx.drawImage = function (src) {
+      var srcId = (src && typeof src.__node === "number") ? src.__node
+                : (src && src.canvas && typeof src.canvas.__node === "number") ? src.canvas.__node : -1;
+      if (srcId < 0) { return; }
+      // Natural source size (for the 3-arg form's default dw/dh, and to default sw/sh).
+      var natW = (src.naturalWidth | 0) || (src.width | 0) || 0;
+      var natH = (src.naturalHeight | 0) || (src.height | 0) || 0;
+      var sx = 0, sy = 0, sw = natW, sh = natH, dx, dy, dw, dh;
+      if (arguments.length <= 3) {               // (src, dx, dy)
+        dx = +arguments[1] || 0; dy = +arguments[2] || 0; dw = natW; dh = natH;
+      } else if (arguments.length <= 5) {         // (src, dx, dy, dw, dh)
+        dx = +arguments[1] || 0; dy = +arguments[2] || 0; dw = +arguments[3] || 0; dh = +arguments[4] || 0;
+      } else {                                    // (src, sx, sy, sw, sh, dx, dy, dw, dh)
+        sx = +arguments[1] || 0; sy = +arguments[2] || 0; sw = +arguments[3] || 0; sh = +arguments[4] || 0;
+        dx = +arguments[5] || 0; dy = +arguments[6] || 0; dw = +arguments[7] || 0; dh = +arguments[8] || 0;
+      }
+      // Transform the dest rect's 4 corners into device space (a quad).
+      var p0 = __cnvApply(state.m, dx, dy), p1 = __cnvApply(state.m, dx + dw, dy),
+          p2 = __cnvApply(state.m, dx + dw, dy + dh), p3 = __cnvApply(state.m, dx, dy + dh);
+      var cmd = { op: "drawImage", src: srcId,
+        sx: sx, sy: sy, sw: sw, sh: sh,
+        quad: [p0[0], p0[1], p1[0], p1[1], p2[0], p2[1], p3[0], p3[1]],
+        alpha: state.globalAlpha };
+      emit(cmd);
+    };
+
     ctx.getContextAttributes = function () { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; };
     return ctx;
+  }
+  // ImageData constructor: new ImageData(w,h) | new ImageData(Uint8ClampedArray, w[, h]).
+  if (typeof globalThis.ImageData !== "function") {
+    globalThis.ImageData = function ImageData(a, b, c) {
+      var data, w, h;
+      if (a && typeof a === "object" && typeof a.length === "number") {
+        data = a; w = b | 0; h = c != null ? (c | 0) : (w > 0 ? (a.length / 4 / w) | 0 : 0);
+      } else {
+        w = a | 0; h = b | 0; data = new Uint8ClampedArray(Math.max(0, w * h * 4));
+      }
+      if (w <= 0) { w = 1; } if (h <= 0) { h = 1; }
+      this.width = w; this.height = h; this.data = data; this.colorSpace = "srgb";
+    };
   }
   globalThis.__makeCanvas2D = __makeCanvas2D;
 
@@ -6733,6 +7013,11 @@ enum SessionCmd {
         /// Full document content height in CSS px (reported as documentElement/body scrollHeight).
         doc_height_css: f32,
     },
+    /// Push the engine's freshly-rasterized canvas/image pixels onto `HostState` so `getImageData`
+    /// can read real RGBA. Fire-and-forget: no reply. `(node_id, width, height, rgba8)` per source.
+    SetCanvasPixels {
+        pixels: Vec<(usize, u32, u32, Vec<u8>)>,
+    },
     /// Stop the loop; the isolate is torn down on the thread it lives on.
     Stop,
 }
@@ -6876,6 +7161,12 @@ impl Session {
         doc_height_css: f32,
     ) {
         let _ = self.tx.send(SessionCmd::SetRects { rects, naturals, scroll_y_css, doc_height_css });
+    }
+
+    /// Push freshly-rasterized canvas/image RGBA pixels to the worker so `getImageData` returns real
+    /// pixels. Fire-and-forget (no reply). `pixels` is `(node_id, width, height, rgba8)` per source.
+    pub fn set_canvas_pixels(&self, pixels: Vec<(usize, u32, u32, Vec<u8>)>) {
+        let _ = self.tx.send(SessionCmd::SetCanvasPixels { pixels });
     }
 
     /// Notify the page that the OS appearance (prefers-color-scheme) changed: re-evaluates every
@@ -7178,6 +7469,20 @@ fn session_thread_main(
                 state.viewport_scroll_y.set(scroll_y_css);
                 state.doc_height.set(doc_height_css);
             }
+            SessionCmd::SetCanvasPixels { pixels } => {
+                // Store the engine's rasterized RGBA on HostState for getImageData. Re-enter the
+                // persistent context to reach the slot. Fire-and-forget: no reply.
+                let ctx = context.clone();
+                v8::scope!(let handle_scope, &mut isolate);
+                let local_ctx = v8::Local::new(handle_scope, &ctx);
+                let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
+                let state = host_state(scope);
+                let mut map = state.canvas_pixels.borrow_mut();
+                map.clear();
+                for (id, w, h, rgba) in pixels {
+                    map.insert(id, (w, h, rgba));
+                }
+            }
             SessionCmd::Stop => break,
         }
     }
@@ -7339,6 +7644,64 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(text_content(&doc, p), "new");
+    }
+
+    /// A <canvas> drawImage/clip/dashed-stroke/putImageData records the expected display-list
+    /// commands (the engine rasterizes these; tested in the engine crate).
+    #[test]
+    fn canvas_records_draw_image_clip_dash_putimagedata() {
+        let (mut doc, body) = doc_with_body("");
+        let cv = doc.append_element(body, "canvas");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(cv).data {
+            e.attrs.insert("width".to_string(), "100".to_string());
+            e.attrs.insert("height".to_string(), "100".to_string());
+        }
+        let img = doc.append_element(body, "img");
+        if let dom::NodeData::Element(e) = &mut doc.get_mut(img).data {
+            e.attrs.insert("id".to_string(), "src".to_string());
+        }
+        let src = r#"
+            var c = document.querySelector('canvas');
+            var ctx = c.getContext('2d');
+            // clip to a rect, then fill (the fill command should carry the clip).
+            ctx.beginPath(); ctx.rect(10, 10, 30, 30); ctx.clip();
+            ctx.fillStyle = '#ff0000'; ctx.fillRect(0, 0, 100, 100);
+            // dashed stroke
+            ctx.setLineDash([5, 5]);
+            ctx.beginPath(); ctx.moveTo(0, 50); ctx.lineTo(100, 50); ctx.stroke();
+            // drawImage of the <img> by ref
+            var im = document.getElementById('src');
+            ctx.drawImage(im, 0, 0, 20, 20);
+            // putImageData of a 2x2 block
+            var id = ctx.createImageData(2, 2);
+            for (var i = 0; i < id.data.length; i += 4) { id.data[i] = 255; id.data[i+3] = 255; }
+            ctx.putImageData(id, 5, 5);
+            JSON.stringify((globalThis.__canvasLists||function(){return[]})());
+        "#;
+        let (_doc, out) = run_with_dom(doc, vec![src.to_string()], "https://example.com/");
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        let json = out[0].value.clone().unwrap_or_default();
+        assert!(json.contains("\"op\":\"fillRect\"") && json.contains("\"clip\""), "no clipped fill: {json}");
+        assert!(json.contains("\"dash\""), "no dash on stroke: {json}");
+        assert!(json.contains("\"op\":\"drawImage\""), "no drawImage cmd: {json}");
+        assert!(json.contains("\"op\":\"putImageData\""), "no putImageData cmd: {json}");
+        assert!(json.contains("getLineDash") == false); // sanity: no leaked fn names
+    }
+
+    /// getLineDash mirrors setLineDash; lineDashOffset round-trips; getImageData returns the engine
+    /// pixels pushed via set_canvas_pixels (the round-trip).
+    #[test]
+    fn canvas_line_dash_accessors() {
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "canvas");
+        let src = r#"
+            var ctx = document.querySelector('canvas').getContext('2d');
+            ctx.setLineDash([4, 2]); ctx.lineDashOffset = 3;
+            JSON.stringify({ dash: ctx.getLineDash(), off: ctx.lineDashOffset });
+        "#;
+        let (_doc, out) = run_with_dom(doc, vec![src.to_string()], "https://example.com/");
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some(r#"{"dash":[4,2],"off":3}"#));
     }
 
     #[test]
