@@ -225,6 +225,10 @@ pub struct ComputedStyle {
     pub underline: bool,
     /// `text-decoration` line-through flag. Inherits.
     pub line_through: bool,
+    /// `text-decoration` overline flag (line above the text). Inherits.
+    pub overline: bool,
+    /// `vertical-align` for inline-level boxes. Drives `sub`/`super` baseline shifts. Not inherited.
+    pub vertical_align: VerticalAlign,
     /// `opacity` in 0.0..=1.0 (1.0 = fully opaque). Not inherited (composited per-box).
     pub opacity: f32,
     /// Uniform `border-radius` in px (0 = square corners). Not inherited.
@@ -257,6 +261,16 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// `vertical-align` for inline-level content. Only the `sub`/`super` keywords (subscript /
+/// superscript) are modeled; everything else is treated as `Baseline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VerticalAlign {
+    #[default]
+    Baseline,
+    Sub,
+    Super,
 }
 
 /// An RGBA color used by gradients and shadows (where alpha is significant, unlike the opaque
@@ -385,6 +399,8 @@ impl Default for ComputedStyle {
             letter_spacing: 0.0,
             underline: false,
             line_through: false,
+            overline: false,
+            vertical_align: VerticalAlign::Baseline,
             opacity: 1.0,
             border_radius: 0.0,
             background_gradient: None,
@@ -509,12 +525,21 @@ impl ComputedStyle {
                 if self.line_through {
                     parts.push("line-through");
                 }
+                if self.overline {
+                    parts.push("overline");
+                }
                 if parts.is_empty() {
                     "none".to_string()
                 } else {
                     parts.join(" ")
                 }
             }
+            "vertical-align" => match self.vertical_align {
+                VerticalAlign::Baseline => "baseline",
+                VerticalAlign::Sub => "sub",
+                VerticalAlign::Super => "super",
+            }
+            .to_string(),
 
             // --- sizing ---
             "width" => self.width.map(px).unwrap_or_else(|| "auto".to_string()),
@@ -648,6 +673,7 @@ impl ComputedStyle {
             "line-height",
             "text-decoration",
             "text-decoration-line",
+            "vertical-align",
             "width",
             "height",
             "min-width",
@@ -1000,6 +1026,9 @@ fn compute_element_style<'a>(
         letter_spacing: parent.letter_spacing,
         underline: parent.underline,
         line_through: parent.line_through,
+        overline: parent.overline,
+        // `vertical-align` is not inherited; each box starts at the baseline.
+        vertical_align: VerticalAlign::Baseline,
         // Paint extras: opacity & border-radius are not inherited.
         opacity: 1.0,
         border_radius: 0.0,
@@ -1827,6 +1856,12 @@ fn apply_declaration(
             "right" => style.text_align = TextAlign::Right,
             _ => {}
         },
+        "vertical-align" => match val.trim().to_ascii_lowercase().as_str() {
+            "sub" => style.vertical_align = VerticalAlign::Sub,
+            "super" => style.vertical_align = VerticalAlign::Super,
+            "baseline" => style.vertical_align = VerticalAlign::Baseline,
+            _ => {}
+        },
         "display" => match val.trim().to_ascii_lowercase().as_str() {
             "none" => style.display = Display::None,
             "block" => style.display = Display::Block,
@@ -2318,14 +2353,14 @@ fn apply_text_decoration(style: &mut ComputedStyle, val: &str) {
     if lower.split_whitespace().any(|t| t == "none") {
         style.underline = false;
         style.line_through = false;
+        style.overline = false;
         return;
     }
     for tok in lower.split_whitespace() {
         match tok {
             "underline" => style.underline = true,
             "line-through" => style.line_through = true,
-            // `overline` is treated as an underline-ish line for our purposes (rarely used).
-            "overline" => style.underline = true,
+            "overline" => style.overline = true,
             _ => {}
         }
     }
@@ -3233,6 +3268,12 @@ fn parse_font_weight(val: &str) -> Option<bool> {
 /// are treated as px.
 fn parse_font_size(val: &str, parent_px: f32) -> Option<f32> {
     let v = val.trim().to_ascii_lowercase();
+    // Relative keywords resolve against the parent font size (CSS uses ~1.2× steps).
+    match v.as_str() {
+        "smaller" => return Some(parent_px / 1.2).filter(|n| *n > 0.0),
+        "larger" => return Some(parent_px * 1.2).filter(|n| *n > 0.0),
+        _ => {}
+    }
     if has_math_func(&v) {
         // `em` in a font-size resolves against the parent font size.
         return eval_length(&v, parent_px).filter(|n| *n > 0.0);
@@ -4675,7 +4716,19 @@ fn user_agent_stylesheet() -> css::Stylesheet {
          b { font-weight: bold }
          strong { font-weight: bold }
          i { font-style: italic }
-         em { font-style: italic }",
+         em { font-style: italic }
+         a { text-decoration: underline; color: #0000ee }
+         u, ins { text-decoration: underline }
+         s, del, strike { text-decoration: line-through }
+         abbr[title] { text-decoration: underline }
+         mark { background-color: #ffff00; color: #000 }
+         cite, var, dfn, address { font-style: italic }
+         small { font-size: smaller }
+         sub, sup { font-size: smaller }
+         sub { vertical-align: sub }
+         sup { vertical-align: super }
+         q::before { content: \"\\201C\" }
+         q::after { content: \"\\201D\" }",
     )
 }
 
@@ -5414,6 +5467,74 @@ mod tests {
         assert!(!map[&a].line_through);
         assert!(map[&b].line_through);
         assert!(!map[&c].underline && !map[&c].line_through);
+    }
+
+    #[test]
+    fn ua_inline_text_defaults_cascade() {
+        // The UA stylesheet styles inline text elements; verify a representative set reaches
+        // the computed style (and is reported by getComputedStyle).
+        let doc = html::parse(
+            r##"<html><body>
+                 <a href="#">link</a>
+                 <s>strike</s>
+                 <del>del</del>
+                 <ins>ins</ins>
+                 <mark>mark</mark>
+                 <cite>cite</cite>
+                 <abbr title="t">abbr</abbr>
+                 <sup>2</sup>
+                 <sub>2</sub>
+                 <small>small</small>
+               </body></html>"##,
+        );
+        let map = cascade(&doc, &[]);
+        let g = |tag: &str| {
+            let id = elem(&doc, |e| e.tag == tag);
+            &map[&id]
+        };
+        // <a>: blue + underline.
+        let a = g("a");
+        assert!(a.underline, "a should be underlined");
+        assert_eq!(a.color, (0x00, 0x00, 0xee), "a should be link blue");
+        assert_eq!(a.get_property("text-decoration"), "underline");
+        // <s>/<del>: line-through.
+        assert!(g("s").line_through);
+        assert!(g("del").line_through);
+        assert_eq!(g("s").get_property("text-decoration"), "line-through");
+        // <ins>: underline.
+        assert!(g("ins").underline);
+        // <mark>: yellow bg, black text.
+        assert_eq!(g("mark").background_color, Some((0xff, 0xff, 0x00)));
+        assert_eq!(g("mark").color, (0, 0, 0));
+        assert_eq!(g("mark").get_property("background-color"), "rgb(255, 255, 0)");
+        // <cite>: italic.
+        assert!(g("cite").italic);
+        // <abbr title>: underline.
+        assert!(g("abbr").underline);
+        // <sup>/<sub>: smaller font + vertical-align.
+        assert!(g("sup").font_size < 16.0, "sup should be smaller, got {}", g("sup").font_size);
+        assert_eq!(g("sup").vertical_align, VerticalAlign::Super);
+        assert_eq!(g("sub").vertical_align, VerticalAlign::Sub);
+        assert_eq!(g("sup").get_property("vertical-align"), "super");
+        // <small>: smaller font.
+        assert!(g("small").font_size < 16.0, "small should be smaller, got {}", g("small").font_size);
+    }
+
+    #[test]
+    fn font_size_relative_keywords() {
+        assert_eq!(parse_font_size("smaller", 16.0), Some(16.0 / 1.2));
+        assert_eq!(parse_font_size("larger", 10.0), Some(12.0));
+    }
+
+    #[test]
+    fn q_quote_marks_via_pseudo_content() {
+        let doc = html::parse(r#"<html><body><q>quote</q></body></html>"#);
+        let map = cascade(&doc, &[]);
+        let q = elem(&doc, |e| e.tag == "q");
+        let before = map[&q].before.as_ref().expect("q::before should exist");
+        let after = map[&q].after.as_ref().expect("q::after should exist");
+        assert_eq!(before.content.as_deref(), Some("\u{201C}"));
+        assert_eq!(after.content.as_deref(), Some("\u{201D}"));
     }
 
     #[test]

@@ -2472,6 +2472,11 @@ fn paint_box_opacity(
                         let my = (baseline - fs * 0.3).round() as i32;
                         fb.fill_rect(Rect { x: x.round() as i32, y: my, w: run_w.round() as i32, h: thickness }, color);
                     }
+                    if b.style.overline {
+                        // A line above the text, near the top of the em box (~0.8em above baseline).
+                        let oy = (baseline - fs * 0.8).round() as i32;
+                        fb.fill_rect(Rect { x: x.round() as i32, y: oy, w: run_w.round() as i32, h: thickness }, color);
+                    }
                 }
             }
         }
@@ -5196,6 +5201,120 @@ mod tests {
         let m = rightmost_green(&moved);
         assert!(b >= 0 && m >= 0, "green not found base={b} moved={m}");
         assert!((m - b - 40).abs() <= 3, "translate should shift ~40px: base={b} moved={m}");
+    }
+
+    // Count colored (non-black) pixels on a given row within an x range.
+    fn colored_on_row(fb: &Framebuffer, y: i32, x0: i32, x1: i32) -> i32 {
+        let mut n = 0;
+        for x in x0..x1.min(fb.width as i32) {
+            let p = px_rgb(fb, x, y);
+            if p != [0, 0, 0] {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn underline_paints_a_line_below_the_baseline() {
+        // The NF stub rasterizes no glyphs, so any colored pixels on a row come from the
+        // decoration line (or background), not the text itself. An underlined run must produce a
+        // horizontal colored line; a plain run must not.
+        let underlined = render_html(
+            r#"<html><body style="margin:0"><span style="text-decoration:underline; color:rgb(255,255,255); font-size:20px">hello</span></body></html>"#,
+            200, 60,
+        );
+        let plain = render_html(
+            r#"<html><body style="margin:0"><span style="color:rgb(255,255,255); font-size:20px">hello</span></body></html>"#,
+            200, 60,
+        );
+        // The run sits on the first line; baseline ≈ 20*0.8 = 16, underline just below it.
+        let mut found_underline = false;
+        for y in 16..26 {
+            if colored_on_row(&underlined, y, 0, 60) >= 10 {
+                found_underline = true;
+            }
+        }
+        assert!(found_underline, "expected an underline row of white pixels");
+        // The plain run draws no glyphs (NF stub) and no decoration → no colored rows.
+        let mut plain_colored = 0;
+        for y in 0..60 {
+            plain_colored += colored_on_row(&plain, y, 0, 60);
+        }
+        assert_eq!(plain_colored, 0, "undecorated text should paint no line, got {plain_colored} px");
+    }
+
+    #[test]
+    fn line_through_and_overline_paint_at_distinct_heights() {
+        let strike = render_html(
+            r#"<html><body style="margin:0"><span style="text-decoration:line-through; color:rgb(255,255,255); font-size:20px">hello</span></body></html>"#,
+            200, 60,
+        );
+        let over = render_html(
+            r#"<html><body style="margin:0"><span style="text-decoration:overline; color:rgb(255,255,255); font-size:20px">hello</span></body></html>"#,
+            200, 60,
+        );
+        let row_of = |fb: &Framebuffer| -> i32 {
+            for y in 0..40 {
+                if colored_on_row(fb, y, 0, 60) >= 10 {
+                    return y;
+                }
+            }
+            -1
+        };
+        let strike_y = row_of(&strike);
+        let over_y = row_of(&over);
+        assert!(strike_y >= 0, "line-through not painted");
+        assert!(over_y >= 0, "overline not painted");
+        // Overline sits clearly above the strike-through (which crosses the x-height middle).
+        assert!(over_y < strike_y, "overline ({over_y}) should be above line-through ({strike_y})");
+    }
+
+    #[test]
+    fn mark_paints_yellow_behind_the_text() {
+        let fb = render_html(
+            r#"<html><body style="margin:0"><mark>hi</mark></body></html>"#,
+            200, 60,
+        );
+        // Scan the top line for yellow (#ffff00) pixels behind the run.
+        let mut yellow = 0;
+        for y in 0..30 {
+            for x in 0..60 {
+                let p = px_rgb(&fb, x, y);
+                if p[0] > 200 && p[1] > 200 && p[2] < 60 {
+                    yellow += 1;
+                }
+            }
+        }
+        assert!(yellow > 20, "expected a yellow mark highlight band, got {yellow} px");
+    }
+
+    #[test]
+    fn sup_run_is_painted_above_a_normal_run() {
+        // Compare the top y of the colored band for a baseline run vs a superscript run. The
+        // superscript run (vertical-align:super) is shifted up, so its highest colored pixel is
+        // higher (smaller y). We give the sup an underline so the NF stub still paints a visible
+        // line we can locate.
+        let normal = render_html(
+            r#"<html><body style="margin:0"><span style="text-decoration:underline; color:rgb(255,255,255); font-size:20px">x</span></body></html>"#,
+            120, 80,
+        );
+        let supscript = render_html(
+            r#"<html><body style="margin:0"><sup style="text-decoration:underline; color:rgb(255,255,255); font-size:20px">x</sup></body></html>"#,
+            120, 80,
+        );
+        let top_y = |fb: &Framebuffer| -> i32 {
+            for y in 0..80 {
+                if colored_on_row(fb, y, 0, 120) >= 1 {
+                    return y;
+                }
+            }
+            -1
+        };
+        let n = top_y(&normal);
+        let s = top_y(&supscript);
+        assert!(n >= 0 && s >= 0, "lines not found normal={n} sup={s}");
+        assert!(s < n, "superscript run ({s}) should sit above the normal run ({n})");
     }
 
     #[test]

@@ -73,6 +73,10 @@ pub struct PaintStyle {
     pub underline: bool,
     /// Draw a strike-through line over text runs (`text-decoration: line-through`).
     pub line_through: bool,
+    /// Draw an overline above text runs (`text-decoration: overline`).
+    pub overline: bool,
+    /// `vertical-align` (sub/super) for inline runs. Drives the painter's baseline shift.
+    pub vertical_align: style::VerticalAlign,
     /// Per-box opacity (0.0..=1.0); the painter multiplies painted alpha by this (and threads it
     /// to the subtree). 1.0 = fully opaque.
     pub opacity: f32,
@@ -112,6 +116,8 @@ impl Default for PaintStyle {
             border_color: (0, 0, 0),
             underline: false,
             line_through: false,
+            overline: false,
+            vertical_align: style::VerticalAlign::Baseline,
             opacity: 1.0,
             border_radius: 0.0,
             letter_spacing: 0.0,
@@ -566,6 +572,8 @@ fn paint_style_of(cs: &style::ComputedStyle) -> PaintStyle {
         border_color: cs.border_color,
         underline: cs.underline,
         line_through: cs.line_through,
+        overline: cs.overline,
+        vertical_align: cs.vertical_align,
         opacity: cs.opacity,
         border_radius: cs.border_radius,
         letter_spacing: cs.letter_spacing,
@@ -2338,10 +2346,21 @@ fn layout_inline_children(
             if let Some(r) = run.take() {
                 let text = r.texts.join(" ");
                 let ls = r.style.letter_spacing;
+                // `vertical-align: sub|super` shifts the run off the line's baseline by ~0.3em
+                // (of the run's own, already-reduced, font size). Super raises (smaller y), sub
+                // lowers (larger y). Width/height are measured at the run's own font size so the
+                // shifted sub/sup text keeps its reduced size.
+                let run_fs = r.style.font_size;
+                let voff = match r.style.vertical_align {
+                    style::VerticalAlign::Super => -run_fs * 0.3,
+                    style::VerticalAlign::Sub => run_fs * 0.3,
+                    style::VerticalAlign::Baseline => 0.0,
+                };
+                let measure_fs = if run_fs > 0.0 { run_fs } else { line_font };
                 let mut tb = LayoutBox::new(BoxContent::Text(text), r.style, r.node);
-                let w = run_width(measurer, &tb_text(&tb), line_font, false, ls);
+                let w = run_width(measurer, &tb_text(&tb), measure_fs, false, ls);
                 tb.dimensions.content =
-                    Rect { x: line_x + r.start_off, y, width: w, height: text_lh };
+                    Rect { x: line_x + r.start_off, y: y + voff, width: w, height: text_lh };
                 out.push(tb);
             }
         };
@@ -2863,6 +2882,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn vertical_align_sub_super_offsets_the_run() {
+        // p > "base" <sup>"hi"</sup> <sub>"lo"</sub> — the superscript run sits above the base
+        // run's y, the subscript run below it.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let p = doc.append_element(body, "p");
+        doc.append_child(p, dom::NodeData::Text("base".into()));
+        let sup = doc.append_element(p, "sup");
+        let sup_text = doc.append_child(sup, dom::NodeData::Text("hi".into()));
+        let sub = doc.append_element(p, "sub");
+        let sub_text = doc.append_child(sub, dom::NodeData::Text("lo".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(p, block_style(true));
+        let mut sup_cs = style::ComputedStyle::default();
+        sup_cs.vertical_align = style::VerticalAlign::Super;
+        let mut sub_cs = style::ComputedStyle::default();
+        sub_cs.vertical_align = style::VerticalAlign::Sub;
+        styles.insert(sup, sup_cs);
+        styles.insert(sub, sub_cs);
+
+        let root_box = layout_document(&doc, &styles, 400.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(p)).unwrap();
+
+        let y_of = |node: dom::NodeId| -> f32 {
+            find_box(pbox, &|x| matches!(x.content, BoxContent::Text(_)) && x.node == Some(node))
+                .unwrap()
+                .dimensions
+                .content
+                .y
+        };
+        let base_y =
+            find_box(pbox, &|x| matches!(&x.content, BoxContent::Text(t) if t == "base"))
+                .unwrap()
+                .dimensions
+                .content
+                .y;
+        let sup_y = y_of(sup_text);
+        let sub_y = y_of(sub_text);
+        assert!(sup_y < base_y, "sup run ({sup_y}) should sit above base ({base_y})");
+        assert!(sub_y > base_y, "sub run ({sub_y}) should sit below base ({base_y})");
     }
 
     /// Collect references to all `Text` boxes in a subtree (DFS).
