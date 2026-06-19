@@ -76,6 +76,11 @@ struct LayoutCache {
     dh: u32,
     root: layout::LayoutBox,
     content_h: f32,
+    /// The page's resolved *used* color scheme (true = dark), captured during the cascade that
+    /// produced this layout (see `style::cascade_with_root_scheme`). Drives the default canvas
+    /// background when no html/body `background-color` is set. Stored here (rather than re-read from
+    /// the process-global at paint time) so a concurrent cascade can't flip it under us.
+    root_scheme_dark: bool,
 }
 
 /// The result of a click landing on (or inside) a `<select>` control: enough for the platform
@@ -447,8 +452,10 @@ impl Engine {
         // @container, and vw/vh units evaluate against the true window — and, since this runs on
         // every viewport change, they re-evaluate on resize.
         style::set_viewport_metrics(self.vp_w as f32, self.vp_h as f32, self.scale);
-        // Feed the real OS appearance to the cascade so @media (prefers-color-scheme) re-evaluates.
-        style::set_color_scheme_dark(self.is_dark);
+        // The OS appearance (for `@media (prefers-color-scheme)` and the `color-scheme` resolution)
+        // is fed to the cascade via `cascade_with_root_scheme(.., self.is_dark)` below — set there
+        // under the cascade lock so it's atomic with the cascade (no separate global write here,
+        // which would race a concurrent cascade reading the flag).
         // Feed pointer/keyboard interaction state to the cascade so `:hover`/`:focus`/… match.
         style::set_interaction_state(self.hovered_node.map(|n| n.0), self.focused_node.map(|n| n.0));
         if matches!(&self.layout_cache, Some(c) if c.dw == dw && c.dh == dh) {
@@ -476,15 +483,22 @@ impl Engine {
             // Inline <svg> is a replaced element too: its intrinsic size is its width/height attrs
             // (or its viewBox w/h, else 300x150). The engine rasterizes the SVG subtree to a bitmap.
             collect_svg_intrinsics(d, &mut intrinsic_sizes);
-            let computed = style::cascade(d, styles);
+            let (computed, root_scheme_dark) =
+                style::cascade_with_root_scheme(d, styles, self.is_dark);
             let root =
                 layout::layout_document(d, &computed, vw, vh, &measurer, &intrinsic_sizes, self.focused_node);
             let content_h = root.dimensions.margin_box().height;
-            Some((root, content_h))
+            Some((root, content_h, root_scheme_dark))
         } else {
             None
         };
-        self.layout_cache = computed.map(|(root, content_h)| LayoutCache { dw, dh, root, content_h });
+        self.layout_cache = computed.map(|(root, content_h, root_scheme_dark)| LayoutCache {
+            dw,
+            dh,
+            root,
+            content_h,
+            root_scheme_dark,
+        });
         true
     }
 
@@ -652,7 +666,9 @@ impl Engine {
         // A loaded HTML page paints on a real document canvas (white by default, or the html/body
         // background). The splash / non-HTML / error states (no layout tree) keep the chrome gradient.
         match (&self.state, &self.layout_cache) {
-            (LoadState::Loaded { .. }, Some(cache)) => fb.clear(page_background(&cache.root)),
+            (LoadState::Loaded { .. }, Some(cache)) => {
+                fb.clear(page_background(&cache.root, cache.root_scheme_dark))
+            }
             _ => paint_gradient(&mut fb),
         }
 
@@ -1719,7 +1735,7 @@ impl Engine {
 /// (`<html>`) background; if that's transparent, the `<body>`'s background propagates up. Defaults
 /// to white when neither sets one. Walks the first-child chain (html → body) so it never picks up a
 /// content element's background.
-fn page_background(root: &layout::LayoutBox) -> Color {
+fn page_background(root: &layout::LayoutBox, root_scheme_dark: bool) -> Color {
     let mut node = root;
     for _ in 0..3 {
         if let Some((r, g, b)) = node.style.background_color {
@@ -1730,7 +1746,13 @@ fn page_background(root: &layout::LayoutBox) -> Color {
             None => break,
         }
     }
-    Color::WHITE
+    // No explicit html/body background: default canvas is white, or dark (`#1e1e1e`) when the page
+    // opted into a dark `color-scheme` (resolved during the cascade and stored on the layout cache).
+    if root_scheme_dark {
+        Color::rgb(0x1e, 0x1e, 0x1e)
+    } else {
+        Color::WHITE
+    }
 }
 
 fn paint_gradient(fb: &mut Framebuffer) {
@@ -4743,6 +4765,15 @@ fn draw_console_panel(
 mod tests {
     use super::*;
 
+    /// Serializes tests that drive the process-global OS appearance (`set_color_scheme`) and then
+    /// read color-scheme-dependent output, which `cargo test` would otherwise race on. Poisoning is
+    /// irrelevant (we only need exclusion).
+    static COLOR_SCHEME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn color_scheme_guard() -> std::sync::MutexGuard<'static, ()> {
+        COLOR_SCHEME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Column of RGB pixels down the middle of a framebuffer (for comparing renders).
     fn center_column(fb: &Framebuffer) -> Vec<u8> {
         let x = (fb.width / 2) as usize;
@@ -4904,6 +4935,7 @@ mod tests {
 
     #[test]
     fn matchmedia_prefers_color_scheme_tracks_os_appearance() {
+        let _g = color_scheme_guard();
         // A page with a script so the engine keeps a live JS Session we can console_eval against.
         let html = "<html><body><script>window.__ready = true;</script></body></html>";
         let path = std::env::temp_dir().join("browser_color_scheme_test.html");
@@ -4959,6 +4991,93 @@ mod tests {
             "change should fire with matches=true on flip to Dark",
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Render `html` at `os_dark` appearance and return the top-left canvas pixel (r, g, b).
+    /// Holds the color-scheme test lock for the whole set+render so the OS flag can't be flipped
+    /// by a parallel test mid-render.
+    fn canvas_top_left(html: &str, os_dark: bool) -> (u8, u8, u8) {
+        let _g = color_scheme_guard();
+        let path = std::env::temp_dir()
+            .join(format!("browser_color_scheme_canvas_{}.html", rand_suffix()));
+        std::fs::write(&path, html).unwrap();
+        let mut e = Engine::new();
+        e.set_viewport(200, 200, 1.0);
+        e.set_color_scheme(os_dark);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let fb = e.render();
+        let px = (fb.pixels[0], fb.pixels[1], fb.pixels[2]);
+        let _ = std::fs::remove_file(&path);
+        px
+    }
+
+    fn rand_suffix() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+    }
+
+    #[test]
+    fn color_scheme_dark_gives_dark_canvas() {
+        // `color-scheme: dark` (only dark) → dark canvas regardless of OS flag.
+        let html = "<html style=\"color-scheme: dark\"><body>hi</body></html>";
+        assert_eq!(canvas_top_left(html, true), (0x1e, 0x1e, 0x1e), "dark canvas in Dark OS");
+        assert_eq!(canvas_top_left(html, false), (0x1e, 0x1e, 0x1e), "dark canvas in Light OS");
+        // Via :root { color-scheme: dark } too.
+        let html2 = "<html><head><style>:root{color-scheme:dark}</style></head><body>hi</body></html>";
+        assert_eq!(canvas_top_left(html2, true), (0x1e, 0x1e, 0x1e));
+    }
+
+    #[test]
+    fn color_scheme_light_or_unset_stays_white() {
+        // Only-light → white canvas regardless of OS flag.
+        let light = "<html style=\"color-scheme: light\"><body>hi</body></html>";
+        assert_eq!(canvas_top_left(light, true), (0xff, 0xff, 0xff), "light stays white in Dark OS");
+        assert_eq!(canvas_top_left(light, false), (0xff, 0xff, 0xff));
+        // Unset → white canvas even when the OS is dark (no opt-in).
+        let unset = "<html><body>hi</body></html>";
+        assert_eq!(canvas_top_left(unset, true), (0xff, 0xff, 0xff), "no opt-in stays white");
+    }
+
+    #[test]
+    fn color_scheme_light_dark_follows_os() {
+        // `light dark` (both supported) → follow the OS appearance.
+        let html = "<html style=\"color-scheme: light dark\"><body>hi</body></html>";
+        assert_eq!(canvas_top_left(html, true), (0x1e, 0x1e, 0x1e), "dark canvas when OS Dark");
+        assert_eq!(canvas_top_left(html, false), (0xff, 0xff, 0xff), "white canvas when OS Light");
+    }
+
+    #[test]
+    fn color_scheme_browserscore_style_dark_canvas() {
+        // Mirrors browserscore.dev: color-scheme:dark gated behind the dark media query, and a body
+        // background that references an undefined custom property (leaving it transparent, so the
+        // canvas shows through). Dark OS → dark canvas.
+        let html = "<html><head><style>\
+            @media (prefers-color-scheme: dark){:root{color-scheme:dark}} \
+            body{background:var(--undefined-var)}\
+            </style></head><body>hi</body></html>";
+        assert_eq!(canvas_top_left(html, true), (0x1e, 0x1e, 0x1e), "dark canvas when OS Dark");
+        assert_eq!(canvas_top_left(html, false), (0xff, 0xff, 0xff), "white canvas when OS Light");
+    }
+
+    #[test]
+    fn color_scheme_dynamic_toggle_updates_canvas() {
+        let _g = color_scheme_guard();
+        // `light dark` page: toggling the OS appearance re-resolves the used scheme on next render.
+        let html = "<html style=\"color-scheme: light dark\"><body>hi</body></html>";
+        let path = std::env::temp_dir()
+            .join(format!("browser_color_scheme_toggle_{}.html", rand_suffix()));
+        std::fs::write(&path, html).unwrap();
+        let mut e = Engine::new();
+        e.set_viewport(200, 200, 1.0);
+        e.set_color_scheme(false);
+        assert_eq!(e.load_url(&format!("file://{}", path.display())), 0);
+        let fb = e.render();
+        assert_eq!((fb.pixels[0], fb.pixels[1], fb.pixels[2]), (0xff, 0xff, 0xff));
+        // Flip to Dark — the cascade re-runs and the canvas goes dark.
+        e.set_color_scheme(true);
+        let fb = e.render();
+        assert_eq!((fb.pixels[0], fb.pixels[1], fb.pixels[2]), (0x1e, 0x1e, 0x1e));
         let _ = std::fs::remove_file(&path);
     }
 

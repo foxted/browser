@@ -285,6 +285,71 @@ pub struct ComputedStyle {
     pub before: Option<Box<ComputedStyle>>,
     /// Computed style of the `::after` pseudo-element (see [`before`](Self::before)).
     pub after: Option<Box<ComputedStyle>>,
+
+    /// The CSS `color-scheme` value for this element. Inherits (initial `Normal`). Only the
+    /// root's value is used — [`cascade`] reads it off `<html>` (falling back to `<body>` /
+    /// `<meta name="color-scheme">`) and combines it with the OS appearance to decide whether the
+    /// page opts into a dark UA canvas/text (see [`ColorScheme::resolves_dark`] and
+    /// [`root_used_scheme_dark`]).
+    pub color_scheme: ColorScheme,
+}
+
+/// Parsed CSS `color-scheme` value. The property lists the schemes a page supports; the browser
+/// then picks one (here, light vs dark) for UA-rendered surfaces (canvas background, default text).
+/// We model only the three states our UA theming cares about; the `only` keyword and any unknown
+/// custom idents are ignored (they don't change which of light/dark we can pick).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorScheme {
+    /// `normal` or unset — no opt-in; UA renders light.
+    #[default]
+    Normal,
+    /// `light` (only light supported) — always light.
+    Light,
+    /// `dark` (only dark supported) — always dark.
+    Dark,
+    /// `light dark` / `dark light` (both supported) — follow the OS appearance.
+    LightDark,
+}
+
+impl ColorScheme {
+    /// Resolve to a used scheme (true = dark) given the OS appearance (`os_dark`):
+    /// `Dark` → dark; `Light`/`Normal` → light; `LightDark` → follow the OS.
+    pub fn resolves_dark(self, os_dark: bool) -> bool {
+        match self {
+            ColorScheme::Dark => true,
+            ColorScheme::Light | ColorScheme::Normal => false,
+            ColorScheme::LightDark => os_dark,
+        }
+    }
+}
+
+/// Parse a CSS `color-scheme` value (lowercased). Accepts `normal`, and one or both of
+/// `light`/`dark` in any order with an optional `only` keyword and unknown custom idents (both
+/// ignored). Returns `None` for empty/`inherit`-like input so the caller keeps the existing value.
+/// `normal` mixed with `light`/`dark` is treated as the light/dark selection (the keywords win).
+fn parse_color_scheme(val: &str) -> Option<ColorScheme> {
+    let mut light = false;
+    let mut dark = false;
+    let mut saw_any = false;
+    for tok in val.split_whitespace() {
+        saw_any = true;
+        match tok {
+            "light" => light = true,
+            "dark" => dark = true,
+            // `only`, `normal`, and unknown custom idents don't change which scheme we can pick.
+            _ => {}
+        }
+    }
+    if !saw_any {
+        return None;
+    }
+    Some(match (light, dark) {
+        (true, true) => ColorScheme::LightDark,
+        (false, true) => ColorScheme::Dark,
+        (true, false) => ColorScheme::Light,
+        // Only `normal`/`only`/unknown idents → no light/dark opt-in.
+        (false, false) => ColorScheme::Normal,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -436,7 +501,10 @@ impl SizeConstraint {
 impl Default for ComputedStyle {
     fn default() -> Self {
         ComputedStyle {
-            color: (0, 0, 0), // black — the page canvas defaults to white (CSS initial)
+            // Initial text color: black on a light canvas, or a light grey when the root opted into
+            // a dark `color-scheme` (resolved before the cascade — see `root_used_scheme_dark`). The
+            // root inherits this, so every box gets themed default text unless author CSS overrides.
+            color: ua_default_text_color(),
             background_color: None,
             font_size: 16.0,
             bold: false,
@@ -497,6 +565,7 @@ impl Default for ComputedStyle {
             content: None,
             before: None,
             after: None,
+            color_scheme: ColorScheme::Normal,
         }
     }
 }
@@ -582,6 +651,13 @@ impl ComputedStyle {
             },
             "border-top-color" | "border-right-color" | "border-bottom-color"
             | "border-left-color" | "border-color" => rgb_str(self.border_color),
+            "color-scheme" => match self.color_scheme {
+                ColorScheme::Normal => "normal",
+                ColorScheme::Light => "light",
+                ColorScheme::Dark => "dark",
+                ColorScheme::LightDark => "light dark",
+            }
+            .to_string(),
             "opacity" => num(self.opacity),
             "border-radius" => px(self.border_radius),
 
@@ -898,17 +974,156 @@ pub fn cascade(
     doc: &dom::Document,
     sheets: &[css::Stylesheet],
 ) -> HashMap<dom::NodeId, ComputedStyle> {
-    let ua = user_agent_stylesheet();
+    cascade_locked(doc, sheets, None).0
+}
+
+/// Like [`cascade`], but `os_dark` is the OS appearance for this document (true = Dark), applied
+/// to `@media (prefers-color-scheme)` and the `color-scheme` resolution *atomically* with the
+/// cascade (set under the cascade lock so a concurrent cascade can't clobber the shared flag), and
+/// also returns the root's resolved *used* color scheme (true = dark). The engine stores that on
+/// its layout cache so the canvas background doesn't have to re-read the racy process-global. Pass
+/// this rather than calling [`set_color_scheme_dark`] separately before [`cascade`].
+pub fn cascade_with_root_scheme(
+    doc: &dom::Document,
+    sheets: &[css::Stylesheet],
+    os_dark: bool,
+) -> (HashMap<dom::NodeId, ComputedStyle>, bool) {
+    cascade_locked(doc, sheets, Some(os_dark))
+}
+
+/// The shared, lock-held cascade body. When `os_dark` is `Some`, the OS-appearance flag is set
+/// under the lock first (so `@media (prefers-color-scheme)` and the `color-scheme` resolution see a
+/// stable value); when `None`, the previously-set global is used as-is (back-compat for callers
+/// that set it themselves). Returns the styles plus the root's resolved used color scheme.
+fn cascade_locked(
+    doc: &dom::Document,
+    sheets: &[css::Stylesheet],
+    os_dark: Option<bool>,
+) -> (HashMap<dom::NodeId, ComputedStyle>, bool) {
+    // Hold the cascade lock for the whole body: the OS-appearance flag and the root-color-scheme
+    // global are written and read back here, so concurrent cascades must not interleave.
+    let _cascade_guard = CASCADE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(dark) = os_dark {
+        set_color_scheme_dark(dark);
+    }
     let mut out = HashMap::new();
-    // Build the selector index ONCE over UA + author sheets, so every node shares it instead
-    // of re-scanning (and re-parsing) all rules per element.
+    // Pre-pass: resolve the root's *used* color scheme (light vs dark) BEFORE the real UA sheet and
+    // cascade are built, so the UA dark defaults (html/body text color in `user_agent_stylesheet`,
+    // initial color via `ComputedStyle::default()`, canvas background via `ua_default_canvas_color`)
+    // are seeded for this whole cascade. `color-scheme` is often gated behind
+    // `@media (prefers-color-scheme: dark)`, so we cascade `<html>` (then `<body>`) for real to read
+    // the property, then combine with the OS flag. `<meta name="color-scheme">` is a fallback opt-in
+    // mapped like the property. See `resolve_root_color_scheme` (it runs with light defaults so its
+    // own read can't depend on the result).
+    set_root_used_scheme_dark(resolve_root_color_scheme(doc, sheets));
+    // Now build the (themed) UA sheet and the selector index ONCE over UA + author sheets, so every
+    // node shares it instead of re-scanning (and re-parsing) all rules per element.
+    let ua = user_agent_stylesheet();
     let index = SelectorIndex::build(&ua, sheets);
-    // The root inherits from a fresh default style.
+    // The root inherits from a fresh default style (now themed by the resolved scheme above).
     let initial = ComputedStyle::default();
     // Custom properties (`--name`) inherit; the root starts with an empty environment.
     let initial_vars: HashMap<String, String> = HashMap::new();
     cascade_node(doc, doc.root(), &initial, &initial_vars, false, &index, &mut out);
-    out
+    (out, root_used_scheme_dark())
+}
+
+/// Resolve the root's *used* color scheme (true = dark) for one cascade. Reads the page's
+/// `color-scheme` opt-in (which determines whether the UA renders a dark canvas + light text) and
+/// combines it with the OS appearance:
+///
+/// 1. Cascade `<html>` for real (so a `color-scheme` set under `@media (prefers-color-scheme:dark)`
+///    or via `:root{…}` is picked up), then fall back to `<body>` if `<html>` left it `Normal`.
+/// 2. If still `Normal`, honor a `<meta name="color-scheme" content="…">` in `<head>`, mapped like
+///    the property.
+/// 3. Apply [`ColorScheme::resolves_dark`] against the OS flag: only-dark → dark; only-light/normal
+///    → light; `light dark` (both) → follow the OS.
+///
+/// Runs the pre-pass with the dark UA defaults *disabled* (`set_root_used_scheme_dark(false)`) so
+/// the property read doesn't depend on its own result. The caller stores the returned value.
+fn resolve_root_color_scheme(doc: &dom::Document, sheets: &[css::Stylesheet]) -> bool {
+    // Read the property with light defaults so the pre-pass result can't depend on itself.
+    set_root_used_scheme_dark(false);
+    // Build a (light-themed) UA sheet + index just for this read. `color-scheme` only ever comes
+    // from author CSS / inline style / meta, so the UA rules don't affect the result, but we still
+    // index over UA + author to match real selectors (e.g. `:root { color-scheme: dark }`).
+    let ua = user_agent_stylesheet();
+    let index = SelectorIndex::build(&ua, sheets);
+    let initial = ComputedStyle::default();
+    let initial_vars: HashMap<String, String> = HashMap::new();
+
+    let mut scheme = ColorScheme::Normal;
+    if let Some(html) = find_element(doc, "html") {
+        if let dom::NodeData::Element(el) = &doc.get(html).data {
+            let (s, _) =
+                compute_element_style(doc, html, el, &initial, &initial_vars, false, &index);
+            scheme = s.color_scheme;
+        }
+    }
+    if scheme == ColorScheme::Normal {
+        if let Some(body) = find_element(doc, "body") {
+            if let dom::NodeData::Element(el) = &doc.get(body).data {
+                let (s, _) =
+                    compute_element_style(doc, body, el, &initial, &initial_vars, false, &index);
+                scheme = s.color_scheme;
+            }
+        }
+    }
+    if scheme == ColorScheme::Normal {
+        if let Some(meta) = meta_color_scheme(doc) {
+            scheme = meta;
+        }
+    }
+    scheme.resolves_dark(color_scheme_dark())
+}
+
+/// Depth-first search for the first element with the given (lowercase) tag name.
+fn find_element(doc: &dom::Document, tag: &str) -> Option<dom::NodeId> {
+    fn walk(doc: &dom::Document, id: dom::NodeId, tag: &str) -> Option<dom::NodeId> {
+        if id.0 >= doc.len() {
+            return None;
+        }
+        if let dom::NodeData::Element(el) = &doc.get(id).data {
+            if el.tag.eq_ignore_ascii_case(tag) {
+                return Some(id);
+            }
+        }
+        for &c in &doc.get(id).children {
+            if let Some(found) = walk(doc, c, tag) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(doc, doc.root(), tag)
+}
+
+/// Read a `<meta name="color-scheme" content="…">` (the HTML opt-in equivalent of the CSS
+/// property) and map its `content` like `color-scheme`. Returns the first such meta's value.
+fn meta_color_scheme(doc: &dom::Document) -> Option<ColorScheme> {
+    fn walk(doc: &dom::Document, id: dom::NodeId) -> Option<ColorScheme> {
+        if id.0 >= doc.len() {
+            return None;
+        }
+        if let dom::NodeData::Element(el) = &doc.get(id).data {
+            if el.tag.eq_ignore_ascii_case("meta")
+                && el.attrs.get("name").is_some_and(|n| n.eq_ignore_ascii_case("color-scheme"))
+            {
+                if let Some(content) = el.attrs.get("content") {
+                    if let Some(cs) = parse_color_scheme(&content.to_ascii_lowercase()) {
+                        return Some(cs);
+                    }
+                }
+            }
+        }
+        for &c in &doc.get(id).children {
+            if let Some(found) = walk(doc, c) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(doc, doc.root())
 }
 
 /// One indexed selector. Points back at the rule's declarations and carries everything needed
@@ -1022,6 +1237,54 @@ pub fn set_color_scheme_dark(is_dark: bool) {
 /// Whether the effective OS appearance is currently Dark (drives `prefers-color-scheme`).
 fn color_scheme_dark() -> bool {
     COLOR_SCHEME_DARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The root's *used* color scheme (true = dark), resolved by [`cascade`] from the page's
+/// `color-scheme` (off `<html>`/`<body>`/`<meta>`) combined with the OS appearance. Seeds the dark
+/// UA defaults: the initial/inherited text color ([`ua_default_text_color`]) and the canvas
+/// background ([`ua_default_canvas_color`], read by the engine's `page_background`). Defaults to
+/// light (false). Re-resolved every cascade, so an OS Light/Dark toggle (which re-runs the cascade)
+/// flips both the `@media` gating the page's `color-scheme` AND this used scheme.
+static ROOT_USED_SCHEME_DARK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Serializes [`cascade`] across threads. `cascade` resolves the root color scheme into the
+/// process-global [`ROOT_USED_SCHEME_DARK`] and then reads it back while building UA defaults, so
+/// two concurrent cascades on different documents could otherwise clobber each other's flag. The
+/// engine runs one cascade at a time, so this only matters for parallel `cargo test`; the lock is
+/// cheap and held only for the (fast) cascade body. Poisoning is irrelevant — we only need mutual
+/// exclusion — so the guard ignores it.
+static CASCADE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Whether the root opted into a dark color scheme for this cascade (UA dark canvas + light text).
+pub fn root_used_scheme_dark() -> bool {
+    ROOT_USED_SCHEME_DARK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_root_used_scheme_dark(dark: bool) {
+    ROOT_USED_SCHEME_DARK.store(dark, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// UA initial/default text color: black on a light page, light grey (`#e8e8e8`) when the root used
+/// a dark color scheme. Read by `ComputedStyle::default()` (the cascade root's inherited color and
+/// the `color: initial`/`unset` reset target), so dark pages get light text without per-element CSS.
+fn ua_default_text_color() -> (u8, u8, u8) {
+    if root_used_scheme_dark() {
+        (0xe8, 0xe8, 0xe8)
+    } else {
+        (0, 0, 0)
+    }
+}
+
+/// UA default canvas/page background: white on a light page, dark (`#1e1e1e`) when the root used a
+/// dark color scheme. Read by the engine's `page_background` when no html/body `background-color`
+/// is set.
+pub fn ua_default_canvas_color() -> (u8, u8, u8) {
+    if root_used_scheme_dark() {
+        (0x1e, 0x1e, 0x1e)
+    } else {
+        (0xff, 0xff, 0xff)
+    }
 }
 
 // Live pointer/keyboard interaction state used to evaluate `:hover`/`:focus`/`:active`/
@@ -1186,6 +1449,8 @@ fn compute_element_style<'a>(
         content: None,
         before: None,
         after: None,
+        // `color-scheme` inherits (initial `Normal`).
+        color_scheme: parent.color_scheme,
     };
     if parent_hidden {
         style.display_none = true;
@@ -2138,6 +2403,14 @@ fn apply_declaration(
                 style.background_gradient = Some(g);
             } else if val.trim().eq_ignore_ascii_case("none") {
                 style.background_gradient = None;
+            }
+        }
+        "color-scheme" => {
+            let trimmed = val.trim().to_ascii_lowercase();
+            if trimmed == "inherit" {
+                style.color_scheme = parent.color_scheme;
+            } else if let Some(cs) = parse_color_scheme(&trimmed) {
+                style.color_scheme = cs;
             }
         }
         "box-shadow" => {
@@ -5061,9 +5334,18 @@ fn is_empty_element(doc: &dom::Document, id: dom::NodeId) -> bool {
 
 /// The built-in user-agent stylesheet: sane defaults on a white page canvas.
 fn user_agent_stylesheet() -> css::Stylesheet {
-    css::parse(
-        "html { color: #000; font-size: 16px }
-         body { color: #000; font-size: 16px }
+    // html/body default text color is themed by the root's used `color-scheme` (resolved by the
+    // cascade pre-pass before this runs): black on a light page, light grey (`#e8e8e8`) on a dark
+    // one. Form-control text/background (`input`/`button`/…) is intentionally left light — control
+    // & scrollbar theming is out of scope.
+    let (tr, tg, tb) = ua_default_text_color();
+    let text = format!("#{tr:02x}{tg:02x}{tb:02x}");
+    let sheet =
+        // html/body keep explicit UA color rules (rather than dropping them) so body's color doesn't
+        // inherit a `:root` author color the way a real `:root` selector would; author rules still
+        // override.
+        "html { color: {TEXT}; font-size: 16px }
+         body { color: {TEXT}; font-size: 16px }
          h1 { font-size: 32px; font-weight: bold; display: block; margin: 0.67em 0 }
          h2 { font-size: 26px; font-weight: bold; display: block; margin: 0.83em 0 }
          h3 { font-size: 20px; font-weight: bold; display: block; margin: 1em 0 }
@@ -5131,14 +5413,24 @@ fn user_agent_stylesheet() -> css::Stylesheet {
          input[type=submit], input[type=reset], input[type=button], button { background-color: #efefef; padding: 2px 8px }
          input[type=file] { background-color: #efefef; padding: 1px 2px }
          input[type=checkbox], input[type=radio], input[type=range], input[type=color], progress, meter { border: 0; padding: 0; background-color: transparent }
-         label { display: inline-block }",
-    )
+         label { display: inline-block }";
+    css::parse(&sheet.replace("{TEXT}", &text))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use dom::NodeData;
+
+    /// Serializes tests that read or mutate the process-global OS-appearance / root-color-scheme
+    /// flags (`set_color_scheme_dark` / `root_used_scheme_dark`), which `cargo test` would otherwise
+    /// run in parallel and race on. Poisoning is irrelevant (we only need exclusion), so callers
+    /// ignore a poisoned guard.
+    static SCHEME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn scheme_guard() -> std::sync::MutexGuard<'static, ()> {
+        SCHEME_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn elem(doc: &dom::Document, tag_and_pred: impl Fn(&dom::ElementData) -> bool) -> dom::NodeId {
         // Find first element matching predicate (depth-first).
@@ -5846,6 +6138,7 @@ mod tests {
 
     #[test]
     fn media_prefers_color_scheme_tracks_os_appearance() {
+        let _g = scheme_guard();
         let sheet = css::parse(
             "p { color: rgb(10,20,30) } \
              @media (prefers-color-scheme: dark) { p { color: rgb(1,2,3) } } \
@@ -5863,6 +6156,78 @@ mod tests {
         set_color_scheme_dark(false);
         let map = cascade(&doc, &[sheet]);
         assert_eq!(map[&p].color, (4, 5, 6), "light rule should win in Light mode");
+    }
+
+    #[test]
+    fn color_scheme_parses() {
+        assert_eq!(parse_color_scheme("normal"), Some(ColorScheme::Normal));
+        assert_eq!(parse_color_scheme("light"), Some(ColorScheme::Light));
+        assert_eq!(parse_color_scheme("dark"), Some(ColorScheme::Dark));
+        assert_eq!(parse_color_scheme("light dark"), Some(ColorScheme::LightDark));
+        assert_eq!(parse_color_scheme("dark light"), Some(ColorScheme::LightDark));
+        // `only` and unknown idents are ignored.
+        assert_eq!(parse_color_scheme("only dark"), Some(ColorScheme::Dark));
+        assert_eq!(parse_color_scheme("dark only"), Some(ColorScheme::Dark));
+        assert_eq!(parse_color_scheme("foo bar"), Some(ColorScheme::Normal));
+        assert_eq!(parse_color_scheme(""), None);
+    }
+
+    #[test]
+    fn color_scheme_resolves_dark() {
+        assert!(ColorScheme::Dark.resolves_dark(false));
+        assert!(ColorScheme::Dark.resolves_dark(true));
+        assert!(!ColorScheme::Light.resolves_dark(true));
+        assert!(!ColorScheme::Normal.resolves_dark(true));
+        assert!(ColorScheme::LightDark.resolves_dark(true));
+        assert!(!ColorScheme::LightDark.resolves_dark(false));
+    }
+
+    #[test]
+    fn root_dark_scheme_themes_default_text() {
+        let _g = scheme_guard();
+        // :root { color-scheme: dark } → root used scheme dark → default UA text light. The map's
+        // colors are captured during the cascade (which holds CASCADE_LOCK, so the root-scheme
+        // global it writes is the one it reads back), so they're race-free to assert on.
+        let sheet = css::parse(":root { color-scheme: dark }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        set_color_scheme_dark(false);
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        // Default (UA) text color is now light, not black.
+        assert_eq!(map[&p].color, (0xe8, 0xe8, 0xe8));
+    }
+
+    #[test]
+    fn root_light_scheme_keeps_black_text() {
+        let _g = scheme_guard();
+        let sheet = css::parse(":root { color-scheme: light }");
+        let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
+        set_color_scheme_dark(true); // OS dark, but page opts only into light
+        let map = cascade(&doc, &[sheet]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (0, 0, 0));
+    }
+
+    #[test]
+    fn meta_color_scheme_dark_opts_in() {
+        let _g = scheme_guard();
+        // <meta name="color-scheme" content="dark"> with no CSS property.
+        let doc = html::parse(
+            r#"<html><head><meta name="color-scheme" content="dark"></head><body><p>t</p></body></html>"#,
+        );
+        set_color_scheme_dark(false);
+        let map = cascade(&doc, &[]);
+        let p = elem(&doc, |e| e.tag == "p");
+        assert_eq!(map[&p].color, (0xe8, 0xe8, 0xe8));
+    }
+
+    #[test]
+    fn color_scheme_get_property_serializes() {
+        let mut s = ComputedStyle::default();
+        s.color_scheme = ColorScheme::LightDark;
+        assert_eq!(s.get_property("color-scheme"), "light dark");
+        s.color_scheme = ColorScheme::Dark;
+        assert_eq!(s.get_property("color-scheme"), "dark");
     }
 
     #[test]
