@@ -2762,7 +2762,26 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     globalThis.WebSocket.CONNECTING = 0; globalThis.WebSocket.OPEN = 1; globalThis.WebSocket.CLOSING = 2; globalThis.WebSocket.CLOSED = 3;
   }
   if (typeof globalThis.Headers !== "function") {
-    def(globalThis, "Headers", function (init) { var m = {}; this.append = function (k, v) { m[String(k).toLowerCase()] = String(v); }; this.set = this.append; this.get = function (k) { var v = m[String(k).toLowerCase()]; return v === undefined ? null : v; }; this.has = function (k) { return String(k).toLowerCase() in m; }; this.delete = function (k) { delete m[String(k).toLowerCase()]; }; this.forEach = function (cb) { for (var k in m) { cb(m[k], k, this); } }; if (init) { for (var k in init) { if (Object.prototype.hasOwnProperty.call(init, k)) { this.append(k, init[k]); } } } });
+    def(globalThis, "Headers", function (init) {
+      var m = {};
+      this.append = function (k, v) { k = String(k).toLowerCase(); m[k] = (m[k] === undefined) ? String(v) : (m[k] + ", " + String(v)); };
+      this.set = function (k, v) { m[String(k).toLowerCase()] = String(v); };
+      this.get = function (k) { var v = m[String(k).toLowerCase()]; return v === undefined ? null : v; };
+      this.has = function (k) { return String(k).toLowerCase() in m; };
+      this.delete = function (k) { delete m[String(k).toLowerCase()]; };
+      this.forEach = function (cb, thisArg) { Object.keys(m).sort().forEach(function (k) { cb.call(thisArg, m[k], k, this); }, this); };
+      this.keys = function () { return Object.keys(m).sort()[Symbol.iterator](); };
+      this.values = function () { return Object.keys(m).sort().map(function (k) { return m[k]; })[Symbol.iterator](); };
+      this.entries = function () { return Object.keys(m).sort().map(function (k) { return [k, m[k]]; })[Symbol.iterator](); };
+      this.getSetCookie = function () { return []; };
+      this[Symbol.iterator] = function () { return this.entries(); };
+      // init: another Headers, an array of [k,v] pairs, or a plain object.
+      if (init) {
+        if (typeof init.forEach === "function" && typeof init.length !== "number") { init.forEach(function (v, k) { this.append(k, v); }, this); }
+        else if (typeof init.length === "number") { for (var i = 0; i < init.length; i++) { this.append(init[i][0], init[i][1]); } }
+        else { for (var k in init) { if (Object.prototype.hasOwnProperty.call(init, k)) { this.append(k, init[k]); } } }
+      }
+    });
   }
 
   // --- URLSearchParams ---------------------------------------------------------------------
@@ -2796,9 +2815,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       this.has = function (k) { k = String(k); for (var i = 0; i < pairs.length; i++) { if (pairs[i][0] === k) { return true; } } return false; };
       this.delete = function (k) { k = String(k); for (var i = pairs.length - 1; i >= 0; i--) { if (pairs[i][0] === k) { pairs.splice(i, 1); } } };
       this.forEach = function (cb, thisArg) { for (var i = 0; i < pairs.length; i++) { cb.call(thisArg, pairs[i][1], pairs[i][0], this); } };
-      this.keys = function () { return pairs.map(function (p) { return p[0]; }); };
-      this.values = function () { return pairs.map(function (p) { return p[1]; }); };
-      this.entries = function () { return pairs.slice(); };
+      this.keys = function () { return pairs.map(function (p) { return p[0]; })[Symbol.iterator](); };
+      this.values = function () { return pairs.map(function (p) { return p[1]; })[Symbol.iterator](); };
+      this.entries = function () { return pairs.map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); };
+      this.sort = function () { pairs.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; }); };
+      this[Symbol.iterator] = function () { return this.entries(); };
       this.toString = function () { return pairs.map(function (p) { return encodeURIComponent(p[0]) + "=" + encodeURIComponent(p[1]); }).join("&"); };
       Object.defineProperty(this, "size", { get: function () { return pairs.length; }, enumerable: false, configurable: true });
     });

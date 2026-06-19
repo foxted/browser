@@ -645,6 +645,14 @@ impl Engine {
         }
     }
 
+    /// Console + error lines captured for the current page (diagnostics).
+    pub fn console_lines(&self) -> Vec<String> {
+        match &self.state {
+            LoadState::Loaded { console, .. } => console.clone(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Test-only: focus the first editable text field in the live document (by walking the DOM),
     /// returning whether one was found. Sidesteps coordinate-precise click-to-focus in tests.
     #[cfg(test)]
