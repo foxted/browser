@@ -1,11 +1,11 @@
 # WPT conformance — biggest wins
 
-Baseline (in-process `wpt-runner` over the `dom/` tests): **501/5295 subtests (9.5%)**, 466 files ran,
+Baseline 501/5295 (9.5%) → after implicit-body + classList: **1918/5254 (36.5%)**, 466 files ran,
 34 harness-errors. Prioritized by subtests unlocked.
 
 ## Top wins (by impact)
-- [ ] **Implicit `<head>`/`<body>`** — `document.body === null` on bodyless pages. **29 files die outright** (`null.insertBefore`) + 38 more fail `appendChild on null`; nearly every WPT test appends fixtures to `document.body`. (`crates/html` parser) — **gates the most**
-- [ ] **`classList` / `DOMTokenList`** — `Element-classlist.html` is **20/1420**. Full DOMTokenList: add/remove/toggle(force)/replace/contains/item/length/value/supports, indexing, iteration, token validation (throw on empty/whitespace). (`crates/js`)
+- [x] **Implicit `<head>`/`<body>`** — `document.body === null` on bodyless pages. **29 files die outright** (`null.insertBefore`) + 38 more fail `appendChild on null`; nearly every WPT test appends fixtures to `document.body`. (`crates/html` parser) — **gates the most**
+- [x] **`classList` / `DOMTokenList`** → 1420/1420 (+ MutationObserver.takeRecords fix) — `Element-classlist.html` is **20/1420**. Full DOMTokenList: add/remove/toggle(force)/replace/contains/item/length/value/supports, indexing, iteration, token validation (throw on empty/whitespace). (`crates/js`)
 - [ ] **Namespaces** — `createElementNS` (596) + `Document-createElement-namespace` (51): `namespaceURI`/`prefix`/`localName`, `createElementNS`/`createAttributeNS`, `getElementsByTagNameNS`. (`crates/js`)
 - [ ] **`createElement` edge cases** (147) — invalid-name `InvalidCharacterError`, lowercasing, `localName`/`tagName`/`nodeName`. (`crates/js`)
 - [ ] **`cloneNode`** (135) — deep/shallow real clone (attrs + children), not `return this`. (`crates/js`)
