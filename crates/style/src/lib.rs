@@ -241,6 +241,15 @@ pub struct ComputedStyle {
     /// `transform-origin` as fractions of the box's own size (x, y); default (0.5, 0.5). Used to
     /// pivot the `transform`. Not inherited.
     pub transform_origin: (f32, f32),
+
+    /// The resolved `content` string for a generated pseudo-element box. `None` for ordinary
+    /// elements and for pseudo-elements whose `content` is `none`/`normal`/unsupported (no box).
+    pub content: Option<String>,
+    /// Computed style of the `::before` pseudo-element, set only when a matching `::before` rule
+    /// supplied a `content`. Boxed to keep `ComputedStyle` small. Inherits from this element.
+    pub before: Option<Box<ComputedStyle>>,
+    /// Computed style of the `::after` pseudo-element (see [`before`](Self::before)).
+    pub after: Option<Box<ComputedStyle>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +391,9 @@ impl Default for ComputedStyle {
             box_shadows: Vec::new(),
             transform: None,
             transform_origin: (0.5, 0.5),
+            content: None,
+            before: None,
+            after: None,
         }
     }
 }
@@ -995,6 +1007,10 @@ fn compute_element_style<'a>(
         box_shadows: Vec::new(),
         transform: None,
         transform_origin: (0.5, 0.5),
+        // `content` only applies to generated pseudo-elements; ordinary elements never carry one.
+        content: None,
+        before: None,
+        after: None,
     };
     if parent_hidden {
         style.display_none = true;
@@ -1021,12 +1037,29 @@ fn compute_element_style<'a>(
     // origin and decls are constant for a given order, so the only thing we fold is the max
     // specificity.
     let mut best_by_order: HashMap<usize, (u8, u32, &[(String, String)])> = HashMap::new();
+    // Matching `::before`/`::after` rules, kept separately so they cascade onto the pseudo style
+    // rather than the element itself. Each is (origin, specificity, order, decls).
+    let mut before_matches: Vec<(u8, u32, usize, &'a [(String, String)])> = Vec::new();
+    let mut after_matches: Vec<(u8, u32, usize, &'a [(String, String)])> = Vec::new();
     let mut consider = |entry: &Entry<'a>| {
-        if complex_matches(doc, node_id, &entry.compiled.selector) {
-            best_by_order
-                .entry(entry.order)
-                .and_modify(|(_, spec, _)| *spec = (*spec).max(entry.compiled.specificity))
-                .or_insert((entry.origin, entry.compiled.specificity, entry.decls));
+        // The compound must match the originating element either way; the pseudo just routes the
+        // declarations to the element's ::before/::after style.
+        if !complex_matches(doc, node_id, &entry.compiled.selector) {
+            return;
+        }
+        match entry.compiled.pseudo_element {
+            Some(PseudoElement::Before) => {
+                before_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls));
+            }
+            Some(PseudoElement::After) => {
+                after_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls));
+            }
+            None => {
+                best_by_order
+                    .entry(entry.order)
+                    .and_modify(|(_, spec, _)| *spec = (*spec).max(entry.compiled.specificity))
+                    .or_insert((entry.origin, entry.compiled.specificity, entry.decls));
+            }
         }
     };
 
@@ -1124,7 +1157,89 @@ fn compute_element_style<'a>(
         Display::Block | Display::Flex | Display::Grid | Display::None
     );
 
+    // Cascade ::before / ::after styles. Each inherits from this element's computed style, then
+    // applies its own matching rules. A pseudo-element only generates a box when its `content`
+    // resolves to Some, so we keep the result only in that case.
+    style.before = cascade_pseudo(&style, el, &before_matches, &vars);
+    style.after = cascade_pseudo(&style, el, &after_matches, &vars);
+
     (style, vars)
+}
+
+/// Cascade a `::before`/`::after` pseudo-element's style from its originating element's computed
+/// style (the inheritance source) plus the `matches` (origin, specificity, order, decls) rules
+/// whose compound matched. Returns the boxed pseudo style only when `content` resolved to Some
+/// (a pseudo with no `content` generates no box, per spec). `vars` is the element's custom-property
+/// environment (pseudo-elements inherit it).
+fn cascade_pseudo(
+    element_style: &ComputedStyle,
+    el: &dom::ElementData,
+    matches: &[(u8, u32, usize, &[(String, String)])],
+    vars: &HashMap<String, String>,
+) -> Option<Box<ComputedStyle>> {
+    if matches.is_empty() {
+        return None;
+    }
+    // Start from values inherited from the originating element (a fresh element-style snapshot,
+    // already carrying the element's inherited typography/color), but reset the non-inherited
+    // box/content fields to initial.
+    let mut ps = element_style.clone();
+    ps.background_color = None;
+    ps.background_gradient = None;
+    ps.box_shadows = Vec::new();
+    ps.transform = None;
+    ps.transform_origin = (0.5, 0.5);
+    ps.margin = Edges::default();
+    ps.padding = Edges::default();
+    ps.border = Edges::default();
+    ps.border_color = element_style.color;
+    ps.width = None;
+    ps.height = None;
+    ps.min_width = None;
+    ps.max_width = None;
+    ps.min_height = None;
+    ps.max_height = None;
+    ps.position = Position::Static;
+    ps.top = None;
+    ps.right = None;
+    ps.bottom = None;
+    ps.left = None;
+    ps.z_index = None;
+    ps.opacity = 1.0;
+    ps.border_radius = 0.0;
+    ps.display = Display::Inline; // generated content is inline by default
+    ps.display_block = false;
+    ps.content = None;
+    ps.before = None;
+    ps.after = None;
+
+    // Apply matching rules in cascade order (origin, specificity, source order ascending → winner
+    // last). The inheritance source for `currentColor`/`inherit` is the originating element.
+    let mut sorted: Vec<&(u8, u32, usize, &[(String, String)])> = matches.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let inherited_color = element_style.color;
+    for (_, _, _, decls) in sorted {
+        for (prop, val) in *decls {
+            if prop.starts_with("--") {
+                continue;
+            }
+            let resolved = resolve_vars(val, vars);
+            let current_color = ps.color;
+            apply_declaration(&mut ps, prop, &resolved, element_style, current_color, inherited_color);
+        }
+    }
+
+    // No `content` (or `content: none`) → no generated box.
+    let content = ps.content.take()?;
+    // Resolve `attr(name)` now that we have the element.
+    ps.content = Some(resolve_content_attr(&content, el));
+    // Keep derived display flags consistent for downstream readers.
+    ps.display_none = ps.display == Display::None;
+    ps.display_block = matches!(
+        ps.display,
+        Display::Block | Display::Flex | Display::Grid | Display::None
+    );
+    Some(Box::new(ps))
 }
 
 /// Resolve `var(--name, fallback)` references in `value` against `vars`, recursively (vars can
@@ -2014,8 +2129,94 @@ fn apply_declaration(
             }
         }
 
+        // --- generated content (only meaningful on ::before/::after pseudo-elements) ---
+        // `attr(name)` references can't be resolved here (we lack the originating element), so they
+        // are stored verbatim and resolved by the pseudo cascade via `resolve_content_attr`.
+        "content" => {
+            style.content = parse_content(val);
+        }
+
         _ => {}
     }
+}
+
+/// Parse a `content` value into the string a pseudo-element should render, or `None` when the
+/// value generates no box. Handles: a quoted string (with minimal escape handling — `\"`, `\\`,
+/// and `\XXXX`/`\XX…` hex unicode escapes); `none`/`normal` → `None`; and `attr(name)`, which is
+/// returned verbatim (`attr(name)`) for [`resolve_content_attr`] to resolve once the element is
+/// known. Other functional values (`counter(...)`, `url(...)`, multiple tokens, …) are simplified
+/// to an empty string (a box with no text).
+fn parse_content(val: &str) -> Option<String> {
+    let v = val.trim();
+    let lower = v.to_ascii_lowercase();
+    if lower == "none" || lower == "normal" {
+        return None;
+    }
+    // A single quoted string.
+    if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
+        || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
+    {
+        return Some(unescape_content_string(&v[1..v.len() - 1]));
+    }
+    // `attr(name)` — kept verbatim; resolved against the element later.
+    if lower.starts_with("attr(") && v.ends_with(')') {
+        return Some(v.to_string());
+    }
+    // counter(...)/url(...)/anything else we don't model: an empty box (no text), per the
+    // documented simplification.
+    Some(String::new())
+}
+
+/// Decode the minimal CSS string escapes used in `content`: `\"`, `\'`, `\\`, and hex escapes
+/// (`\A`, `\2192`, optionally terminated by a space). Unknown escapes drop the backslash.
+fn unescape_content_string(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() {
+            let next = chars[i + 1];
+            if next.is_ascii_hexdigit() {
+                // Up to 6 hex digits, optionally followed by a single whitespace terminator.
+                let mut j = i + 1;
+                let mut hex = String::new();
+                while j < chars.len() && hex.len() < 6 && chars[j].is_ascii_hexdigit() {
+                    hex.push(chars[j]);
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ' ' {
+                    j += 1; // consume the terminating space
+                }
+                if let Some(cp) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    out.push(cp);
+                }
+                i = j;
+                continue;
+            }
+            // Literal escape (`\"`, `\\`, …): emit the escaped char.
+            out.push(next);
+            i += 2;
+            continue;
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Resolve a parsed `content` string against the originating element: if it's an `attr(name)`
+/// reference, return the element's `name` attribute value (or empty string when absent);
+/// otherwise return it unchanged.
+fn resolve_content_attr(content: &str, el: &dom::ElementData) -> String {
+    let lower = content.to_ascii_lowercase();
+    if lower.starts_with("attr(") && content.ends_with(')') {
+        let name = content[5..content.len() - 1].trim();
+        return el.attrs.get(&name.to_ascii_lowercase())
+            .or_else(|| el.attrs.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v))
+            .cloned()
+            .unwrap_or_default();
+    }
+    content.to_string()
 }
 
 /// Parse a `min-width`/`max-width`/`min-height`/`max-height` value. `none`/`auto`/empty → `None`
@@ -3553,6 +3754,9 @@ struct Compound {
 struct ComplexSelector {
     parts: Vec<(Combinator, Compound)>,
     specificity: u32,
+    /// A trailing `::before`/`::after` (or legacy `:before`/`:after`) on the subject compound.
+    /// `None` for an ordinary element selector.
+    pseudo_element: Option<PseudoElement>,
 }
 
 /// What we bucket a compiled selector under in the [`SelectorIndex`]: the most-selective simple
@@ -3565,12 +3769,22 @@ enum BucketKey {
     Universal,
 }
 
+/// A CSS pseudo-element (only the two that generate content boxes are modeled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PseudoElement {
+    Before,
+    After,
+}
+
 /// A compiled selector ready for the index: the parsed [`ComplexSelector`] plus its bucket key.
 #[derive(Debug, Clone)]
 struct Compiled {
     selector: ComplexSelector,
     key: BucketKey,
     specificity: u32,
+    /// `Some` if this selector targets a `::before`/`::after` pseudo-element. The rest of the
+    /// selector still matches the ORIGINATING element normally; this just routes the result.
+    pseudo_element: Option<PseudoElement>,
 }
 
 impl Compiled {
@@ -3621,7 +3835,8 @@ fn compile_selector(sel: &str) -> Option<Compiled> {
         // Purely `[attr]`/`:pseudo`/`*` subject → universal bucket.
         BucketKey::Universal
     };
-    Some(Compiled { selector, key, specificity })
+    let pseudo_element = selector.pseudo_element;
+    Some(Compiled { selector, key, specificity, pseudo_element })
 }
 
 /// Parse a complex selector into rightmost-first `(Combinator, Compound)` parts, computing its
@@ -3731,23 +3946,36 @@ fn parse_complex(sel: &str) -> Option<ComplexSelector> {
 
     let mut out: Vec<(Combinator, Compound)> = Vec::with_capacity(k);
     let mut spec = Spec::default();
-    // Build rightmost-first.
+    let mut pseudo_element = None;
+    // Build rightmost-first. Only the rightmost (subject, source-last) compound may carry a
+    // trailing `::before`/`::after`.
     for i in (0..k).rev() {
-        let (compound, cspec) = parse_compound(&parts[i].1)?;
+        let is_subject = i == k - 1;
+        let (compound, cspec, pe) = parse_compound(&parts[i].1)?;
+        // A pseudo-element is only valid on the subject; anywhere else it's malformed.
+        if pe.is_some() && !is_subject {
+            return None;
+        }
+        if is_subject {
+            pseudo_element = pe;
+        }
         spec.add(cspec);
         out.push((right_link[i], compound));
     }
-    Some(ComplexSelector { parts: out, specificity: spec.pack() })
+    Some(ComplexSelector { parts: out, specificity: spec.pack(), pseudo_element })
 }
 
 /// Parse a single compound selector (`type.class#id[attr]:pseudo`...). Returns the compound and
 /// its specificity, or `None` on a pseudo-element / malformed token.
-fn parse_compound(text: &str) -> Option<(Compound, Spec)> {
+fn parse_compound(text: &str) -> Option<(Compound, Spec, Option<PseudoElement>)> {
     let chars: Vec<char> = text.chars().collect();
     let n = chars.len();
     let mut i = 0;
     let mut compound = Compound::default();
     let mut spec = Spec::default();
+    // Set when we strip a trailing `::before`/`::after` (or legacy single-colon). The pseudo-element
+    // must be the LAST token in the compound, so once seen, nothing else may follow.
+    let mut pseudo_element: Option<PseudoElement> = None;
 
     // Optional leading type / universal.
     if i < n && chars[i] != '.' && chars[i] != '#' && chars[i] != '[' && chars[i] != ':' && chars[i] != '*' {
@@ -3821,8 +4049,38 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec)> {
                 i = j + 1;
             }
             ':' => {
-                // Pseudo-element `::x` is out of scope → reject the whole selector.
-                if i + 1 < n && chars[i + 1] == ':' {
+                // A pseudo-element uses double-colon (`::before`) syntax; legacy CSS2 also allowed
+                // single-colon (`:before`). Detect either and, for the two we support, strip them
+                // (routing the result to the element's ::before/::after style); a pseudo-element
+                // must be the rightmost token, so nothing may follow it.
+                let double_colon = i + 1 < n && chars[i + 1] == ':';
+                let name_start = if double_colon { i + 2 } else { i + 1 };
+                let mut j = name_start;
+                while j < n && is_name_char(chars[j]) {
+                    j += 1;
+                }
+                let pe_name: String = chars[name_start..j].iter().collect();
+                let pe_name_l = pe_name.to_ascii_lowercase();
+                let pe = match pe_name_l.as_str() {
+                    "before" => Some(PseudoElement::Before),
+                    "after" => Some(PseudoElement::After),
+                    _ => None,
+                };
+                if let Some(pe) = pe {
+                    // Must be the last token in the compound (no class/attr/etc. after a
+                    // pseudo-element). `::before:hover`-style follow-ons are out of scope.
+                    if j != n {
+                        return None;
+                    }
+                    pseudo_element = Some(pe);
+                    // A pseudo-element contributes one type-level (c) specificity unit.
+                    spec.c += 1;
+                    i = j;
+                    continue;
+                }
+                // Any other double-colon pseudo-element (`::first-line`, `::marker`, …) stays out
+                // of scope → reject the whole selector.
+                if double_colon {
                     return None;
                 }
                 i += 1;
@@ -3832,8 +4090,8 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec)> {
                 }
                 let name: String = chars[start..i].iter().collect();
                 let name_l = name.to_ascii_lowercase();
-                // Single-colon pseudo-elements (legacy) are also out of scope.
-                if matches!(name_l.as_str(), "before" | "after" | "first-line" | "first-letter" | "placeholder" | "marker" | "selection" | "backdrop") {
+                // Other single-colon legacy pseudo-elements are also out of scope.
+                if matches!(name_l.as_str(), "first-line" | "first-letter" | "placeholder" | "marker" | "selection" | "backdrop") {
                     return None;
                 }
                 // Functional pseudo with `(...)`.
@@ -3877,7 +4135,7 @@ fn parse_compound(text: &str) -> Option<(Compound, Spec)> {
             _ => return None,
         }
     }
-    Some((compound, spec))
+    Some((compound, spec, pseudo_element))
 }
 
 /// Parse the inside of `[...]` into an [`AttrSel`].
@@ -5787,8 +6045,9 @@ mod tests {
     }
 
     #[test]
-    fn pseudo_element_does_not_crash_and_never_matches() {
-        // `::before` is out of scope: the rule is dropped, the element keeps inherited color.
+    fn pseudo_element_does_not_apply_to_originating_element() {
+        // `::before { color: red }` styles the pseudo, NOT the element: `p` itself stays blue.
+        // And with no `content`, no pseudo box is generated at all.
         let sheet = css::parse(
             "p::before { color: red }
              p { color: blue }",
@@ -5796,10 +6055,92 @@ mod tests {
         let doc = html::parse(r#"<html><body><p>t</p></body></html>"#);
         let map = cascade(&doc, &[sheet]);
         let p = elem(&doc, |e| e.tag == "p");
-        assert_eq!(map[&p].color, (0, 0, 255)); // only `p { blue }` applied
-        // The compile step itself rejects pseudo-elements.
-        assert!(compile_selector("p::before").is_none());
-        assert!(compile_selector("div::after").is_none());
+        assert_eq!(map[&p].color, (0, 0, 255)); // only `p { blue }` applied to the element
+        assert!(map[&p].before.is_none()); // no `content` → no generated box
+        // The compile step now KEEPS pseudo-elements (routing them to ::before/::after).
+        assert_eq!(
+            compile_selector("p::before").unwrap().pseudo_element,
+            Some(PseudoElement::Before)
+        );
+        assert_eq!(
+            compile_selector("div::after").unwrap().pseudo_element,
+            Some(PseudoElement::After)
+        );
+    }
+
+    #[test]
+    fn pseudo_element_before_generates_content() {
+        let sheet = css::parse(r#".x::before { content: "→" } p { color: blue }"#);
+        let doc = html::parse(r#"<html><body><div class="x">hi</div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let d = elem(&doc, |e| e.tag == "div");
+        let before = map[&d].before.as_ref().expect("::before box");
+        assert_eq!(before.content.as_deref(), Some("→"));
+        assert!(map[&d].after.is_none());
+    }
+
+    #[test]
+    fn pseudo_element_empty_and_none_generate_no_or_empty_box() {
+        let sheet = css::parse(
+            r#"div::after { content: "" }
+               span::after { content: none }"#,
+        );
+        let doc = html::parse(r#"<html><body><div>d</div><span>s</span></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let d = elem(&doc, |e| e.tag == "div");
+        let s = elem(&doc, |e| e.tag == "span");
+        // Empty string → a box with empty content (still Some, so styling could show).
+        assert_eq!(map[&d].after.as_ref().unwrap().content.as_deref(), Some(""));
+        // `content: none` → no box at all.
+        assert!(map[&s].after.is_none());
+    }
+
+    #[test]
+    fn pseudo_element_content_attr() {
+        let sheet = css::parse("div::before { content: attr(data-label) }");
+        let doc = html::parse(
+            r#"<html><body><div data-label="Note">x</div></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let d = elem(&doc, |e| e.tag == "div");
+        assert_eq!(map[&d].before.as_ref().unwrap().content.as_deref(), Some("Note"));
+    }
+
+    #[test]
+    fn pseudo_element_carries_distinct_paint_style() {
+        let sheet = css::parse(
+            r#"div { color: rgb(0,0,255) }
+               div::before { content: "x"; color: rgb(255,0,0); background-color: rgb(0,255,0) }"#,
+        );
+        let doc = html::parse(r#"<html><body><div>d</div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let d = elem(&doc, |e| e.tag == "div");
+        assert_eq!(map[&d].color, (0, 0, 255)); // element stays blue
+        let before = map[&d].before.as_ref().unwrap();
+        assert_eq!(before.color, (255, 0, 0)); // pseudo is red
+        assert_eq!(before.background_color, Some((0, 255, 0)));
+    }
+
+    #[test]
+    fn pseudo_element_legacy_single_colon() {
+        let sheet = css::parse(r#"div:before { content: "L" }"#);
+        let doc = html::parse(r#"<html><body><div>d</div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let d = elem(&doc, |e| e.tag == "div");
+        assert_eq!(map[&d].before.as_ref().unwrap().content.as_deref(), Some("L"));
+    }
+
+    #[test]
+    fn pseudo_element_specificity_class_beats_type() {
+        let sheet = css::parse(
+            r#"div::before { content: "a" }
+               .x::before { content: "b" }"#,
+        );
+        let doc = html::parse(r#"<html><body><div class="x">d</div></body></html>"#);
+        let map = cascade(&doc, &[sheet]);
+        let d = elem(&doc, |e| e.tag == "div");
+        // `.x::before` (class) wins over `div::before` (type) → "b".
+        assert_eq!(map[&d].before.as_ref().unwrap().content.as_deref(), Some("b"));
     }
 
     #[test]

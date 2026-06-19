@@ -768,6 +768,39 @@ fn build_replaced_or_control(
     Some(bx)
 }
 
+/// Build an anonymous generated-content box for a `::before`/`::after` pseudo-element from its
+/// computed style `cs`. The box is inline by default (so it flows with the element's text) unless
+/// the pseudo style says block/flex/grid. It holds a single `Text` child with the resolved content
+/// string. The box itself carries NO DOM node (it is anonymous, with no backing element) — the
+/// `originating` id is only used so the text run inherits a sensible style lookup if needed.
+///
+/// Returns `None` only for `display: none`. An empty content string still yields a box (it may
+/// carry a visible background/border); the inner `Text` child is skipped when the string is empty.
+fn build_pseudo_box(originating: dom::NodeId, cs: &style::ComputedStyle) -> Option<LayoutBox> {
+    if cs.display_none {
+        return None;
+    }
+    let content_str = cs.content.clone().unwrap_or_default();
+    let block_display = matches!(
+        cs.display,
+        style::Display::Block | style::Display::Flex | style::Display::Grid
+    ) || (cs.display == style::Display::Inline && cs.display_block);
+    let content = if block_display { BoxContent::Block } else { BoxContent::Inline };
+    let ps = paint_style_of(cs);
+    // Anonymous: no node id (matches other anonymous boxes), so layout/paint never tries to read
+    // a (nonexistent) style entry for it.
+    let mut bx = LayoutBox::new(content, ps.clone(), None);
+    bx.dimensions.margin = edges_of(cs.margin);
+    bx.dimensions.padding = edges_of(cs.padding);
+    bx.dimensions.border = edges_of(cs.border);
+    if !content_str.is_empty() {
+        // The text run carries the originating element's id so its paint style resolves the same
+        // way ordinary text does if the box's own style isn't consulted directly.
+        bx.children.push(LayoutBox::new(BoxContent::Text(content_str), ps, Some(originating)));
+    }
+    Some(bx)
+}
+
 /// Build the box (or boxes) for a single DOM node, pushing into `out`. May push nothing
 /// (hidden / non-rendered / empty text) or several (an inline element contributes its own
 /// box; its rendered text/children become that box's children).
@@ -846,7 +879,21 @@ fn build_box(
             bx.dimensions.margin = edges_of(cs.margin);
             bx.dimensions.padding = edges_of(cs.padding);
             bx.dimensions.border = edges_of(cs.border);
-            bx.children = build_children(doc, id, bx_ctx);
+            // Generated content: a ::before box becomes the first child, ::after the last, around
+            // the element's real children.
+            let mut children: Vec<LayoutBox> = Vec::new();
+            if let Some(before) = &cs.before {
+                if let Some(b) = build_pseudo_box(id, before) {
+                    children.push(b);
+                }
+            }
+            children.extend(build_children(doc, id, bx_ctx));
+            if let Some(after) = &cs.after {
+                if let Some(b) = build_pseudo_box(id, after) {
+                    children.push(b);
+                }
+            }
+            bx.children = children;
             out.push(bx);
         }
         _ => {
@@ -3865,6 +3912,195 @@ mod tests {
             0,
             "unfocused input has no caret"
         );
+    }
+
+    // ----- generated content (::before / ::after) -----
+
+    /// A pseudo computed style carrying a content string (inline by default).
+    fn pseudo_style(content: &str) -> style::ComputedStyle {
+        style::ComputedStyle { content: Some(content.to_string()), ..Default::default() }
+    }
+
+    /// The first child of the box for `node` whose text equals `s` and its index among children.
+    fn child_text_at<'a>(b: &'a LayoutBox) -> Vec<&'a str> {
+        b.children
+            .iter()
+            .filter_map(|c| match &c.content {
+                BoxContent::Text(t) => Some(t.as_str()),
+                _ => c.children.first().and_then(|cc| match &cc.content {
+                    BoxContent::Text(t) => Some(t.as_str()),
+                    _ => None,
+                }),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn before_text_precedes_real_text() {
+        // <div class=x>hi</div> with ::before content "→".
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let div = doc.append_element(body, "div");
+        doc.append_child(div, dom::NodeData::Text("hi".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            div,
+            style::ComputedStyle {
+                display_block: true,
+                before: Some(Box::new(pseudo_style("→"))),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let dbox = find_box(&root_box, &|x| x.node == Some(div)).unwrap();
+        // The ::before "→" text must appear before "hi" in document order.
+        let texts = collect_text_boxes(dbox)
+            .iter()
+            .filter_map(|b| match &b.content {
+                BoxContent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, vec!["→".to_string(), "hi".to_string()]);
+    }
+
+    #[test]
+    fn after_text_follows_real_text() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let div = doc.append_element(body, "div");
+        doc.append_child(div, dom::NodeData::Text("hi".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            div,
+            style::ComputedStyle {
+                display_block: true,
+                after: Some(Box::new(pseudo_style("world"))),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let dbox = find_box(&root_box, &|x| x.node == Some(div)).unwrap();
+        let texts = collect_text_boxes(dbox)
+            .iter()
+            .filter_map(|b| match &b.content {
+                BoxContent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // "hi" and "world" are separate inline words on the same line; ::after comes last.
+        assert!(texts.iter().any(|t| t.contains("hi")));
+        let joined = texts.join(" ");
+        let hi_pos = joined.find("hi").unwrap();
+        let world_pos = joined.find("world").unwrap();
+        assert!(hi_pos < world_pos, "::after text must follow the element's own text");
+    }
+
+    #[test]
+    fn empty_content_emits_no_text_box() {
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let div = doc.append_element(body, "div");
+        doc.append_child(div, dom::NodeData::Text("hi".into()));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            div,
+            style::ComputedStyle {
+                display_block: true,
+                after: Some(Box::new(pseudo_style(""))),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let dbox = find_box(&root_box, &|x| x.node == Some(div)).unwrap();
+        let texts: Vec<_> = collect_text_boxes(dbox)
+            .iter()
+            .filter_map(|b| match &b.content {
+                BoxContent::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        // Only the real "hi" text — the empty ::after contributes a box but no text child.
+        assert_eq!(texts, vec!["hi".to_string()]);
+        let _ = child_text_at(dbox);
+    }
+
+    #[test]
+    fn inline_pseudo_text_carries_its_own_color() {
+        // An inline ::before is flattened into text runs; the run carries the pseudo's color.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let div = doc.append_element(body, "div");
+
+        let mut pseudo = pseudo_style("x");
+        pseudo.color = (255, 0, 0);
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            div,
+            style::ComputedStyle {
+                display_block: true,
+                color: (0, 0, 255),
+                before: Some(Box::new(pseudo)),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let dbox = find_box(&root_box, &|x| x.node == Some(div)).unwrap();
+        let tb = collect_text_boxes(dbox)
+            .into_iter()
+            .find(|b| matches!(&b.content, BoxContent::Text(t) if t == "x"))
+            .expect("::before text box");
+        assert_eq!(tb.style.color, (255, 0, 0)); // pseudo red, distinct from element blue
+    }
+
+    #[test]
+    fn block_pseudo_box_carries_background() {
+        // A `display: block` ::before keeps its own box (not flattened), so its background applies.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let div = doc.append_element(body, "div");
+
+        let mut pseudo = pseudo_style("x");
+        pseudo.display = style::Display::Block;
+        pseudo.display_block = true;
+        pseudo.background_color = Some((0, 255, 0));
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            div,
+            style::ComputedStyle {
+                display_block: true,
+                before: Some(Box::new(pseudo)),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let dbox = find_box(&root_box, &|x| x.node == Some(div)).unwrap();
+        let pseudo_box = dbox
+            .children
+            .iter()
+            .find(|c| c.node.is_none() && matches!(c.content, BoxContent::Block))
+            .expect("anonymous ::before block box");
+        assert_eq!(pseudo_box.style.background_color, Some((0, 255, 0)));
     }
 }
 
