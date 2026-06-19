@@ -1,10 +1,26 @@
 //! Hand-written HTML parsing (Phase 2): a tokenizer plus a forgiving tree builder that
 //! populates an arena [`dom::Document`].
 //!
-//! This is intentionally a pragmatic subset of the HTML5 spec. We do not implement
-//! insertion modes, the adoption agency algorithm, or implied tag insertion. The goal is
-//! to produce a sensible tree for typical real-world pages and to *never panic* on
-//! malformed input.
+//! This is intentionally a pragmatic subset of the HTML5 spec. We do not implement the
+//! adoption agency algorithm or `<table>`/`<select>` foster-parenting. We *do* implement a
+//! small set of **insertion modes** so the final tree always has the
+//! `Document → html → [head, body]` skeleton, exactly like a real browser: `document.body`
+//! is never null on a real HTML page, even when the source omits `<html>`/`<head>`/`<body>`.
+//!
+//! ## Head vs body routing
+//!
+//! As tokens stream in we track an [`InsertMode`]:
+//! `Initial → BeforeHtml → BeforeHead → InHead → InBody`. The first non-doctype/non-comment
+//! token forces an `<html>` element (reusing an explicit `<html>` start tag if present), then
+//! a `<head>`. Metadata start tags (`title`, `base`, `meta`, `link`, `style`, `script`,
+//! `noscript`, `template`) stay in `<head>`; any *flow* content — a start tag that is not
+//! metadata, or text with a non-whitespace character — implicitly closes `<head>`, opens
+//! `<body>`, and switches to `InBody`. Once in body, everything (including late metadata and
+//! content after `</body>`/`</html>`) is appended to the body subtree. Explicit
+//! `<html>`/`<head>`/`<body>` tags are reused rather than duplicated.
+//!
+//! The goal is to produce a sensible tree for typical real-world pages and to *never panic*
+//! on malformed input.
 
 use std::collections::HashMap;
 
@@ -19,12 +35,40 @@ const VOID_ELEMENTS: &[&str] = &[
 /// Elements whose content is raw text (not parsed as HTML).
 const RAWTEXT_ELEMENTS: &[&str] = &["script", "style"];
 
+/// "Metadata content" start tags that belong in `<head>` when they appear before any flow
+/// content. Anything not in this set is treated as flow content and opens `<body>`.
+const METADATA_ELEMENTS: &[&str] = &[
+    "base", "basefont", "bgsound", "link", "meta", "noscript", "script", "style", "template",
+    "title",
+];
+
 fn is_void(tag: &str) -> bool {
     VOID_ELEMENTS.contains(&tag)
 }
 
 fn is_rawtext(tag: &str) -> bool {
     RAWTEXT_ELEMENTS.contains(&tag)
+}
+
+fn is_metadata(tag: &str) -> bool {
+    METADATA_ELEMENTS.contains(&tag)
+}
+
+/// Where the tree builder currently is in the implied `html > head, body` skeleton. We only
+/// model the handful of modes needed to route head vs body correctly; everything inside
+/// `<body>` uses the lenient stack-based builder (mode stays [`InsertMode::InBody`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InsertMode {
+    /// Nothing inserted yet (doctype/comments/whitespace allowed).
+    Initial,
+    /// `<html>` not yet open.
+    BeforeHtml,
+    /// `<html>` open, `<head>` not yet open.
+    BeforeHead,
+    /// `<head>` open and current; metadata goes here, flow content closes it.
+    InHead,
+    /// `<body>` open and current (or we are otherwise placing flow content).
+    InBody,
 }
 
 /// Parse an HTML string into a [`dom::Document`].
@@ -122,6 +166,14 @@ struct Parser<'a> {
     open: Vec<NodeId>,
     /// Accumulated text characters, flushed to a text node when the next tag begins.
     text_buf: String,
+    /// Current insertion mode (drives the implied `html > head, body` skeleton).
+    mode: InsertMode,
+    /// The `<html>` element once created.
+    html: Option<NodeId>,
+    /// The `<head>` element once created.
+    head: Option<NodeId>,
+    /// The `<body>` element once created.
+    body: Option<NodeId>,
 }
 
 impl<'a> Parser<'a> {
@@ -132,6 +184,10 @@ impl<'a> Parser<'a> {
             doc: Document::new(),
             open: Vec::new(),
             text_buf: String::new(),
+            mode: InsertMode::Initial,
+            html: None,
+            head: None,
+            body: None,
         }
     }
 
@@ -139,6 +195,79 @@ impl<'a> Parser<'a> {
     /// document root if nothing is open.
     fn current_parent(&self) -> NodeId {
         *self.open.last().unwrap_or(&self.doc.root())
+    }
+
+    // ---- implied skeleton (html > head, body) ----
+
+    /// Ensure an `<html>` element exists under the document root and is on the open stack.
+    /// Reuses `attrs` only when synthesizing (an explicit `<html>` start tag is handled in
+    /// `parse_start_tag`, which calls this then merges its attributes).
+    fn ensure_html(&mut self) -> NodeId {
+        if let Some(html) = self.html {
+            return html;
+        }
+        let root = self.doc.root();
+        let html = self.doc.append_child(
+            root,
+            NodeData::Element(ElementData { tag: "html".into(), attrs: HashMap::new() }),
+        );
+        self.html = Some(html);
+        self.open.push(html);
+        if self.mode == InsertMode::Initial || self.mode == InsertMode::BeforeHtml {
+            self.mode = InsertMode::BeforeHead;
+        }
+        html
+    }
+
+    /// Ensure a `<head>` element exists under `<html>` and is current (mode `InHead`).
+    fn ensure_head(&mut self) -> NodeId {
+        if let Some(head) = self.head {
+            return head;
+        }
+        let html = self.ensure_html();
+        let head = self.doc.append_child(
+            html,
+            NodeData::Element(ElementData { tag: "head".into(), attrs: HashMap::new() }),
+        );
+        self.head = Some(head);
+        self.open.push(head);
+        self.mode = InsertMode::InHead;
+        head
+    }
+
+    /// Pop the `<head>` (and anything above it) off the open stack, leaving `<html>` current.
+    fn pop_head(&mut self) {
+        if let Some(head) = self.head {
+            if let Some(idx) = self.open.iter().rposition(|&id| id == head) {
+                self.open.truncate(idx);
+            }
+        }
+    }
+
+    /// Ensure a `<body>` element exists under `<html>` and is current (mode `InBody`). Closes
+    /// an open `<head>` first. Idempotent once body exists.
+    fn ensure_body(&mut self) -> NodeId {
+        if let Some(body) = self.body {
+            return body;
+        }
+        // Make sure head exists (even if empty) so head precedes body in document order.
+        let html = self.ensure_html();
+        if self.head.is_none() {
+            let head = self.doc.append_child(
+                html,
+                NodeData::Element(ElementData { tag: "head".into(), attrs: HashMap::new() }),
+            );
+            self.head = Some(head);
+        }
+        self.pop_head();
+        let body = self.doc.append_child(
+            html,
+            NodeData::Element(ElementData { tag: "body".into(), attrs: HashMap::new() }),
+        );
+        self.body = Some(body);
+        self.open.push(body);
+        self.mode = InsertMode::InBody;
+        body
     }
 
     fn run(mut self) -> Document {
@@ -174,6 +303,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.flush_text();
+        // Guarantee the full skeleton even for empty / comment-only / head-only input so
+        // `document.body` is never null. `ensure_body` synthesizes head (if missing) then body.
+        self.ensure_body();
         self.doc
     }
 
@@ -336,6 +468,24 @@ impl<'a> Parser<'a> {
         if self.text_buf.is_empty() {
             return;
         }
+        // Before we're in body, only non-whitespace text that would land directly under a
+        // skeleton container (root / html / head) counts as flow content: it implicitly closes
+        // `<head>` and opens `<body>`. Text inside an open element (e.g. `<title>`) just appends
+        // there. Pure inter-element whitespace before body is dropped (matching browsers — it
+        // would otherwise become stray text under root/head).
+        if self.mode != InsertMode::InBody {
+            let parent = self.current_parent();
+            let in_container = Some(parent) == self.html
+                || Some(parent) == self.head
+                || parent == self.doc.root();
+            if in_container {
+                if self.text_buf.trim().is_empty() {
+                    self.text_buf.clear();
+                    return;
+                }
+                self.ensure_body();
+            }
+        }
         let text = std::mem::take(&mut self.text_buf);
         let parent = self.current_parent();
         self.doc.append_child(parent, NodeData::Text(text));
@@ -412,6 +562,48 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // ---- skeleton handling: html / head / body and head-vs-body routing ----
+        // The `<html>`, `<head>`, `<body>` tags reuse the implied elements rather than creating
+        // duplicates; their attributes are merged onto the existing element.
+        match tag.as_str() {
+            "html" => {
+                let html = self.ensure_html();
+                self.merge_attrs(html, attrs);
+                return;
+            }
+            "head" => {
+                // An explicit <head>: ensure it (creating html first), make it current.
+                let head = self.ensure_head();
+                self.merge_attrs(head, attrs);
+                return;
+            }
+            "body" => {
+                let body = self.ensure_body();
+                self.merge_attrs(body, attrs);
+                return;
+            }
+            _ => {}
+        }
+
+        // Decide the destination based on the current mode and whether this is metadata.
+        match self.mode {
+            InsertMode::Initial | InsertMode::BeforeHtml | InsertMode::BeforeHead => {
+                if is_metadata(&tag) {
+                    self.ensure_head();
+                } else {
+                    self.ensure_body();
+                }
+            }
+            InsertMode::InHead => {
+                if !is_metadata(&tag) {
+                    // First flow content: implicitly close head, open body.
+                    self.ensure_body();
+                }
+                // Metadata stays in head (current parent is head).
+            }
+            InsertMode::InBody => {}
+        }
+
         let parent = self.current_parent();
         let node = self.doc.append_child(
             parent,
@@ -431,6 +623,19 @@ impl<'a> Parser<'a> {
         }
 
         self.open.push(node);
+    }
+
+    /// Merge `attrs` onto an existing element, keeping already-present attributes (first wins,
+    /// matching how duplicate `<html>`/`<body>` start tags behave).
+    fn merge_attrs(&mut self, node: NodeId, attrs: HashMap<String, String>) {
+        if attrs.is_empty() {
+            return;
+        }
+        if let NodeData::Element(e) = &mut self.doc.get_mut(node).data {
+            for (k, v) in attrs {
+                e.attrs.entry(k).or_insert(v);
+            }
+        }
     }
 
     /// Consume raw text up to (but not parsing) `</tag>`, appending it as a single text
@@ -470,12 +675,45 @@ impl<'a> Parser<'a> {
         if tag.is_empty() {
             return;
         }
+
+        // Skeleton end tags get special, lenient handling so the head/body shape is preserved.
+        match tag.as_str() {
+            "head" => {
+                // Close head and move to body for subsequent content. (Per spec the mode goes
+                // to "after head"; we open body lazily, but pop head off the stack now so it is
+                // no longer current.)
+                if self.head.is_some() {
+                    self.pop_head();
+                    if self.mode == InsertMode::InHead {
+                        // No body yet; switch out of head so the next flow content opens body.
+                        self.mode = InsertMode::BeforeHead;
+                    }
+                }
+                return;
+            }
+            "body" | "html" => {
+                // Lenient: content after `</body>`/`</html>` still goes in body. Ensure body
+                // exists but do NOT pop it off the open stack, so later nodes land in body.
+                self.ensure_body();
+                return;
+            }
+            _ => {}
+        }
+
         // Find nearest matching open element.
         if let Some(idx) = self.open.iter().rposition(|&id| {
             matches!(&self.doc.get(id).data, NodeData::Element(e) if e.tag == tag)
         }) {
-            // Pop everything above it, plus the match itself.
-            self.open.truncate(idx);
+            // Don't pop past the body element: a stray `</div>` must never unwind body/html.
+            let floor = self
+                .body
+                .and_then(|b| self.open.iter().rposition(|&id| id == b))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            if idx >= floor {
+                // Pop everything above it, plus the match itself.
+                self.open.truncate(idx);
+            }
         }
         // If there's no match, ignore the stray end tag.
     }
@@ -884,6 +1122,30 @@ mod tests {
         }
     }
 
+    /// The `<html>` element (always the first/only child of root after normalization).
+    fn html_of(doc: &Document) -> NodeId {
+        children(doc, doc.root())
+            .into_iter()
+            .find(|&id| tag_of(doc, id) == "html")
+            .expect("document should always have <html>")
+    }
+
+    /// The `<head>` element.
+    fn head_of(doc: &Document) -> NodeId {
+        children(doc, html_of(doc))
+            .into_iter()
+            .find(|&id| tag_of(doc, id) == "head")
+            .expect("document should always have <head>")
+    }
+
+    /// The `<body>` element.
+    fn body_of(doc: &Document) -> NodeId {
+        children(doc, html_of(doc))
+            .into_iter()
+            .find(|&id| tag_of(doc, id) == "body")
+            .expect("document should always have <body>")
+    }
+
     #[test]
     fn empty_parse_has_root_node_zero() {
         let doc = parse("");
@@ -896,7 +1158,10 @@ mod tests {
         let root = doc.root();
         let html = children(&doc, root)[0];
         assert_eq!(tag_of(&doc, html), "html");
-        let body = children(&doc, html)[0];
+        // html > head, body — head is synthesized even though the source omitted it.
+        let html_kids = children(&doc, html);
+        assert_eq!(tag_of(&doc, html_kids[0]), "head");
+        let body = html_kids[1];
         assert_eq!(tag_of(&doc, body), "body");
         let p = children(&doc, body)[0];
         assert_eq!(tag_of(&doc, p), "p");
@@ -907,7 +1172,8 @@ mod tests {
     #[test]
     fn parses_attributes_quoted_unquoted_boolean() {
         let doc = parse(r#"<input type="text" name='n' size=10 disabled>"#);
-        let input = children(&doc, doc.root())[0];
+        // `<input>` is flow content → goes in body.
+        let input = children(&doc, body_of(&doc))[0];
         let attrs = match &doc.get(input).data {
             NodeData::Element(e) => &e.attrs,
             _ => panic!("expected element"),
@@ -921,7 +1187,7 @@ mod tests {
     #[test]
     fn void_element_has_no_children_and_siblings_attach() {
         let doc = parse("<div><img src=x>after</div>");
-        let div = children(&doc, doc.root())[0];
+        let div = children(&doc, body_of(&doc))[0];
         let kids = children(&doc, div);
         assert_eq!(tag_of(&doc, kids[0]), "img");
         assert!(children(&doc, kids[0]).is_empty());
@@ -932,7 +1198,7 @@ mod tests {
     #[test]
     fn decodes_entities_in_text() {
         let doc = parse("<p>a &amp; b &lt;c&gt; &#39;x&#39; &#x41; &nbsp;&copy;</p>");
-        let p = children(&doc, doc.root())[0];
+        let p = children(&doc, body_of(&doc))[0];
         let t = children(&doc, p)[0];
         assert_eq!(text_of(&doc, t), Some("a & b <c> 'x' A \u{00A0}\u{00A9}"));
     }
@@ -942,7 +1208,7 @@ mod tests {
         let doc = parse(
             "<p>&middot;&mdash;&hellip;&rarr;&eacute;&deg;&times;&frac12;&alpha;&euro;&trade;&copy;</p>",
         );
-        let p = children(&doc, doc.root())[0];
+        let p = children(&doc, body_of(&doc))[0];
         let t = children(&doc, p)[0];
         assert_eq!(
             text_of(&doc, t),
@@ -953,7 +1219,7 @@ mod tests {
     #[test]
     fn unknown_entity_passes_through() {
         let doc = parse("<p>5 &notreal; x</p>");
-        let p = children(&doc, doc.root())[0];
+        let p = children(&doc, body_of(&doc))[0];
         let t = children(&doc, p)[0];
         assert_eq!(text_of(&doc, t), Some("5 &notreal; x"));
     }
@@ -961,7 +1227,7 @@ mod tests {
     #[test]
     fn creates_comment_node() {
         let doc = parse("<div><!-- hello --></div>");
-        let div = children(&doc, doc.root())[0];
+        let div = children(&doc, body_of(&doc))[0];
         let c = children(&doc, div)[0];
         match &doc.get(c).data {
             NodeData::Comment(s) => assert_eq!(s, " hello "),
@@ -972,7 +1238,8 @@ mod tests {
     #[test]
     fn script_rawtext_is_not_parsed() {
         let doc = parse("<script>if (a<b) { x = 0; }</script>");
-        let script = children(&doc, doc.root())[0];
+        // A leading <script> is metadata content → lives in <head>.
+        let script = children(&doc, head_of(&doc))[0];
         assert_eq!(tag_of(&doc, script), "script");
         let kids = children(&doc, script);
         assert_eq!(kids.len(), 1);
@@ -986,7 +1253,8 @@ mod tests {
     #[test]
     fn style_rawtext_is_not_parsed() {
         let doc = parse("<style>a > b { color: red }</style>");
-        let style = children(&doc, doc.root())[0];
+        // <style> is metadata content → lives in <head>.
+        let style = children(&doc, head_of(&doc))[0];
         assert_eq!(tag_of(&doc, style), "style");
         let kids = children(&doc, style);
         assert_eq!(text_of(&doc, kids[0]), Some("a > b { color: red }"));
@@ -1004,7 +1272,7 @@ mod tests {
     #[test]
     fn self_closing_tag() {
         let doc = parse("<div><br/>x</div>");
-        let div = children(&doc, doc.root())[0];
+        let div = children(&doc, body_of(&doc))[0];
         let kids = children(&doc, div);
         assert_eq!(tag_of(&doc, kids[0]), "br");
         assert!(children(&doc, kids[0]).is_empty());
@@ -1015,16 +1283,16 @@ mod tests {
     fn mismatched_end_tag_pops_to_ancestor() {
         // </b> has no match; should be ignored. </span> closes span.
         let doc = parse("<span>a</b>b</span>c");
-        let root = doc.root();
-        let span = children(&doc, root)[0];
+        let body = body_of(&doc);
+        let span = children(&doc, body)[0];
         assert_eq!(tag_of(&doc, span), "span");
         // span has two text children "a" and "b".
         let kids = children(&doc, span);
         assert_eq!(text_of(&doc, kids[0]), Some("a"));
         assert_eq!(text_of(&doc, kids[1]), Some("b"));
-        // "c" is a sibling of span under root.
-        let root_kids = children(&doc, root);
-        assert_eq!(text_of(&doc, root_kids[1]), Some("c"));
+        // "c" is a sibling of span under body.
+        let body_kids = children(&doc, body);
+        assert_eq!(text_of(&doc, body_kids[1]), Some("c"));
     }
 
     #[test]
@@ -1041,7 +1309,7 @@ mod tests {
     #[test]
     fn tag_names_are_lowercased() {
         let doc = parse("<DIV><SPAN>x</SPAN></DIV>");
-        let div = children(&doc, doc.root())[0];
+        let div = children(&doc, body_of(&doc))[0];
         assert_eq!(tag_of(&doc, div), "div");
         let span = children(&doc, div)[0];
         assert_eq!(tag_of(&doc, span), "span");
@@ -1069,10 +1337,10 @@ mod tests {
         let one_shot = parse(whole);
         assert_eq!(node_count(&streamed), node_count(&one_shot));
 
-        // Structural spot-check: html > body > p with text "Hello, world".
+        // Structural spot-check: html > head, body; body > p with text "Hello, world".
         let html = children(&streamed, streamed.root())[0];
         assert_eq!(tag_of(&streamed, html), "html");
-        let body = children(&streamed, html)[0];
+        let body = body_of(&streamed);
         let para = children(&streamed, body)[0];
         let text = children(&streamed, para)[0];
         assert_eq!(text_of(&streamed, text), Some("Hello, world"));
@@ -1091,7 +1359,7 @@ mod tests {
         p.feed(&bytes[split..]);
         let doc = p.finish();
 
-        let para = children(&doc, doc.root())[0];
+        let para = children(&doc, body_of(&doc))[0];
         let text = children(&doc, para)[0];
         assert_eq!(text_of(&doc, text), Some("café 🎉"));
     }
@@ -1103,8 +1371,7 @@ mod tests {
         let doc = p.snapshot();
 
         // The lenient tree builder auto-closes open elements; the partial text is present.
-        let html = children(&doc, doc.root())[0];
-        let body = children(&doc, html)[0];
+        let body = body_of(&doc);
         let para = children(&doc, body)[0];
         let text = children(&doc, para)[0];
         assert_eq!(text_of(&doc, text), Some("Hello"));
@@ -1134,5 +1401,121 @@ mod tests {
                 "node count mismatch for {case:?}"
             );
         }
+    }
+
+    // ---- skeleton (html > head, body) tests ----
+
+    /// Every parse yields exactly one `<html>` containing `<head>` then `<body>` (in that order).
+    fn assert_skeleton(doc: &Document) {
+        let root_kids: Vec<_> = children(doc, doc.root())
+            .into_iter()
+            .filter(|&id| tag_of(doc, id) == "html")
+            .collect();
+        assert_eq!(root_kids.len(), 1, "exactly one <html>");
+        let html_kids: Vec<_> = children(doc, root_kids[0])
+            .into_iter()
+            .filter(|&id| matches!(tag_of(doc, id), "head" | "body"))
+            .collect();
+        assert_eq!(tag_of(doc, html_kids[0]), "head", "head first");
+        assert_eq!(tag_of(doc, html_kids[1]), "body", "body second");
+        assert_eq!(html_kids.len(), 2, "exactly one head + one body");
+    }
+
+    #[test]
+    fn bare_flow_content_gets_skeleton_and_body() {
+        let doc = parse("<p>hi</p>");
+        assert_skeleton(&doc);
+        // head is empty, the <p> is in body.
+        assert!(children(&doc, head_of(&doc)).is_empty());
+        let p = children(&doc, body_of(&doc))[0];
+        assert_eq!(tag_of(&doc, p), "p");
+        assert_eq!(text_of(&doc, children(&doc, p)[0]), Some("hi"));
+    }
+
+    #[test]
+    fn metadata_to_head_flow_to_body() {
+        let doc = parse("<!doctype html><title>T</title><div>x</div>");
+        assert_skeleton(&doc);
+        // <title> in head.
+        let head_kids = children(&doc, head_of(&doc));
+        assert_eq!(tag_of(&doc, head_kids[0]), "title");
+        assert_eq!(text_of(&doc, children(&doc, head_kids[0])[0]), Some("T"));
+        // <div> in body.
+        let body_kids = children(&doc, body_of(&doc));
+        assert_eq!(tag_of(&doc, body_kids[0]), "div");
+        assert_eq!(text_of(&doc, children(&doc, body_kids[0])[0]), Some("x"));
+    }
+
+    #[test]
+    fn explicit_skeleton_is_not_duplicated() {
+        let doc = parse(
+            "<html><head><meta charset=\"utf-8\"><title>T</title></head><body><p>hi</p></body></html>",
+        );
+        assert_skeleton(&doc);
+        let head_kids = children(&doc, head_of(&doc));
+        assert_eq!(tag_of(&doc, head_kids[0]), "meta");
+        assert_eq!(tag_of(&doc, head_kids[1]), "title");
+        let body_kids = children(&doc, body_of(&doc));
+        assert_eq!(tag_of(&doc, body_kids[0]), "p");
+    }
+
+    #[test]
+    fn head_script_runs_before_body_script_in_document_order() {
+        // Both scripts must survive, head's first then body's. Document order of execution is the
+        // tree's depth-first order: head/script precedes body/script.
+        let doc = parse("<script>a()</script><div></div><script>b()</script>");
+        let head_scripts = children(&doc, head_of(&doc));
+        assert_eq!(tag_of(&doc, head_scripts[0]), "script");
+        assert_eq!(text_of(&doc, children(&doc, head_scripts[0])[0]), Some("a()"));
+        let body_kids = children(&doc, body_of(&doc));
+        assert_eq!(tag_of(&doc, body_kids[0]), "div");
+        assert_eq!(tag_of(&doc, body_kids[1]), "script");
+        assert_eq!(text_of(&doc, children(&doc, body_kids[1])[0]), Some("b()"));
+    }
+
+    #[test]
+    fn empty_input_yields_skeleton() {
+        assert_skeleton(&parse(""));
+    }
+
+    #[test]
+    fn text_only_input_yields_skeleton_with_body_text() {
+        let doc = parse("just text");
+        assert_skeleton(&doc);
+        assert_eq!(text_of(&doc, children(&doc, body_of(&doc))[0]), Some("just text"));
+    }
+
+    #[test]
+    fn comment_only_input_yields_skeleton() {
+        let doc = parse("<!-- just a comment -->");
+        assert_skeleton(&doc);
+    }
+
+    #[test]
+    fn head_only_input_yields_empty_body() {
+        let doc = parse("<head><title>T</title></head>");
+        assert_skeleton(&doc);
+        assert_eq!(tag_of(&doc, children(&doc, head_of(&doc))[0]), "title");
+        assert!(children(&doc, body_of(&doc)).is_empty());
+    }
+
+    #[test]
+    fn content_after_body_close_stays_in_body() {
+        let doc = parse("<body><p>a</p></body><div>b</div>");
+        assert_skeleton(&doc);
+        let body_kids = children(&doc, body_of(&doc));
+        assert_eq!(tag_of(&doc, body_kids[0]), "p");
+        assert_eq!(tag_of(&doc, body_kids[1]), "div");
+    }
+
+    #[test]
+    fn stray_end_tag_does_not_unwind_body() {
+        // </body> with content after it must not strand later nodes outside body.
+        let doc = parse("<div>a</div></body><span>b</span>");
+        assert_skeleton(&doc);
+        let body_kids = children(&doc, body_of(&doc));
+        // Both <div> and the post-</body> <span> remain children of body.
+        assert_eq!(tag_of(&doc, body_kids[0]), "div");
+        assert_eq!(tag_of(&doc, body_kids[1]), "span");
     }
 }
