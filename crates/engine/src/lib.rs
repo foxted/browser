@@ -214,7 +214,10 @@ impl Engine {
         let computed = if let (Some(font), LoadState::Loaded { doc: Some(d), styles, console, images, .. }) =
             (self.font.as_ref(), &self.state)
         {
-            let page_max_y = if console.is_empty() { dh as f32 } else { (dh as f32 * 0.65).floor() };
+            // The page always uses the full framebuffer height; the console now lives in the
+            // Swift devtools panel, not painted by the engine.
+            let _ = console;
+            let page_max_y = dh as f32;
             let vw = (dw as f32).max(1.0);
             let vh = (page_max_y - header_h).max(1.0);
             let measurer = FontMeasurer { font };
@@ -257,13 +260,11 @@ impl Engine {
                     draw_text(&mut fb, font, "Enter a URL and press Go.",
                               12.0 * self.scale, 60.0 * self.scale, px, Color::WHITE);
                 }
-                LoadState::Loaded { url, doc, console, images, .. } => {
+                LoadState::Loaded { url, doc, images, .. } => {
                     let left = 0.0;
-                    let page_max_y = if console.is_empty() {
-                        dh as f32
-                    } else {
-                        (dh as f32 * 0.65).floor()
-                    };
+                    // The page fills the full framebuffer height; the console panel is rendered by
+                    // the Swift devtools, not the engine.
+                    let page_max_y = dh as f32;
                     let viewport_height = (page_max_y - header_h).max(1.0);
 
                     if let Some(cache) = &self.layout_cache {
@@ -278,12 +279,6 @@ impl Engine {
                         draw_text(
                             &mut fb, font, &format!("(non-HTML content: {})", url),
                             left, header_h + px * 1.4, px, Color::WHITE,
-                        );
-                    }
-
-                    if !console.is_empty() {
-                        draw_console_panel(
-                            &mut fb, font, console, self.scale, dw, dh, page_max_y,
                         );
                     }
                 }
@@ -2988,6 +2983,8 @@ fn measure_text(font: &dyn GlyphRasterizer, text: &str, px: f32) -> f32 {
 
 /// Paint a console panel along the bottom of the framebuffer: a divider, a "console" label,
 /// and the captured lines (in order). `panel_top` is the y where the page-text region ended.
+/// No longer called: the console now lives in the Swift devtools panel. Kept for reference.
+#[allow(dead_code)]
 fn draw_console_panel(
     fb: &mut Framebuffer,
     font: &dyn GlyphRasterizer,

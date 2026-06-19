@@ -356,12 +356,403 @@ final class TabButton: NSView {
     }
 }
 
+// MARK: - DevTools
+
+/// One parsed row of the engine's network log JSON.
+private struct NetRow {
+    var method: String
+    var url: String
+    var status: Int
+    var ok: Bool
+    var ms: Double
+    var size: Int
+    var type: String
+
+    /// "Name" column: the last non-empty path segment, or the host for "/".
+    var name: String {
+        guard let u = URL(string: url) else { return url }
+        let segs = u.path.split(separator: "/").map(String.init)
+        if let last = segs.last, !last.isEmpty { return last }
+        return u.host ?? url
+    }
+
+    var typeShort: String {
+        String(type.split(separator: ";").first ?? Substring(type))
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    var statusText: String { status == 0 ? "(failed)" : String(status) }
+
+    var sizeText: String {
+        let bytes = Double(size)
+        if size <= 0 { return "—" }
+        if bytes < 1024 { return "\(size) B" }
+        if bytes < 1024 * 1024 { return String(format: "%.1f KB", bytes / 1024) }
+        return String(format: "%.1f MB", bytes / (1024 * 1024))
+    }
+
+    var timeText: String { "\(Int(ms.rounded())) ms" }
+}
+
+/// The bottom devtools panel: a Console tab (page console output + a REPL) and a Network tab
+/// (a request table). Hidden by default; toggled with ⌘⌥I. Reaches the active tab's engine and
+/// the app's refresh() via injected closures.
+final class DevToolsView: NSView {
+    /// Returns the active tab's engine, or nil if there is none / a load is in flight.
+    var engineProvider: (() -> OpaquePointer?)?
+    /// Ask the app to re-render the page (an eval may have mutated the DOM).
+    var onRefreshPage: (() -> Void)?
+
+    /// REPL input/output lines, kept Swift-side so they survive console-text refreshes. Cleared
+    /// on navigation (a REPL session is per page).
+    private var replLines: [String] = []
+
+    private let segmented = NSSegmentedControl(labels: ["Console", "Network"], trackingMode: .selectOne, target: nil, action: nil)
+    private let header = NSTextField(labelWithString: "")
+
+    // Console tab
+    private let consoleScroll = NSScrollView()
+    private let consoleText = NSTextView()
+    private let promptLabel = NSTextField(labelWithString: "›")
+    private let replField = NSTextField()
+    private var consoleContainer = NSView()
+
+    // Network tab
+    private let netScroll = NSScrollView()
+    private let netTable = NSTableView()
+    private var netContainer = NSView()
+    private var netRows: [NetRow] = []
+
+    private static let bg = NSColor(calibratedRed: 0.10, green: 0.10, blue: 0.11, alpha: 1.0)
+    private static let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = DevToolsView.bg.cgColor
+        buildUI()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var isFlipped: Bool { true }
+
+    private func buildUI() {
+        // Thin top divider.
+        let divider = NSBox()
+        divider.boxType = .custom
+        divider.borderWidth = 0
+        divider.fillColor = NSColor.separatorColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(divider)
+
+        // Tab switcher + header count.
+        segmented.selectedSegment = 0
+        segmented.target = self
+        segmented.action = #selector(tabChanged)
+        segmented.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(segmented)
+
+        header.font = NSFont.systemFont(ofSize: 10)
+        header.textColor = NSColor.secondaryLabelColor
+        header.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(header)
+
+        buildConsoleTab()
+        buildNetworkTab()
+
+        NSLayoutConstraint.activate([
+            divider.topAnchor.constraint(equalTo: topAnchor),
+            divider.leadingAnchor.constraint(equalTo: leadingAnchor),
+            divider.trailingAnchor.constraint(equalTo: trailingAnchor),
+            divider.heightAnchor.constraint(equalToConstant: 1),
+
+            segmented.topAnchor.constraint(equalTo: divider.bottomAnchor, constant: 6),
+            segmented.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+
+            header.centerYAnchor.constraint(equalTo: segmented.centerYAnchor),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+
+            consoleContainer.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 6),
+            consoleContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            consoleContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            consoleContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            netContainer.topAnchor.constraint(equalTo: segmented.bottomAnchor, constant: 6),
+            netContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            netContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            netContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+
+        showTab(0)
+    }
+
+    private func buildConsoleTab() {
+        consoleContainer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(consoleContainer)
+
+        consoleText.isEditable = false
+        consoleText.isSelectable = true
+        consoleText.drawsBackground = true
+        consoleText.backgroundColor = DevToolsView.bg
+        consoleText.textColor = NSColor(white: 0.85, alpha: 1.0)
+        consoleText.font = DevToolsView.mono
+        consoleText.textContainerInset = NSSize(width: 6, height: 4)
+        consoleText.isVerticallyResizable = true
+        consoleText.isHorizontallyResizable = false
+        consoleText.autoresizingMask = [.width]
+        consoleText.textContainer?.widthTracksTextView = true
+
+        consoleScroll.documentView = consoleText
+        consoleScroll.hasVerticalScroller = true
+        consoleScroll.drawsBackground = true
+        consoleScroll.backgroundColor = DevToolsView.bg
+        consoleScroll.translatesAutoresizingMaskIntoConstraints = false
+        consoleContainer.addSubview(consoleScroll)
+
+        promptLabel.font = DevToolsView.mono
+        promptLabel.textColor = NSColor(calibratedRed: 0.5, green: 0.8, blue: 1.0, alpha: 1.0)
+        promptLabel.translatesAutoresizingMaskIntoConstraints = false
+        consoleContainer.addSubview(promptLabel)
+
+        replField.isBezeled = false
+        replField.isBordered = false
+        replField.drawsBackground = false
+        replField.focusRingType = .none
+        replField.font = DevToolsView.mono
+        replField.textColor = NSColor(white: 0.95, alpha: 1.0)
+        replField.placeholderString = "Evaluate JavaScript in the page…"
+        replField.usesSingleLineMode = true
+        replField.cell?.usesSingleLineMode = true
+        replField.target = self
+        replField.action = #selector(replSubmit)
+        replField.translatesAutoresizingMaskIntoConstraints = false
+        consoleContainer.addSubview(replField)
+
+        NSLayoutConstraint.activate([
+            consoleScroll.topAnchor.constraint(equalTo: consoleContainer.topAnchor),
+            consoleScroll.leadingAnchor.constraint(equalTo: consoleContainer.leadingAnchor),
+            consoleScroll.trailingAnchor.constraint(equalTo: consoleContainer.trailingAnchor),
+
+            promptLabel.leadingAnchor.constraint(equalTo: consoleContainer.leadingAnchor, constant: 8),
+            promptLabel.bottomAnchor.constraint(equalTo: consoleContainer.bottomAnchor, constant: -6),
+
+            replField.leadingAnchor.constraint(equalTo: promptLabel.trailingAnchor, constant: 6),
+            replField.trailingAnchor.constraint(equalTo: consoleContainer.trailingAnchor, constant: -8),
+            replField.centerYAnchor.constraint(equalTo: promptLabel.centerYAnchor),
+
+            consoleScroll.bottomAnchor.constraint(equalTo: replField.topAnchor, constant: -6),
+        ])
+    }
+
+    private func buildNetworkTab() {
+        netContainer.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(netContainer)
+
+        let cols: [(String, String, CGFloat)] = [
+            ("name", "Name", 220),
+            ("method", "Method", 70),
+            ("status", "Status", 70),
+            ("type", "Type", 130),
+            ("size", "Size", 80),
+            ("time", "Time", 80),
+        ]
+        for (id, title, width) in cols {
+            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+            col.title = title
+            col.width = width
+            col.minWidth = 40
+            netTable.addTableColumn(col)
+        }
+        netTable.dataSource = self
+        netTable.delegate = self
+        netTable.usesAlternatingRowBackgroundColors = false
+        netTable.backgroundColor = DevToolsView.bg
+        netTable.gridColor = NSColor(white: 0.2, alpha: 1.0)
+        netTable.gridStyleMask = [.solidHorizontalGridLineMask]
+        netTable.rowHeight = 18
+        netTable.headerView?.wantsLayer = true
+
+        netScroll.documentView = netTable
+        netScroll.hasVerticalScroller = true
+        netScroll.drawsBackground = true
+        netScroll.backgroundColor = DevToolsView.bg
+        netScroll.translatesAutoresizingMaskIntoConstraints = false
+        netContainer.addSubview(netScroll)
+
+        NSLayoutConstraint.activate([
+            netScroll.topAnchor.constraint(equalTo: netContainer.topAnchor),
+            netScroll.leadingAnchor.constraint(equalTo: netContainer.leadingAnchor),
+            netScroll.trailingAnchor.constraint(equalTo: netContainer.trailingAnchor),
+            netScroll.bottomAnchor.constraint(equalTo: netContainer.bottomAnchor),
+        ])
+    }
+
+    // MARK: Tab switching
+
+    @objc private func tabChanged() { showTab(segmented.selectedSegment) }
+
+    private func showTab(_ index: Int) {
+        consoleContainer.isHidden = index != 0
+        netContainer.isHidden = index != 1
+        refreshVisible()
+    }
+
+    var isConsoleTab: Bool { segmented.selectedSegment == 0 }
+
+    // MARK: REPL
+
+    @objc private func replSubmit() {
+        let input = replField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !input.isEmpty else { return }
+        replLines.append("› " + input)
+        if let engine = engineProvider?() {
+            let result = input.withCString { browser_engine_console_eval(engine, $0) }
+            if let result = result {
+                replLines.append(String(cString: result))
+            }
+        }
+        replField.stringValue = ""
+        // An eval may have changed the DOM; ask the app to re-render (which also refreshes us).
+        onRefreshPage?()
+        refreshConsole()
+        scrollConsoleToBottom()
+        // Keep focus in the REPL for the next expression.
+        window?.makeFirstResponder(replField)
+    }
+
+    /// Move focus into the REPL field (called when devtools is shown on the Console tab).
+    func focusREPL() {
+        if isConsoleTab { window?.makeFirstResponder(replField) }
+    }
+
+    // MARK: Refresh
+
+    /// Clear the per-page REPL session (called on navigation / active-tab change).
+    func clearREPL() {
+        replLines.removeAll()
+        refreshConsole()
+    }
+
+    /// Refresh whichever tab is currently visible. Cheap; called on the render/tick path.
+    func refreshVisible() {
+        guard !isHidden else { return }
+        if isConsoleTab { refreshConsole() } else { refreshNetwork() }
+    }
+
+    private func refreshConsole() {
+        guard !isHidden, isConsoleTab else { return }
+        var lines: [String] = []
+        if let engine = engineProvider?(), let c = browser_engine_console_text(engine) {
+            let text = String(cString: c)
+            if !text.isEmpty { lines = text.components(separatedBy: "\n") }
+        }
+        lines.append(contentsOf: replLines)
+
+        let attr = NSMutableAttributedString()
+        let normal = NSColor(white: 0.85, alpha: 1.0)
+        let errColor = NSColor(calibratedRed: 1.0, green: 0.45, blue: 0.45, alpha: 1.0)
+        let replColor = NSColor(calibratedRed: 0.55, green: 0.85, blue: 1.0, alpha: 1.0)
+        for (i, line) in lines.enumerated() {
+            let lower = line.lowercased()
+            let color: NSColor
+            if line.hasPrefix("›") {
+                color = replColor
+            } else if lower.contains("uncaught") || lower.contains("error") {
+                color = errColor
+            } else {
+                color = normal
+            }
+            let suffix = i == lines.count - 1 ? "" : "\n"
+            attr.append(NSAttributedString(string: line + suffix, attributes: [
+                .font: DevToolsView.mono,
+                .foregroundColor: color,
+            ]))
+        }
+        consoleText.textStorage?.setAttributedString(attr)
+    }
+
+    private func scrollConsoleToBottom() {
+        consoleText.scrollToEndOfDocument(nil)
+    }
+
+    private func refreshNetwork() {
+        guard !isHidden, !isConsoleTab else { return }
+        var rows: [NetRow] = []
+        if let engine = engineProvider?(), let c = browser_engine_network_log(engine) {
+            let json = String(cString: c)
+            if let data = json.data(using: .utf8),
+               let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+                for o in arr {
+                    rows.append(NetRow(
+                        method: o["method"] as? String ?? "",
+                        url: o["url"] as? String ?? "",
+                        status: (o["status"] as? NSNumber)?.intValue ?? 0,
+                        ok: o["ok"] as? Bool ?? false,
+                        ms: (o["ms"] as? NSNumber)?.doubleValue ?? 0,
+                        size: (o["size"] as? NSNumber)?.intValue ?? 0,
+                        type: o["type"] as? String ?? ""
+                    ))
+                }
+            }
+        }
+        netRows = rows
+        header.stringValue = "\(rows.count) request\(rows.count == 1 ? "" : "s")"
+        netTable.reloadData()
+    }
+}
+
+extension DevToolsView: NSTableViewDataSource, NSTableViewDelegate {
+    func numberOfRows(in tableView: NSTableView) -> Int { netRows.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let column = tableColumn, row < netRows.count else { return nil }
+        let r = netRows[row]
+        let id = column.identifier.rawValue
+        let cell: NSTextField
+        if let reused = tableView.makeView(withIdentifier: column.identifier, owner: self) as? NSTextField {
+            cell = reused
+        } else {
+            cell = NSTextField(labelWithString: "")
+            cell.identifier = column.identifier
+            cell.font = DevToolsView.mono
+            cell.lineBreakMode = .byTruncatingTail
+            cell.drawsBackground = false
+        }
+        var color = NSColor(white: 0.85, alpha: 1.0)
+        switch id {
+        case "name": cell.stringValue = r.name
+        case "method": cell.stringValue = r.method
+        case "status":
+            cell.stringValue = r.statusText
+            if r.status == 0 || !(r.status >= 200 && r.status < 300) {
+                color = NSColor(calibratedRed: 1.0, green: 0.45, blue: 0.45, alpha: 1.0)
+            }
+        case "type": cell.stringValue = r.typeShort
+        case "size": cell.stringValue = r.sizeText
+        case "time": cell.stringValue = r.timeText
+        default: cell.stringValue = ""
+        }
+        cell.textColor = color
+        cell.toolTip = r.url
+        return cell
+    }
+}
+
 // MARK: - AppDelegate
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var window: NSWindow!
     var urlField: URLTextField!
     var bitmapView: BitmapView!
+
+    // DevTools bottom panel (hidden by default; ⌘⌥I toggles).
+    private var devTools: DevToolsView!
+    private var devToolsVisible = false
+    private var devToolsHeightConstraint: NSLayoutConstraint!
+    private var bitmapBottomToContent: NSLayoutConstraint!
+    private var bitmapBottomToDevTools: NSLayoutConstraint!
+    private let devToolsHeight: CGFloat = 260
 
     private var backButton: NSButton!
     private var forwardButton: NSButton!
@@ -531,6 +922,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         bitmapView.onMouseEvent = { [weak self] kind, point in self?.handleMouseEvent(kind, point) }
         content.addSubview(bitmapView)
 
+        // MARK: DevTools panel (hidden by default; ⌘⌥I toggles)
+        devTools = DevToolsView()
+        devTools.translatesAutoresizingMaskIntoConstraints = false
+        devTools.isHidden = true
+        devTools.engineProvider = { [weak self] in
+            guard let tab = self?.activeTab, let engine = tab.engine, tab.pendingLoads == 0 else { return nil }
+            return engine
+        }
+        devTools.onRefreshPage = { [weak self] in self?.refresh() }
+        content.addSubview(devTools)
+
         // MARK: Auto Layout
         NSLayoutConstraint.activate([
             toolbar.topAnchor.constraint(equalTo: content.topAnchor),
@@ -560,7 +962,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             bitmapView.topAnchor.constraint(equalTo: separator.bottomAnchor),
             bitmapView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             bitmapView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            bitmapView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
 
             // Nav buttons pinned to the leading edge, clear of the traffic lights.
             navStack.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 80),
@@ -598,6 +999,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let pillMinWidth = pill.widthAnchor.constraint(greaterThanOrEqualToConstant: 90)
         pillMinWidth.priority = .defaultLow
         NSLayoutConstraint.activate([pillMaxWidth, pillIdealWidth, pillLeadingGap, pillTrailingGap, pillMinWidth])
+
+        // DevTools sits below the bitmap, splitting the content area vertically. We toggle which
+        // of two bitmap-bottom constraints is active: when hidden the bitmap fills to the content
+        // bottom; when shown it stops at the devtools top and devtools takes a fixed height.
+        bitmapBottomToContent = bitmapView.bottomAnchor.constraint(equalTo: content.bottomAnchor)
+        bitmapBottomToDevTools = bitmapView.bottomAnchor.constraint(equalTo: devTools.topAnchor)
+        devToolsHeightConstraint = devTools.heightAnchor.constraint(equalToConstant: devToolsHeight)
+        NSLayoutConstraint.activate([
+            devTools.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            devTools.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            devTools.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            devToolsHeightConstraint,
+            bitmapBottomToContent,
+        ])
 
         // Only listen for resize/backing callbacks once all views exist, so an early
         // notification can't reach updateViewport() before bitmapView is set.
@@ -708,6 +1123,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let forwardItem = NSMenuItem(title: "Forward", action: #selector(goForward), keyEquivalent: "]")
         forwardItem.target = self
         viewMenu.addItem(forwardItem)
+        viewMenu.addItem(NSMenuItem.separator())
+        let devToolsItem = NSMenuItem(title: "Toggle DevTools", action: #selector(toggleDevTools), keyEquivalent: "i")
+        devToolsItem.keyEquivalentModifierMask = [.command, .option]
+        devToolsItem.target = self
+        viewMenu.addItem(devToolsItem)
         viewMenuItem.submenu = viewMenu
 
         // Window menu (tab switching).
@@ -831,6 +1251,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         updateActiveTabHighlight()
         syncUIToActiveTab()
         updateViewport()
+        // The active engine changed: reset the (panel-global) REPL session and refresh both tabs.
+        devTools?.clearREPL()
         refresh()
     }
 
@@ -1046,6 +1468,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    // MARK: DevTools
+
+    @objc private func toggleDevTools() {
+        devToolsVisible.toggle()
+        devTools.isHidden = !devToolsVisible
+        // Swap which bitmap-bottom constraint is active so the bitmap shrinks/grows.
+        bitmapBottomToContent.isActive = !devToolsVisible
+        bitmapBottomToDevTools.isActive = devToolsVisible
+        window.layoutIfNeeded()
+        // The bitmap changed size: re-layout the page at the new viewport.
+        updateViewport()
+        refresh()
+        if devToolsVisible {
+            devTools.refreshVisible()
+            devTools.focusREPL()
+        } else {
+            // Returning focus to the page lets page typing work again.
+            window.makeFirstResponder(bitmapView)
+        }
+    }
+
     // MARK: Rendering
 
     func refresh() {
@@ -1072,6 +1515,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         )
         bitmapView.image = image
         bitmapView.setNeedsDisplay(bitmapView.bounds)
+
+        // Refresh the visible devtools tab on the render path (console text / network entries
+        // accumulate during load + async ticks). Guarded internally to be cheap when hidden.
+        devTools?.refreshVisible()
     }
 
     // MARK: Navigation
@@ -1141,6 +1588,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func load(urlString: String, recordHistory shouldRecord: Bool) {
         guard let tab = activeTab, let engine = tab.engine else { return }
         let urlCopy = urlString
+
+        // A REPL session is per page: navigating starts a fresh one.
+        devTools?.clearREPL()
 
         if shouldRecord {
             tab.recordHistory(urlString)
