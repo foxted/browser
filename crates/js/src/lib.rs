@@ -992,6 +992,41 @@ fn prim_storage_save(
     let _ = std::fs::write(storage_path(&key), json);
 }
 
+/// Fill `buf` with cryptographically-random bytes from the OS (`/dev/urandom`), falling back to a
+/// time/address-seeded PRNG only if that's unreadable.
+fn fill_random(buf: &mut [u8]) {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(buf).is_ok() {
+            return;
+        }
+    }
+    use std::hash::{BuildHasher, Hasher};
+    let mut seed = std::collections::hash_map::RandomState::new().build_hasher().finish();
+    for b in buf.iter_mut() {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *b = (seed >> 33) as u8;
+    }
+}
+
+/// `__cryptoRandom(n) -> [byte, ...]` — `n` real random bytes (for `crypto.getRandomValues`/UUID).
+fn prim_crypto_random(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let n = args.get(0).number_value(scope).unwrap_or(0.0);
+    let n = if n.is_finite() && n > 0.0 { (n as usize).min(1 << 20) } else { 0 };
+    let mut buf = vec![0u8; n];
+    fill_random(&mut buf);
+    let arr = v8::Array::new(scope, n as i32);
+    for (i, &b) in buf.iter().enumerate() {
+        let v = v8::Integer::new_from_unsigned(scope, b as u32);
+        arr.set_index(scope, i as u32, v.into());
+    }
+    rv.set(arr.into());
+}
+
 /// `__appendChild(parentId, childId)` — reparent child under parent.
 fn prim_append_child(
     scope: &mut v8::PinScope,
@@ -1797,6 +1832,7 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__attrNames", prim_attr_names);
     set_fn(scope, global, "__storageLoad", prim_storage_load);
     set_fn(scope, global, "__storageSave", prim_storage_save);
+    set_fn(scope, global, "__cryptoRandom", prim_crypto_random);
     set_fn(scope, global, "__appendChild", prim_append_child);
     set_fn(scope, global, "__insertBefore", prim_insert_before);
     set_fn(scope, global, "__removeChild", prim_remove_child);
@@ -4171,20 +4207,30 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return out;
   });
 
-  // crypto: no real RNG available; fill deterministically with a nonzero pattern.
-  var cryptoSeed = 0x9e3779b9;
-  function nextByte() { cryptoSeed = (cryptoSeed * 1103515245 + 12345) & 0x7fffffff; return ((cryptoSeed >> 16) & 0xff) || 1; }
+  // crypto: real OS randomness via the __cryptoRandom native (falls back to a PRNG if unavailable).
+  function __randBytes(n) {
+    try { var b = __cryptoRandom(n); if (b && b.length === n) { return b; } } catch (e) {}
+    var out = []; for (var i = 0; i < n; i++) { out.push((Math.floor((i * 2654435761) % 256)) || 1); } return out;
+  }
   globalThis.crypto = {
-    getRandomValues: function (arr) { if (arr && typeof arr.length === "number") { for (var i = 0; i < arr.length; i++) { arr[i] = nextByte(); } } return arr; },
-    randomUUID: function () {
-      var hex = "0123456789abcdef", s = "";
-      for (var i = 0; i < 36; i++) {
-        if (i === 8 || i === 13 || i === 18 || i === 23) { s += "-"; }
-        else if (i === 14) { s += "4"; }
-        else if (i === 19) { s += hex.charAt((nextByte() & 0x3) | 0x8); }
-        else { s += hex.charAt(nextByte() & 0xf); }
+    getRandomValues: function (arr) {
+      if (!arr || typeof arr.length !== "number") { return arr; }
+      var bpe = arr.BYTES_PER_ELEMENT || 1;
+      var bytes = __randBytes(arr.length * bpe);
+      for (var i = 0; i < arr.length; i++) {
+        var v = 0;
+        for (var b = 0; b < bpe; b++) { v = (v * 256) + (bytes[i * bpe + b] || 0); }
+        arr[i] = v;
       }
-      return s;
+      return arr;
+    },
+    randomUUID: function () {
+      var b = __randBytes(16);
+      b[6] = (b[6] & 0x0f) | 0x40; // version 4
+      b[8] = (b[8] & 0x3f) | 0x80; // variant 10
+      var hex = []; for (var i = 0; i < 16; i++) { hex.push((b[i] + 0x100).toString(16).slice(1)); }
+      return hex.slice(0, 4).join("") + "-" + hex.slice(4, 6).join("") + "-" + hex.slice(6, 8).join("") +
+             "-" + hex.slice(8, 10).join("") + "-" + hex.slice(10, 16).join("");
     },
     subtle: {}
   };
