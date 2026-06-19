@@ -127,6 +127,7 @@ impl Engine {
         self.focused_node = None; // a new page has no focused field
         self.focus_value = None;
         self.hovered_node = None; // and nothing is hovered
+        net::clear_network_log(); // devtools Network tab tracks this navigation's requests
         match net::fetch(url) {
             Ok(resp) => {
                 // Parse HTML responses into a DOM; other content types just record metadata.
@@ -645,12 +646,52 @@ impl Engine {
         }
     }
 
-    /// Console + error lines captured for the current page (diagnostics).
+    /// Console + error lines captured for the current page (diagnostics / devtools Console tab).
     pub fn console_lines(&self) -> Vec<String> {
         match &self.state {
             LoadState::Loaded { console, .. } => console.clone(),
             _ => Vec::new(),
         }
+    }
+
+    /// Devtools console REPL: evaluate `code` in the live page's JS context, adopt any DOM
+    /// changes, and return the result (or error) as a display string. No-op if no live session.
+    pub fn console_eval(&mut self, code: &str) -> String {
+        let session = match &self.session {
+            Some(s) => s,
+            None => return "(no live page)".to_string(),
+        };
+        let (display, mut snapshot, console) = session.repl_eval(code);
+        snapshot.prune_invalid();
+        if let LoadState::Loaded { doc, console: c, .. } = &mut self.state {
+            *doc = Some(snapshot);
+            c.extend(console);
+            self.layout_cache = None; // the eval may have mutated the DOM
+        }
+        display
+    }
+
+    /// Network activity for the current navigation, as a JSON array (for the devtools Network tab):
+    /// `[{"method","url","status","ok","ms","size","type"}, ...]`.
+    pub fn network_log_json(&self) -> String {
+        let mut s = String::from("[");
+        for (i, e) in net::network_log().iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&format!(
+                "{{\"method\":{},\"url\":{},\"status\":{},\"ok\":{},\"ms\":{},\"size\":{},\"type\":{}}}",
+                json_str(&e.method),
+                json_str(&e.url),
+                e.status,
+                e.ok,
+                e.duration_ms,
+                e.size,
+                json_str(&e.content_type),
+            ));
+        }
+        s.push(']');
+        s
     }
 
     /// Test-only: focus the first editable text field in the live document (by walking the DOM),
@@ -1723,6 +1764,15 @@ fn parse_headers_json(s: &str) -> Vec<(String, String)> {
 }
 
 /// JSON-escape a string into `out` (control chars, quotes, backslash). No surrounding quotes.
+/// A `"`-quoted, escaped JSON string literal.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    json_escape(s, &mut out);
+    out.push('"');
+    out
+}
+
 fn json_escape(s: &str, out: &mut String) {
     for c in s.chars() {
         match c {

@@ -4644,11 +4644,11 @@ enum SessionCmd {
         reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
     },
     /// Evaluate an arbitrary JS source string against the persistent context, drain the loop,
-    /// reply with snapshot + console. Used for the higher-level interaction helpers (checkbox
-    /// toggle, focus/blur/change/submit, hover) that drive bootstrap functions.
+    /// reply with the eval result (value-or-error string), snapshot + console. Used for the
+    /// interaction helpers AND the devtools console REPL.
     Eval {
         source: String,
-        reply: std::sync::mpsc::Sender<(dom::Document, Vec<String>)>,
+        reply: std::sync::mpsc::Sender<(EvalOutput, dom::Document, Vec<String>)>,
     },
     /// Run due timers / microtasks; reply `Some(snapshot, console)` if work ran, else `None`.
     Tick {
@@ -4785,11 +4785,32 @@ impl Session {
     /// Evaluate an arbitrary JS source string against the live context, drain the event loop, and
     /// return a fresh DOM snapshot + console. Backs the higher-level interaction helpers below.
     fn eval_interact(&self, source: String) -> (dom::Document, Vec<String>) {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel::<(dom::Document, Vec<String>)>();
+        let (_v, doc, console) = self.eval_full(source);
+        (doc, console)
+    }
+
+    /// Evaluate `source` and return the (result value / error EvalOutput, snapshot, console).
+    fn eval_full(&self, source: String) -> (EvalOutput, dom::Document, Vec<String>) {
+        let (reply_tx, reply_rx) =
+            std::sync::mpsc::channel::<(EvalOutput, dom::Document, Vec<String>)>();
         if self.tx.send(SessionCmd::Eval { source, reply: reply_tx }).is_err() {
-            return (dom::Document::new(), Vec::new());
+            return (EvalOutput::default(), dom::Document::new(), Vec::new());
         }
-        reply_rx.recv().unwrap_or_else(|_| (dom::Document::new(), Vec::new()))
+        reply_rx
+            .recv()
+            .unwrap_or_else(|_| (EvalOutput::default(), dom::Document::new(), Vec::new()))
+    }
+
+    /// Devtools console REPL: evaluate `source` in the live page context and return a display
+    /// string (the result value, or an `Uncaught …` error), plus the updated snapshot + console.
+    pub fn repl_eval(&self, source: &str) -> (String, dom::Document, Vec<String>) {
+        let (out, doc, console) = self.eval_full(source.to_string());
+        let display = if let Some(err) = out.error {
+            format!("Uncaught {err}")
+        } else {
+            out.value.unwrap_or_else(|| "undefined".to_string())
+        };
+        (display, doc, console)
     }
 
     /// Toggle a checkbox / radio `node_id`: flips a checkbox's `checked`, or sets a radio
@@ -4957,9 +4978,10 @@ fn session_thread_main(
                 let local_ctx = v8::Local::new(handle_scope, &ctx);
                 let scope = &mut v8::ContextScope::new(handle_scope, local_ctx);
                 let mut results = vec![eval_source(scope, &source, "<interact>")];
+                let first = EvalOutput { value: results[0].value.clone(), error: results[0].error.clone(), console: Vec::new() };
                 drain_event_loop(scope, &mut results, Some(&fetch_rx));
                 let console = results.into_iter().flat_map(|r| r.console).collect();
-                let _ = reply.send((shared.borrow().clone(), console));
+                let _ = reply.send((first, shared.borrow().clone(), console));
             }
             SessionCmd::Tick { reply } => {
                 let ctx = context.clone();

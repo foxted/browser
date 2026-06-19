@@ -159,6 +159,34 @@ int32_t browser_engine_tick(struct Engine *engine);
 int32_t browser_engine_dispatch_move(struct Engine *engine, float x, float y);
 
 /**
+ * Devtools console REPL: evaluate `code` (NUL-terminated UTF-8) in the live page JS and return a
+ * NUL-terminated UTF-8 result/error string. Lifetime: owned by the engine (stored in `last_eval`),
+ * valid until the next `browser_engine_console_eval` call or `browser_engine_free`.
+ *
+ * # Safety
+ * `engine` must be a valid handle; `code` a valid C string.
+ */
+const char *browser_engine_console_eval(struct Engine *engine, const char *code);
+
+/**
+ * The current page's console + error lines, joined by '\n', as a NUL-terminated UTF-8 string
+ * (for the devtools Console tab). Owned by the engine (`last_console`); valid until the next call.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+const char *browser_engine_console_text(struct Engine *engine);
+
+/**
+ * The current navigation's network activity as a JSON array string (for the devtools Network tab).
+ * Owned by the engine (`last_netlog`); valid until the next call.
+ *
+ * # Safety
+ * `engine` must be a valid handle from [`browser_engine_new`].
+ */
+const char *browser_engine_network_log(struct Engine *engine);
+
+/**
  * Dispatch a raw mouse event (`kind` = "mousedown"/"mouseup"/"dblclick"/"contextmenu", NUL-
  * terminated UTF-8) to the node at device-pixel `(x, y)`. Returns 1 if the DOM changed.
  *

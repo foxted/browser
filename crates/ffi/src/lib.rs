@@ -18,6 +18,9 @@ pub struct Engine {
     inner: engine::Engine,
     last_link: Option<CString>,
     last_title: Option<CString>,
+    last_eval: Option<CString>,
+    last_console: Option<CString>,
+    last_netlog: Option<CString>,
 }
 
 /// A borrowed view of the engine's RGBA8 (straight-alpha) framebuffer.
@@ -43,6 +46,9 @@ pub extern "C" fn browser_engine_new() -> *mut Engine {
         inner: engine::Engine::new(),
         last_link: None,
         last_title: None,
+        last_eval: None,
+        last_console: None,
+        last_netlog: None,
     }))
 }
 
@@ -259,6 +265,71 @@ pub unsafe extern "C" fn browser_engine_dispatch_move(engine: *mut Engine, x: f3
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.dispatch_move(x, y))) {
         Ok(true) => 1,
         _ => 0,
+    }
+}
+
+/// Devtools console REPL: evaluate `code` (NUL-terminated UTF-8) in the live page JS and return a
+/// NUL-terminated UTF-8 result/error string. Lifetime: owned by the engine (stored in `last_eval`),
+/// valid until the next `browser_engine_console_eval` call or `browser_engine_free`.
+///
+/// # Safety
+/// `engine` must be a valid handle; `code` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_console_eval(
+    engine: *mut Engine,
+    code: *const c_char,
+) -> *const c_char {
+    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    if code.is_null() {
+        return std::ptr::null();
+    }
+    let code = CStr::from_ptr(code).to_string_lossy().into_owned();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.inner.console_eval(&code)))
+        .unwrap_or_else(|_| "Uncaught Error: evaluation panicked".to_string());
+    match CString::new(result) {
+        Ok(cstr) => {
+            let ptr = cstr.as_ptr();
+            e.last_eval = Some(cstr);
+            ptr
+        }
+        Err(_) => std::ptr::null(),
+    }
+}
+
+/// The current page's console + error lines, joined by '\n', as a NUL-terminated UTF-8 string
+/// (for the devtools Console tab). Owned by the engine (`last_console`); valid until the next call.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_console_text(engine: *mut Engine) -> *const c_char {
+    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    let text = e.inner.console_lines().join("\n");
+    match CString::new(text) {
+        Ok(cstr) => {
+            let ptr = cstr.as_ptr();
+            e.last_console = Some(cstr);
+            ptr
+        }
+        Err(_) => std::ptr::null(),
+    }
+}
+
+/// The current navigation's network activity as a JSON array string (for the devtools Network tab).
+/// Owned by the engine (`last_netlog`); valid until the next call.
+///
+/// # Safety
+/// `engine` must be a valid handle from [`browser_engine_new`].
+#[no_mangle]
+pub unsafe extern "C" fn browser_engine_network_log(engine: *mut Engine) -> *const c_char {
+    let Some(e) = engine.as_mut() else { return std::ptr::null() };
+    match CString::new(e.inner.network_log_json()) {
+        Ok(cstr) => {
+            let ptr = cstr.as_ptr();
+            e.last_netlog = Some(cstr);
+            ptr
+        }
+        Err(_) => std::ptr::null(),
     }
 }
 

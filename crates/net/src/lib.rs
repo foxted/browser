@@ -41,6 +41,43 @@ pub struct Response {
     pub final_url: String,
 }
 
+/// One entry in the network activity log (for the devtools Network tab).
+#[derive(Clone)]
+pub struct NetEntry {
+    pub method: String,
+    pub url: String,
+    pub status: u16, // 0 = transport failure / no response
+    pub ok: bool,
+    pub duration_ms: u64,
+    pub size: usize,
+    pub content_type: String,
+}
+
+/// Global network activity log. Shared across the process (the engine clears it per navigation).
+/// Bounded so a runaway page can't grow it without limit.
+static NET_LOG: std::sync::Mutex<Vec<NetEntry>> = std::sync::Mutex::new(Vec::new());
+const NET_LOG_CAP: usize = 1000;
+
+/// Clear the network log (called by the engine on navigation).
+pub fn clear_network_log() {
+    if let Ok(mut log) = NET_LOG.lock() {
+        log.clear();
+    }
+}
+
+/// Snapshot of the network log.
+pub fn network_log() -> Vec<NetEntry> {
+    NET_LOG.lock().map(|l| l.clone()).unwrap_or_default()
+}
+
+fn record_net(entry: NetEntry) {
+    if let Ok(mut log) = NET_LOG.lock() {
+        if log.len() < NET_LOG_CAP {
+            log.push(entry);
+        }
+    }
+}
+
 /// GET `url` and return a [`Response`], or an `Err(String)` describing the failure.
 /// Supports `http(s)://` (via the reused HTTP client) and `file://` (local read), so
 /// local test pages can be loaded without a server.
@@ -57,7 +94,32 @@ pub fn fetch(url: &str) -> Result<Response, String> {
 /// `body` is sent (via `send_bytes`) for methods that carry a payload (POST/PUT/PATCH/DELETE);
 /// other methods use `.call()`. `headers` are applied verbatim (callers set Content-Type etc.).
 /// The opt-in disk cache (`NET_CACHE_DIR`) applies to GET only; non-GET requests bypass it.
+/// Records the request in the network log (for the devtools Network tab).
 pub fn request(
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+    headers: &[(String, String)],
+) -> Result<Response, String> {
+    let start = std::time::Instant::now();
+    let result = request_inner(method, url, body, headers);
+    let (status, ok, size, ct) = match &result {
+        Ok(r) => (r.status, (200..300).contains(&r.status), r.body.len(), r.content_type.clone()),
+        Err(_) => (0u16, false, 0usize, String::new()),
+    };
+    record_net(NetEntry {
+        method: method.to_ascii_uppercase(),
+        url: url.to_string(),
+        status,
+        ok,
+        duration_ms: start.elapsed().as_millis() as u64,
+        size,
+        content_type: ct,
+    });
+    result
+}
+
+fn request_inner(
     method: &str,
     url: &str,
     body: Option<&[u8]>,
