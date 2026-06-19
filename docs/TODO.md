@@ -1,8 +1,22 @@
 # Feature backlog (non-CSS)
 
-See also `docs/CSS-TODO.md` for the CSS backlog.
+See also `docs/CSS-TODO.md` for the CSS backlog and `docs/HTML-SUPPORT.md` for the element audit.
+
+## HTML element support fix plan (in progress — agent sequence)
+Sequenced (not parallel) because every slice edits the shared `style`/`layout`/`paint` core —
+especially the single `user_agent_stylesheet()` function — so concurrent worktrees would collide.
+- [ ] **1. Inline text rendering** — `text-decoration` (underline/line-through/overline) paint, `sub`/`sup` shift + smaller, monospace for `code`/`kbd`/`samp`/`tt`, `mark` highlight bg, `a` underline+link color, `cite`/`var`/`dfn`/`address` italic, `small` smaller, `q` auto-quotes.
+- [ ] **2. Block defaults + br + pre + lists + hr** — UA margins (`p`/`h1`–`6`/`blockquote`/`figure`/`ul`/`ol`/`dd`), `<br>` line break, `<pre>` `white-space:pre` + monospace, `<hr>` rule, list markers (`•`/`1.`) + indent.
+- [ ] **3. Table layout** — real grid: cells, `thead`/`tbody`/`tfoot`, column alignment + width distribution, `th` bold/centered, `caption` above, `colspan`/`rowspan`, basic `border-collapse`.
+- [ ] **4. Form widgets** — render `range`/`color`/`date`/`file`/`progress`/`meter`; input/button chrome; fix invisible checkbox glyph; give `<label>` a hit box for `for=`.
+- [ ] **5. SVG rendering** — parse inline `<svg>` + render `rect`/`circle`/`ellipse`/`line`/`poly*`/`path`/`text`, `fill`/`stroke`/`viewBox`.
+- [ ] **6. Misc JS/DOM** — `<img>` `width`/`height` attrs, broken-img `alt`, `naturalWidth`/`Height`; `dialog` `open`/`showModal`/`close`; `textarea`/`select` `.value` getters.
+- [ ] **Later** — `<video>`/`<audio>`/`<iframe>` real content, `bdo`/`bdi` bidi, ruby annotation layout, image maps.
 
 ## Done (recent)
+- [x] **Canvas 2D** — real context: display list in JS, rasterized + composited by the engine.
+- [x] **scrollTo / scrollBy / scrollIntoView** — real (engine applies JS-requested scroll).
+- [x] **WebSocket** — real client (tungstenite); **localStorage/sessionStorage** persistent; **History API** (`pushState`/`replaceState`); **matchMedia**, **crypto**, **Blob/FileReader**, **getComputedStyle/getBoundingClientRect**.
 - [x] **V8 JS engine** (replaced Boa) — classic scripts + ES modules + dynamic import.
 - [x] **Interactivity** — click/type/forms/checkbox/radio/hover/focus/blur/change/submit, live event loop (timers/rAF/animations).
 - [x] **Web APIs** — fetch (GET/POST/…), Headers/Request/Response, FormData (urlencoded), AbortController, URLSearchParams, TextEncoder/Decoder, NodeFilter/TreeWalker, CSS object, devicePixelRatio, defaultView.
