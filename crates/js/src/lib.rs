@@ -3862,13 +3862,53 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       this.addEventListener = fn; this.removeEventListener = fn;
     });
   }
-  // --- Blob / File / FileReader / Worker presence stubs ------------------------------------
+  // --- Blob / File / FileReader (real: store + read back bytes) -----------------------------
+  // Flatten Blob constructor `parts` (strings → UTF-8, ArrayBuffer/typed arrays → bytes, nested
+  // Blobs → their bytes) into a plain byte array.
+  function __blobBytes(parts) {
+    var bytes = [];
+    if (!parts || typeof parts.length !== "number") { return bytes; }
+    for (var i = 0; i < parts.length; i++) {
+      var p = parts[i];
+      if (p == null) { continue; }
+      if (typeof p === "string") {
+        var enc = unescape(encodeURIComponent(p));
+        for (var j = 0; j < enc.length; j++) { bytes.push(enc.charCodeAt(j) & 0xff); }
+      } else if (p.__blobBytes) {
+        bytes = bytes.concat(p.__blobBytes);
+      } else if (p instanceof ArrayBuffer) {
+        var v1 = new Uint8Array(p); for (var k = 0; k < v1.length; k++) { bytes.push(v1[k]); }
+      } else if (p.buffer && typeof p.byteLength === "number") {
+        var v2 = new Uint8Array(p.buffer, p.byteOffset || 0, p.byteLength); for (var m = 0; m < v2.length; m++) { bytes.push(v2[m]); }
+      } else {
+        var s2 = unescape(encodeURIComponent(String(p))); for (var n = 0; n < s2.length; n++) { bytes.push(s2.charCodeAt(n) & 0xff); }
+      }
+    }
+    return bytes;
+  }
   if (typeof globalThis.Blob !== "function") {
     def(globalThis, "Blob", function (parts, opts) {
-      this.size = 0; this.type = (opts && opts.type) || "";
-      this.slice = function () { return new globalThis.Blob([], { type: this.type }); };
-      this.text = function () { return Promise.resolve(""); };
-      this.arrayBuffer = function () { return Promise.resolve(new ArrayBuffer(0)); };
+      var bytes = __blobBytes(parts);
+      this.__blobBytes = bytes;
+      this.size = bytes.length;
+      this.type = (opts && opts.type) || "";
+      this.slice = function (start, end, type) {
+        var s = start || 0, e = (end == null ? bytes.length : end);
+        if (s < 0) { s += bytes.length; } if (e < 0) { e += bytes.length; }
+        var sub = bytes.slice(Math.max(0, s), Math.max(0, e));
+        var b = new globalThis.Blob([], { type: type || this.type });
+        b.__blobBytes = sub; b.size = sub.length; return b;
+      };
+      this.text = function () {
+        var s = ""; for (var i = 0; i < bytes.length; i++) { s += String.fromCharCode(bytes[i]); }
+        var out; try { out = decodeURIComponent(escape(s)); } catch (e) { out = s; }
+        return Promise.resolve(out);
+      };
+      this.arrayBuffer = function () {
+        var buf = new ArrayBuffer(bytes.length), view = new Uint8Array(buf);
+        for (var i = 0; i < bytes.length; i++) { view[i] = bytes[i]; }
+        return Promise.resolve(buf);
+      };
     });
   }
   if (typeof globalThis.File !== "function") {
@@ -3876,10 +3916,29 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   if (typeof globalThis.FileReader !== "function") {
     def(globalThis, "FileReader", function () {
+      var self = this;
       this.readyState = 0; this.result = null; this.error = null;
-      this.onload = null; this.onloadend = null; this.onerror = null;
-      this.readAsText = fn; this.readAsDataURL = fn; this.readAsArrayBuffer = fn; this.abort = fn;
-      this.addEventListener = fn; this.removeEventListener = fn;
+      this.onload = null; this.onloadend = null; this.onerror = null; this.onprogress = null;
+      try { installEvents(this); } catch (e) {}
+      function finish(result) {
+        self.readyState = 2; self.result = result;
+        var ev = { type: "load", target: self, currentTarget: self };
+        if (typeof self.onload === "function") { try { self.onload(ev); } catch (e) {} }
+        try { fireOn(self, "load"); } catch (e) {}
+        if (typeof self.onloadend === "function") { try { self.onloadend({ type: "loadend", target: self }); } catch (e) {} }
+        try { fireOn(self, "loadend"); } catch (e) {}
+      }
+      this.readAsText = function (blob) { (blob && blob.text ? blob.text() : Promise.resolve("")).then(finish); };
+      this.readAsArrayBuffer = function (blob) { (blob && blob.arrayBuffer ? blob.arrayBuffer() : Promise.resolve(new ArrayBuffer(0))).then(finish); };
+      this.readAsDataURL = function (blob) {
+        (blob && blob.arrayBuffer ? blob.arrayBuffer() : Promise.resolve(new ArrayBuffer(0))).then(function (buf) {
+          var view = new Uint8Array(buf), s = "";
+          for (var i = 0; i < view.length; i++) { s += String.fromCharCode(view[i]); }
+          var b64 = (typeof btoa === "function") ? btoa(s) : "";
+          finish("data:" + ((blob && blob.type) || "application/octet-stream") + ";base64," + b64);
+        });
+      };
+      this.abort = fn;
     });
   }
   if (typeof globalThis.Worker !== "function") {
