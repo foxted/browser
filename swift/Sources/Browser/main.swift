@@ -820,14 +820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.titleVisibility = .hidden
         window.isMovableByWindowBackground = false
         window.minSize = NSSize(width: 380, height: 300)
-        // Remember the window's position, size, AND which monitor it was on across launches. The
-        // saved frame is in global screen coordinates, so it encodes the display; AppKit persists it
-        // to UserDefaults on every move/resize (so it's current at close) and clamps it back onto an
-        // available screen if that monitor is gone. Center only on first run (no saved frame yet).
-        window.setFrameAutosaveName("BrowserMainWindow")
-        if !window.setFrameUsingName("BrowserMainWindow") {
-            window.center()
-        }
+        window.center() // first-run default; a saved frame is restored last (just before show).
 
         let content = NSView(frame: contentRect)
         content.wantsLayer = true
@@ -1066,6 +1059,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // Only listen for resize/backing callbacks once all views exist, so an early
         // notification can't reach updateViewport() before bitmapView is set.
         window.delegate = self
+
+        // Restore the saved position/size/monitor LAST — after the whole view tree + constraints
+        // exist — so a layout pass (or AppKit re-constraining a secondary-screen frame) can't shift
+        // the window right after it's placed (which looked like "it moves when you interact"). The
+        // saved frame is in global coords so it encodes the display; AppKit clamps it back onto an
+        // available screen if that monitor is gone. setFrameAutosaveName also persists it on every
+        // move/resize (current at close); no-op restore on first run keeps the centered default.
+        window.setFrameAutosaveName("BrowserMainWindow")
+        window.setFrameUsingName("BrowserMainWindow")
         window.makeKeyAndOrderFront(nil)
 
         // Create the first tab (becomes active) and start loading the default URL.
