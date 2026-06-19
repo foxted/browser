@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 dom = { path = "../dom" }
 css = { path = "../css" }
+url = "2.5"
 
 [dev-dependencies]
 html = { path = "../html" }

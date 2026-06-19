@@ -1174,6 +1174,9 @@ struct Entry<'a> {
     compiled: Compiled,
     /// The rule's declarations (applied as a unit when any of its selectors match).
     decls: &'a [(String, String)],
+    /// The owning stylesheet's base URL (for resolving relative `url(...)` in `mask-image` etc.
+    /// against the stylesheet, not the document). `None` if the sheet was parsed without a base.
+    base: Option<&'a str>,
 }
 
 /// An index over all UA + author selectors, bucketed most-selective-key-first so a given
@@ -1234,7 +1237,7 @@ impl<'a> SelectorIndex<'a> {
                 BucketKey::Type(t) => self.by_type.entry(t).or_default(),
                 BucketKey::Universal => &mut self.universal,
             }
-            .push(Entry { origin, order, compiled, decls: &rule.declarations });
+            .push(Entry { origin, order, compiled, decls: &rule.declarations, base: rule.base_url.as_deref() });
         }
     }
 }
@@ -1503,6 +1506,8 @@ fn compute_element_style<'a>(
         specificity: u32,
         order: usize,
         decls: &'a [(String, String)],
+        /// The owning sheet's base URL, for resolving relative `url(...)` values.
+        base: Option<&'a str>,
     }
     let mut matches: Vec<MatchEntry> = Vec::new();
 
@@ -1514,11 +1519,14 @@ fn compute_element_style<'a>(
     // `best_by_order` maps a rule's `order` to its (origin, max-specificity, decls). A rule's
     // origin and decls are constant for a given order, so the only thing we fold is the max
     // specificity.
-    let mut best_by_order: HashMap<usize, (u8, u32, &[(String, String)])> = HashMap::new();
+    let mut best_by_order: HashMap<usize, (u8, u32, &[(String, String)], Option<&'a str>)> =
+        HashMap::new();
     // Matching `::before`/`::after` rules, kept separately so they cascade onto the pseudo style
-    // rather than the element itself. Each is (origin, specificity, order, decls).
-    let mut before_matches: Vec<(u8, u32, usize, &'a [(String, String)])> = Vec::new();
-    let mut after_matches: Vec<(u8, u32, usize, &'a [(String, String)])> = Vec::new();
+    // rather than the element itself. Each is (origin, specificity, order, decls, base).
+    let mut before_matches: Vec<(u8, u32, usize, &'a [(String, String)], Option<&'a str>)> =
+        Vec::new();
+    let mut after_matches: Vec<(u8, u32, usize, &'a [(String, String)], Option<&'a str>)> =
+        Vec::new();
     let mut consider = |entry: &Entry<'a>| {
         // The compound must match the originating element either way; the pseudo just routes the
         // declarations to the element's ::before/::after style.
@@ -1527,16 +1535,16 @@ fn compute_element_style<'a>(
         }
         match entry.compiled.pseudo_element {
             Some(PseudoElement::Before) => {
-                before_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls));
+                before_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls, entry.base));
             }
             Some(PseudoElement::After) => {
-                after_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls));
+                after_matches.push((entry.origin, entry.compiled.specificity, entry.order, entry.decls, entry.base));
             }
             None => {
                 best_by_order
                     .entry(entry.order)
-                    .and_modify(|(_, spec, _)| *spec = (*spec).max(entry.compiled.specificity))
-                    .or_insert((entry.origin, entry.compiled.specificity, entry.decls));
+                    .and_modify(|(_, spec, _, _)| *spec = (*spec).max(entry.compiled.specificity))
+                    .or_insert((entry.origin, entry.compiled.specificity, entry.decls, entry.base));
             }
         }
     };
@@ -1571,9 +1579,9 @@ fn compute_element_style<'a>(
     // regardless of selector specificity (a UA `td { padding: 1px }` has specificity 1, but a hint
     // must still beat it for `cellpadding` to work, so origin level — not specificity — separates
     // them).
-    for (order, (origin, specificity, decls)) in best_by_order {
+    for (order, (origin, specificity, decls, base)) in best_by_order {
         let level = if origin == 0 { 0 } else { 2 };
-        matches.push(MatchEntry { origin: level, specificity, order, decls });
+        matches.push(MatchEntry { origin: level, specificity, order, decls, base });
     }
 
     // Presentational hints: HTML attributes (`border`, `bgcolor`, `align`, `width`, …) mapped to
@@ -1581,7 +1589,7 @@ fn compute_element_style<'a>(
     // `presentational_hints`.
     let hint_decls: Vec<(String, String)> = presentational_hints(doc, node_id, el);
     if !hint_decls.is_empty() {
-        matches.push(MatchEntry { origin: 1, specificity: 0, order: usize::MAX - 1, decls: &hint_decls });
+        matches.push(MatchEntry { origin: 1, specificity: 0, order: usize::MAX - 1, decls: &hint_decls, base: None });
     }
 
     // Inline style is its own origin (level 3) with highest precedence.
@@ -1594,7 +1602,9 @@ fn compute_element_style<'a>(
         // Inline is the sole top-level entry; the sort tiebreaks on `order` only within the
         // same origin/specificity, so the exact value is immaterial. Use MAX to keep the
         // "applied last" intent explicit.
-        matches.push(MatchEntry { origin: 3, specificity: 0, order: usize::MAX, decls: &inline_decls });
+        // Inline `style=""` url()s resolve against the document base; the cascade doesn't carry it,
+        // so leave `base: None` and let the engine resolve against the document URL as a fallback.
+        matches.push(MatchEntry { origin: 3, specificity: 0, order: usize::MAX, decls: &inline_decls, base: None });
     }
 
     // Sort by (origin, specificity, order) ascending so the winner is applied last.
@@ -1627,7 +1637,7 @@ fn compute_element_style<'a>(
             }
             let resolved = resolve_vars(val, &vars);
             let current_color = style.color;
-            apply_declaration(&mut style, prop, &resolved, parent, current_color, inherited_color);
+            apply_declaration(&mut style, prop, &resolved, parent, current_color, inherited_color, m.base);
         }
     }
 
@@ -1667,7 +1677,7 @@ fn compute_element_style<'a>(
 fn cascade_pseudo(
     element_style: &ComputedStyle,
     el: &dom::ElementData,
-    matches: &[(u8, u32, usize, &[(String, String)])],
+    matches: &[(u8, u32, usize, &[(String, String)], Option<&str>)],
     vars: &HashMap<String, String>,
 ) -> Option<Box<ComputedStyle>> {
     if matches.is_empty() {
@@ -1709,17 +1719,18 @@ fn cascade_pseudo(
 
     // Apply matching rules in cascade order (origin, specificity, source order ascending → winner
     // last). The inheritance source for `currentColor`/`inherit` is the originating element.
-    let mut sorted: Vec<&(u8, u32, usize, &[(String, String)])> = matches.iter().collect();
+    let mut sorted: Vec<&(u8, u32, usize, &[(String, String)], Option<&str>)> =
+        matches.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     let inherited_color = element_style.color;
-    for (_, _, _, decls) in sorted {
+    for (_, _, _, decls, base) in sorted {
         for (prop, val) in *decls {
             if prop.starts_with("--") {
                 continue;
             }
             let resolved = resolve_vars(val, vars);
             let current_color = ps.color;
-            apply_declaration(&mut ps, prop, &resolved, element_style, current_color, inherited_color);
+            apply_declaration(&mut ps, prop, &resolved, element_style, current_color, inherited_color, *base);
         }
     }
 
@@ -2409,6 +2420,7 @@ fn ancestor_table(doc: &dom::Document, node_id: dom::NodeId) -> Option<&dom::Ele
 }
 
 /// Apply a single declaration to `style`. Unknown properties/values are ignored silently.
+#[allow(clippy::too_many_arguments)]
 fn apply_declaration(
     style: &mut ComputedStyle,
     prop: &str,
@@ -2416,6 +2428,7 @@ fn apply_declaration(
     parent: &ComputedStyle,
     current_color: (u8, u8, u8),
     inherited_color: (u8, u8, u8),
+    base: Option<&str>,
 ) {
     match prop {
         "color" => {
@@ -2460,7 +2473,12 @@ fn apply_declaration(
             let v = val.trim();
             if v.eq_ignore_ascii_case("none") {
                 style.mask_image = None;
-            } else if let Some(m) = parse_mask(v) {
+            } else if let Some(mut m) = parse_mask(v) {
+                // Resolve the (post-`var()`) relative `url(...)` against the *stylesheet's* own base
+                // URL (per CSS), so it's absolute by the time the engine fetches it. `data:` URLs
+                // and already-absolute URLs pass through unchanged; with no base the engine resolves
+                // it against the document URL as a fallback.
+                m.url = resolve_css_url(&m.url, base);
                 style.mask_image = Some(m);
             }
         }
@@ -3122,6 +3140,26 @@ fn parse_angle_deg(tok: &str) -> Option<f32> {
         n.trim().parse::<f32>().ok().map(|x| x * 360.0)
     } else {
         t.parse::<f32>().ok()
+    }
+}
+
+/// Resolve a relative CSS `url(...)` value against the stylesheet's `base` URL, returning an
+/// absolute URL. `data:` URLs and anything that fails to resolve (e.g. no base, or `base` isn't a
+/// valid absolute URL) are returned unchanged — the engine then falls back to resolving against the
+/// document URL. This is what makes `url('../icons/x.svg')` in an external sheet load from the
+/// sheet's directory, not the document's.
+fn resolve_css_url(url: &str, base: Option<&str>) -> String {
+    let trimmed = url.trim();
+    // `data:` URLs are already self-contained; never rewrite them.
+    if trimmed.to_ascii_lowercase().starts_with("data:") {
+        return trimmed.to_string();
+    }
+    let Some(base) = base else {
+        return trimmed.to_string();
+    };
+    match url::Url::parse(base).and_then(|b| b.join(trimmed)) {
+        Ok(joined) => joined.into(),
+        Err(_) => trimmed.to_string(),
     }
 }
 
@@ -7500,6 +7538,62 @@ mod tests {
         let m = cs.mask_image.expect("mask should parse");
         assert_eq!(m.url, "icon.svg");
         assert_eq!(m.size, MaskSize::Contain);
+    }
+
+    #[test]
+    fn mask_url_resolves_against_stylesheet_base_not_document() {
+        // The bug: a relative `url()` in an `@import`'d sheet at `/a/b/sheet.css` must resolve
+        // against THAT sheet's URL → `/a/x.svg` (stylesheet-relative), not the document.
+        let doc = html::parse(r#"<html><body><div class="x"></div></body></html>"#);
+        let sheet = css::parse_with_base(
+            r#".x { mask: url('../x.svg') no-repeat center / contain }"#,
+            "https://site.example/a/b/sheet.css",
+        );
+        let map = cascade(&doc, &[sheet]);
+        let id = elem(&doc, |e| e.tag == "div");
+        let m = map[&id].mask_image.clone().expect("mask should parse");
+        assert_eq!(m.url, "https://site.example/a/x.svg");
+    }
+
+    #[test]
+    fn mask_url_resolves_against_stylesheet_dir_for_sibling_subdir() {
+        // Mirrors the browserscore bug: sheet at /ui/css/icons.css, url('../icons/w3c.svg')
+        // → /ui/icons/w3c.svg (NOT the document-relative /icons/w3c.svg).
+        let doc = html::parse(r#"<html><body><div class="x"></div></body></html>"#);
+        let sheet = css::parse_with_base(
+            r#".x { mask: url('../icons/w3c.svg') no-repeat center/contain }"#,
+            "https://browserscore.dev/ui/css/icons.css",
+        );
+        let map = cascade(&doc, &[sheet]);
+        let id = elem(&doc, |e| e.tag == "div");
+        let m = map[&id].mask_image.clone().expect("mask should parse");
+        assert_eq!(m.url, "https://browserscore.dev/ui/icons/w3c.svg");
+    }
+
+    #[test]
+    fn mask_data_url_passes_through_unchanged() {
+        // `data:` masks are self-contained and must never be rewritten against a base.
+        let doc = html::parse(r#"<html><body><div class="x"></div></body></html>"#);
+        let sheet = css::parse_with_base(
+            r#".x { mask: url("data:image/svg+xml,<svg></svg>") }"#,
+            "https://site.example/a/b/sheet.css",
+        );
+        let map = cascade(&doc, &[sheet]);
+        let id = elem(&doc, |e| e.tag == "div");
+        let m = map[&id].mask_image.clone().expect("mask should parse");
+        assert_eq!(m.url, "data:image/svg+xml,<svg></svg>");
+    }
+
+    #[test]
+    fn mask_url_without_base_is_left_relative_for_engine_fallback() {
+        // No base (inline-style / base-less sheet): the cascade leaves the url relative; the engine
+        // resolves it against the document URL.
+        let cs = cs_of(
+            r#"<html><body><div class="x"></div></body></html>"#,
+            r#".x { mask: url("icon.svg") no-repeat center / contain }"#,
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.mask_image.expect("mask").url, "icon.svg");
     }
 
     #[test]

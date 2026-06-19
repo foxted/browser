@@ -26,14 +26,36 @@ pub struct Rule {
     /// retained (joined with `" and "` when nested). Evaluated like `media` by the `style` crate
     /// against an assumed container width.
     pub container: Option<String>,
+    /// The absolute URL of the stylesheet that contains this rule, used to resolve relative
+    /// `url(...)` values (`mask-image`, `background-image`, …) against the *stylesheet's* own URL
+    /// rather than the document URL (per CSS, a relative `url()` is resolved against the stylesheet
+    /// it appears in). `None` for sheets parsed via [`parse`] (base unknown); set by
+    /// [`parse_with_base`] for `<link>`/`@import`'d sheets and inline `<style>` (document URL).
+    pub base_url: Option<String>,
 }
 
 /// Parse a CSS string into a [`Stylesheet`].
 pub fn parse(css: &str) -> Stylesheet {
+    parse_inner(css, None)
+}
+
+/// Parse a CSS string, stamping every rule with `base_url` (the absolute URL of the stylesheet this
+/// text came from) so relative `url(...)` values can later be resolved against the stylesheet's own
+/// URL. See [`Rule::base_url`].
+pub fn parse_with_base(css: &str, base_url: &str) -> Stylesheet {
+    parse_inner(css, Some(base_url))
+}
+
+fn parse_inner(css: &str, base_url: Option<&str>) -> Stylesheet {
     let stripped = strip_comments(css);
     let bytes: Vec<char> = stripped.chars().collect();
     let mut rules = Vec::new();
     parse_rules(&bytes, 0, bytes.len(), None, None, &mut rules);
+    if let Some(base) = base_url {
+        for rule in &mut rules {
+            rule.base_url = Some(base.to_string());
+        }
+    }
     Stylesheet { rules }
 }
 
@@ -166,6 +188,7 @@ fn parse_rule_body(
                             declarations: decls,
                             media: media.map(str::to_string),
                             container: container.map(str::to_string),
+                            base_url: None,
                         });
                     }
                 }
@@ -924,6 +947,20 @@ mod tests {
         let sheet = parse("@import url(\"x.css\"); p { color: red }");
         assert_eq!(sheet.rules.len(), 1);
         assert_eq!(sheet.rules[0].selectors, vec!["p"]);
+    }
+
+    #[test]
+    fn parse_with_base_stamps_every_rule() {
+        let sheet = parse_with_base(
+            "a { color: red } @media (min-width: 1px) { b { color: blue } }",
+            "https://example.com/css/app.css",
+        );
+        assert_eq!(sheet.rules.len(), 2);
+        for r in &sheet.rules {
+            assert_eq!(r.base_url.as_deref(), Some("https://example.com/css/app.css"));
+        }
+        // Plain `parse` leaves the base unset.
+        assert!(parse("a { color: red }").rules[0].base_url.is_none());
     }
 
     #[test]

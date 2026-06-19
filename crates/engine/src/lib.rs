@@ -419,7 +419,8 @@ impl Engine {
     /// stylesheets (NO `<link>`/`@import` network fetches), empty images, empty console. Scripts
     /// have not run. Invalidates the layout cache so the next paint re-cascades against this DOM.
     fn install_partial(&mut self, doc: dom::Document, url: &str) {
-        let styles = collect_inline_stylesheets(&doc);
+        let base = base_url(&doc, url);
+        let styles = collect_inline_stylesheets(&doc, &base);
         self.state = LoadState::Loaded {
             url: url.to_string(),
             doc: Some(doc),
@@ -649,7 +650,10 @@ impl Engine {
             return;
         }
 
-        // Resolve the page base url (for fetching same-origin mask SVGs / rasters).
+        // Mask `url(...)`s are resolved against their owning stylesheet's base during the cascade
+        // (see `style::apply_declaration`), so `mask.url` is normally already absolute. The page
+        // URL here is a FALLBACK for masks whose base was unknown (inline `style=""`, or a sheet
+        // parsed without a base) — `load_mask_source` joins it, which leaves an absolute url intact.
         let base = match &self.state {
             LoadState::Loaded { url, .. } => url.clone(),
             _ => String::new(),
@@ -3893,8 +3897,8 @@ pub fn collect_stylesheets(doc: &dom::Document, base: &str) -> (Vec<css::Stylesh
 /// network: they show page structure plus inline-CSS styling, and the final frame (built with the
 /// full [`collect_stylesheets`]) adds external CSS. Inline `@import`s are intentionally NOT followed
 /// here (they'd fetch); the cascade still applies its UA stylesheet on top of these.
-fn collect_inline_stylesheets(doc: &dom::Document) -> Vec<css::Stylesheet> {
-    fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut Vec<css::Stylesheet>) {
+fn collect_inline_stylesheets(doc: &dom::Document, base: &str) -> Vec<css::Stylesheet> {
+    fn walk(doc: &dom::Document, id: dom::NodeId, base: &str, out: &mut Vec<css::Stylesheet>) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag == "style" {
                 let mut src = String::new();
@@ -3903,16 +3907,17 @@ fn collect_inline_stylesheets(doc: &dom::Document) -> Vec<css::Stylesheet> {
                         src.push_str(t);
                     }
                 }
-                out.push(css::parse(&src));
+                // Inline `<style>` resolves relative `url(...)` against the document base URL.
+                out.push(css::parse_with_base(&src, base));
                 return; // a <style>'s text body isn't markup
             }
         }
         for &child in &doc.get(id).children {
-            walk(doc, child, out);
+            walk(doc, child, base, out);
         }
     }
     let mut out = Vec::new();
-    walk(doc, doc.root(), &mut out);
+    walk(doc, doc.root(), base, &mut out);
     out
 }
 
@@ -3952,7 +3957,7 @@ fn process_css_text(
             None => console.push(format!("[skipped @import (unresolvable): {spec}]")),
         }
     }
-    sheets.push(css::parse(text));
+    sheets.push(css::parse_with_base(text, base_url));
 }
 
 /// Fetch the external CSS at absolute URL `url`, then process it (following its own `@import`s).
@@ -5152,6 +5157,59 @@ mod tests {
             (kr, kg, kb)
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn external_stylesheet_mask_url_resolves_against_sheet_dir() {
+        // The browserscore bug, end-to-end over file://: the page lives at <dir>/index.html and
+        // links <dir>/css/app.css; that sheet masks `.b` with url('../icons/dot.svg'). Per CSS the
+        // relative url resolves against the SHEET's dir (<dir>/icons/dot.svg), NOT the page's dir
+        // (<dir>/icons is right; <dir-of-page>/../icons would be wrong). If we (wrongly) resolved
+        // against the document, the page is at <dir>/index.html so `../icons` escapes <dir> and the
+        // SVG 404s → no mask → the whole box paints solid red (corners red). We assert corners show
+        // the page background, proving the mask loaded from the sheet-relative path.
+        let dir = std::env::temp_dir().join("browser_ext_mask_test");
+        let _ = std::fs::create_dir_all(dir.join("css"));
+        let _ = std::fs::create_dir_all(dir.join("icons"));
+        // index.html sits in `dir`; the sheet sits one level deeper in `dir/css`. `../icons/dot.svg`
+        // from the SHEET → `dir/icons/dot.svg`; from the PAGE → `dir/../icons/dot.svg` (escapes dir).
+        let svg = "<svg viewBox='0 0 20 20'><circle cx='10' cy='10' r='9' fill='black'/></svg>";
+        std::fs::write(dir.join("icons/dot.svg"), svg).unwrap();
+        std::fs::write(
+            dir.join("css/app.css"),
+            ".b{width:40px;height:40px;background:red;\
+             -webkit-mask:url('../icons/dot.svg') no-repeat center/contain;\
+             mask:url('../icons/dot.svg') no-repeat center/contain}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("index.html"),
+            "<html><head><link rel=stylesheet href='css/app.css'></head>\
+             <body style='margin:0'><div class='b'></div></body></html>",
+        )
+        .unwrap();
+
+        let mut e = Engine::new();
+        e.set_viewport(100, 100, 1.0);
+        assert_eq!(e.load_url(&format!("file://{}", dir.join("index.html").display())), 0);
+        let fb = e.render();
+        let px = |x: u32, y: u32| -> (u8, u8, u8) {
+            let i = (y * fb.stride) as usize + (x as usize) * 4;
+            (fb.pixels[i], fb.pixels[i + 1], fb.pixels[i + 2])
+        };
+        // Centre of the 40x40 box is inside the circle → red.
+        let (cr, cg, cb) = px(20, 20);
+        assert!(cr > 200 && cg < 60 && cb < 60, "centre should be red, got {:?}", (cr, cg, cb));
+        // Corner is outside the circle → page background, NOT red — proving the mask loaded from the
+        // sheet-relative `../icons/dot.svg`. If url() resolved against the document the SVG would
+        // 404, leaving the whole box red (corner red).
+        let (kr, kg, kb) = px(1, 1);
+        assert!(
+            !(kr > 200 && kg < 60 && kb < 60),
+            "corner is red → mask did not load (url() resolved against document, not sheet), got {:?}",
+            (kr, kg, kb)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
