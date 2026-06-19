@@ -2260,10 +2260,27 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // `location` already exists (a minimal stub from install_globals); overwrite it.
   globalThis.location = location;
 
-  // --- history -----------------------------------------------------------------------------
+  // --- history (pushState/replaceState update location so SPA routers see the new URL) -------
+  function __applyURLToLocation(url) {
+    var resolved;
+    try { resolved = new URL(String(url), location.href).href; } catch (e) { resolved = String(url); }
+    var p = parseURL(resolved);
+    location.href = p.href; location.protocol = p.protocol; location.host = p.host;
+    location.hostname = p.hostname; location.port = p.port; location.pathname = p.pathname;
+    location.search = p.search; location.hash = p.hash; location.origin = p.origin;
+  }
   globalThis.history = {
     length: 1, scrollRestoration: "auto", state: null,
-    pushState: fn, replaceState: fn, back: fn, forward: fn, go: fn
+    pushState: function (state, title, url) {
+      this.state = (state === undefined ? null : state);
+      this.length++;
+      if (url != null && url !== "") { __applyURLToLocation(url); }
+    },
+    replaceState: function (state, title, url) {
+      this.state = (state === undefined ? null : state);
+      if (url != null && url !== "") { __applyURLToLocation(url); }
+    },
+    back: fn, forward: fn, go: fn
   };
 
   // --- Storage (localStorage / sessionStorage) ---------------------------------------------
@@ -2306,14 +2323,71 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   globalThis.getSelection = function () { return null; };
   globalThis.alert = fn; globalThis.confirm = function () { return false; }; globalThis.prompt = function () { return null; };
 
-  // --- matchMedia --------------------------------------------------------------------------
+  // --- matchMedia (real evaluation against the live viewport) ------------------------------
+  function __mqFeature(f) {
+    var iw = Number(globalThis.innerWidth) || 0, ih = Number(globalThis.innerHeight) || 0;
+    var dpr = Number(globalThis.devicePixelRatio) || 1;
+    if (f === "screen" || f === "all") { return true; }
+    if (f === "print" || f === "speech") { return false; }
+    var m = f.match(/^\(\s*([a-z-]+)\s*(?::\s*([^)]+))?\s*\)$/);
+    if (!m) { return false; }
+    var name = m[1], val = (m[2] || "").trim();
+    var px = function (v) { var n = parseFloat(v); if (/r?em$/.test(v)) { n *= 16; } return n; };
+    var res = function (v) { return /dpi$/.test(v) ? parseFloat(v) / 96 : (/dpcm$/.test(v) ? parseFloat(v) / 37.8 : parseFloat(v)); };
+    switch (name) {
+      case "min-width": case "min-device-width": return iw >= px(val);
+      case "max-width": case "max-device-width": return iw <= px(val);
+      case "width": case "device-width": return iw === px(val);
+      case "min-height": case "min-device-height": return ih >= px(val);
+      case "max-height": case "max-device-height": return ih <= px(val);
+      case "height": case "device-height": return ih === px(val);
+      case "min-aspect-ratio": case "max-aspect-ratio": case "aspect-ratio": {
+        var p = val.split("/"); var want = p.length === 2 ? (parseFloat(p[0]) / parseFloat(p[1])) : parseFloat(val);
+        var have = ih ? iw / ih : 0;
+        return name === "min-aspect-ratio" ? have >= want : (name === "max-aspect-ratio" ? have <= want : Math.abs(have - want) < 0.01);
+      }
+      case "orientation": return val === (iw >= ih ? "landscape" : "portrait");
+      case "prefers-color-scheme": return val === "light"; // pages render on a light default
+      case "prefers-reduced-motion": return val === "" || val === "no-preference";
+      case "prefers-contrast": return val === "" || val === "no-preference";
+      case "hover": case "any-hover": return val === "" || val === "hover";
+      case "pointer": case "any-pointer": return val === "" || val === "fine";
+      case "min-resolution": return dpr >= res(val);
+      case "max-resolution": return dpr <= res(val);
+      case "resolution": return Math.abs(dpr - res(val)) < 0.01;
+      case "display-mode": return val === "browser";
+      case "scripting": return val === "" || val === "enabled";
+      case "update": return val === "" || val === "fast";
+      case "color": return val === "" || parseFloat(val) > 0;
+      case "color-gamut": return val === "srgb";
+      default: return false;
+    }
+  }
+  function __mqConj(q) {
+    var neg = false;
+    if (/^not\s/.test(q)) { neg = true; q = q.replace(/^not\s+/, "").trim(); }
+    q = q.replace(/^only\s+/, "");
+    var parts = q.split(/\s+and\s+/);
+    var all = true;
+    for (var i = 0; i < parts.length; i++) { if (!__mqFeature(parts[i].trim())) { all = false; break; } }
+    return neg ? !all : all;
+  }
+  function __evalMedia(query) {
+    query = String(query == null ? "" : query).toLowerCase().trim();
+    if (!query || query === "all" || query === "screen") { return true; }
+    var ors = query.split(",");
+    for (var i = 0; i < ors.length; i++) { if (__mqConj(ors[i].trim())) { return true; } }
+    return false;
+  }
   globalThis.matchMedia = function (q) {
-    return {
-      matches: false, media: String(q), onchange: null,
-      addListener: fn, removeListener: fn,
-      addEventListener: fn, removeEventListener: fn,
+    var mql = {
+      media: String(q), onchange: null,
+      addListener: fn, removeListener: fn, addEventListener: fn, removeEventListener: fn,
       dispatchEvent: function () { return false; }
     };
+    // `matches` re-evaluates against the current viewport on every read (so it tracks resizes).
+    Object.defineProperty(mql, "matches", { get: function () { return __evalMedia(q); }, enumerable: true, configurable: true });
+    return mql;
   };
 
   // --- getComputedStyle --------------------------------------------------------------------
