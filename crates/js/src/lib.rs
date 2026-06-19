@@ -2310,6 +2310,14 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   // window / self aliases (globalThis already exists).
   globalThis.window = globalThis;
   globalThis.self = globalThis;
+  // Top-level browsing context: parent/top/frames are self-referential, there's no opener, and
+  // zero child frames. Real code (testharness.js, framebusters, analytics) walks `window.parent` /
+  // `window.top` and crashes if they're undefined.
+  globalThis.parent = globalThis;
+  globalThis.top = globalThis;
+  globalThis.frames = globalThis;
+  globalThis.opener = null;
+  try { globalThis.length = 0; } catch (e) {}
   // Minimal location stub (overwritten by the browser-env bootstrap).
   globalThis.location = { href: "" };
 
