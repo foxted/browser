@@ -5121,6 +5121,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     DOMExceptionCtor.prototype = Object.create(Error.prototype);
     DOMExceptionCtor.prototype.constructor = DOMExceptionCtor;
     DOMExceptionCtor.prototype.toString = function () { return this.name + ": " + this.message; };
+    // The constructor's own .name must be "DOMException" (it's inferred as the variable name
+    // otherwise): testharness's assert_throws_dom checks `constructor.name === "DOMException"` to
+    // detect the explicit-constructor overload, so a wrong name silently misroutes its arguments.
+    try { Object.defineProperty(DOMExceptionCtor, "name", { value: "DOMException", configurable: true }); } catch (e) {}
     def(globalThis, "DOMException", DOMExceptionCtor);
   })();
 
