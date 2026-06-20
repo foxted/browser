@@ -478,12 +478,33 @@ fn find_by_id(doc: &dom::Document, root: dom::NodeId, id: &str) -> Option<dom::N
 // CSS selector engine (type / .class / #id / compound / descendant). Reused verbatim.
 // ---------------------------------------------------------------------------------------------
 
-/// A single compound selector, e.g. `div.foo#bar`.
+#[derive(Clone, PartialEq, Debug)]
+enum AttrMatchOp {
+    Exists,
+    Equals,
+    Includes,
+    DashMatch,
+    Prefix,
+    Suffix,
+    Substring,
+}
+
+/// A parsed `[attr]` / `[attr op value]` condition for the `querySelector` selector engine.
+#[derive(Clone, Debug)]
+struct AttrCond {
+    name: String, // local name, lowercased
+    op: AttrMatchOp,
+    value: String,
+    ci: bool, // case-insensitive value match (the `i` flag)
+}
+
+/// A single compound selector, e.g. `div.foo#bar[disabled]`.
 #[derive(Debug, Default, Clone)]
 struct Compound {
     tag: Option<String>,
     id: Option<String>,
     classes: Vec<String>,
+    attrs: Vec<AttrCond>,
     any: bool,
 }
 
@@ -508,7 +529,108 @@ impl Compound {
                 return false;
             }
         }
+        for a in &self.attrs {
+            if !attr_cond_matches(e, a) {
+                return false;
+            }
+        }
         true
+    }
+}
+
+/// Strip a CSS attribute-namespace prefix (`*|`, `|`, or `ns|`) to the local name — our HTML
+/// attributes carry no namespace, so any of these reduce to the local name.
+fn strip_attr_ns(name: &str) -> &str {
+    if let Some(rest) = name.strip_prefix("*|") {
+        rest
+    } else if let Some(rest) = name.strip_prefix('|') {
+        rest
+    } else if let Some(bar) = name.find('|') {
+        &name[bar + 1..]
+    } else {
+        name
+    }
+}
+
+/// Parse the inside of an attribute selector `[...]` into an [`AttrCond`].
+fn parse_attr_cond(inner: &str) -> Option<AttrCond> {
+    let s = inner.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(eq) = s.find('=') {
+        // The operator is `=` optionally prefixed by one of ~ | ^ $ * (immediately before it).
+        let prev = if eq > 0 { s.as_bytes().get(eq - 1).copied() } else { None };
+        let (op, name_end) = match prev {
+            Some(b'~') => (AttrMatchOp::Includes, eq - 1),
+            Some(b'|') => (AttrMatchOp::DashMatch, eq - 1),
+            Some(b'^') => (AttrMatchOp::Prefix, eq - 1),
+            Some(b'$') => (AttrMatchOp::Suffix, eq - 1),
+            Some(b'*') => (AttrMatchOp::Substring, eq - 1),
+            _ => (AttrMatchOp::Equals, eq),
+        };
+        let name = s[..name_end].trim();
+        if name.is_empty() {
+            return None;
+        }
+        let mut raw_val = s[eq + 1..].trim();
+        // Optional trailing case-sensitivity flag (whitespace-separated `i`/`s`).
+        let mut ci = false;
+        if let Some(v) = raw_val.strip_suffix(" i").or_else(|| raw_val.strip_suffix(" I")) {
+            raw_val = v.trim_end();
+            ci = true;
+        } else if let Some(v) = raw_val.strip_suffix(" s").or_else(|| raw_val.strip_suffix(" S")) {
+            raw_val = v.trim_end();
+        }
+        let value = unquote_attr_value(raw_val);
+        Some(AttrCond { name: strip_attr_ns(name).to_ascii_lowercase(), op, value, ci })
+    } else {
+        Some(AttrCond {
+            name: strip_attr_ns(s).to_ascii_lowercase(),
+            op: AttrMatchOp::Exists,
+            value: String::new(),
+            ci: false,
+        })
+    }
+}
+
+/// Strip matching surrounding single/double quotes from an attribute-selector value.
+fn unquote_attr_value(s: &str) -> String {
+    let s = s.trim();
+    let b = s.as_bytes();
+    if s.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Match an [`AttrCond`] against an element (mirrors the cascade's attribute matching).
+fn attr_cond_matches(e: &dom::ElementData, a: &AttrCond) -> bool {
+    let actual = e
+        .attrs
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(&a.name))
+        .map(|(_, v)| v.as_str());
+    let Some(val) = actual else {
+        return false;
+    };
+    if a.op == AttrMatchOp::Exists {
+        return true;
+    }
+    let (hay, needle) = if a.ci {
+        (val.to_ascii_lowercase(), a.value.to_ascii_lowercase())
+    } else {
+        (val.to_string(), a.value.clone())
+    };
+    match a.op {
+        AttrMatchOp::Exists => true,
+        AttrMatchOp::Equals => hay == needle,
+        AttrMatchOp::Includes => !needle.is_empty() && hay.split_whitespace().any(|w| w == needle),
+        AttrMatchOp::DashMatch => hay == needle || hay.starts_with(&format!("{needle}-")),
+        AttrMatchOp::Prefix => !needle.is_empty() && hay.starts_with(&needle),
+        AttrMatchOp::Suffix => !needle.is_empty() && hay.ends_with(&needle),
+        AttrMatchOp::Substring => !needle.is_empty() && hay.contains(&needle),
     }
 }
 
@@ -593,11 +715,17 @@ fn parse_compound(s: &str) -> Option<Compound> {
                 c.any = true;
             }
             '[' => {
+                i += 1;
+                let start = i;
                 while i < bytes.len() && bytes[i] != ']' {
                     i += 1;
                 }
+                let inner: String = bytes[start..i].iter().collect();
                 if i < bytes.len() {
-                    i += 1;
+                    i += 1; // consume ']'
+                }
+                if let Some(cond) = parse_attr_cond(&inner) {
+                    c.attrs.push(cond);
                 }
                 c.any = true;
             }
@@ -1101,26 +1229,94 @@ fn prim_get_attr(
 /// Walk the document for `<style>` elements, concatenate their text content, and parse it into a
 /// single author stylesheet. Returns an empty `Vec` when there are no `<style>` blocks (the cascade
 /// then runs with just the UA sheet + inline `style=""` attributes).
-fn collect_author_sheets(doc: &dom::Document) -> Vec<css::Stylesheet> {
-    fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
+fn collect_author_sheets(
+    doc: &dom::Document,
+    fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+) -> Vec<css::Stylesheet> {
+    fn walk(
+        doc: &dom::Document,
+        id: dom::NodeId,
+        out: &mut String,
+        fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+    ) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag.eq_ignore_ascii_case("style") {
                 out.push_str(&text_content(doc, id));
                 out.push('\n');
                 return; // don't descend into a <style>'s text as if it were markup
             }
+            if e.tag.eq_ignore_ascii_case("link") {
+                // An enabled (no `disabled` attribute), non-alternate stylesheet `<link>` contributes
+                // its fetched CSS to the cascade, so `getComputedStyle` reflects `<link>` styles (not
+                // just inline `<style>`). `data:` URLs are decoded inline; others go through the host
+                // fetcher (which the engine has already warmed via the cascade fetch).
+                let rels: Vec<&str> = e
+                    .attrs
+                    .get("rel")
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .split_whitespace()
+                    .collect();
+                let is_stylesheet = rels.iter().any(|r| r.eq_ignore_ascii_case("stylesheet"));
+                let is_alternate = rels.iter().any(|r| r.eq_ignore_ascii_case("alternate"));
+                let disabled = e.attrs.contains_key("disabled");
+                if is_stylesheet && !is_alternate && !disabled {
+                    if let Some(href) = e.attrs.get("href") {
+                        if let Some(css) = fetch_link_css(href, fetcher) {
+                            out.push_str(&css);
+                            out.push('\n');
+                        }
+                    }
+                }
+                return;
+            }
         }
         for &child in &doc.get(id).children {
-            walk(doc, child, out);
+            walk(doc, child, out, fetcher);
         }
     }
     let mut css_src = String::new();
-    walk(doc, doc.root(), &mut css_src);
+    walk(doc, doc.root(), &mut css_src, fetcher);
     if css_src.trim().is_empty() {
         Vec::new()
     } else {
         vec![css::parse(&css_src)]
     }
+}
+
+/// Fetch the CSS text behind a stylesheet `<link href>`. `data:` URLs are decoded directly (the
+/// `text/css` body after the comma, percent-decoded); anything else goes through the host GET fetcher.
+fn fetch_link_css(href: &str, fetcher: &Rc<dyn Fn(&str) -> Option<String>>) -> Option<String> {
+    if let Some(rest) = href.strip_prefix("data:") {
+        let comma = rest.find(',')?;
+        let (meta, data) = (&rest[..comma], &rest[comma + 1..]);
+        if meta.trim_end().ends_with(";base64") {
+            return None; // base64 data: stylesheets are rare; not decoded here
+        }
+        return Some(percent_decode_str(data));
+    }
+    fetcher(href)
+}
+
+/// Minimal percent-decoding for `data:` URL bodies (`%XX` → byte; other chars pass through).
+fn percent_decode_str(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Recompute the cascade if the cache is missing or stale (DOM changed since it was built), then run
@@ -1137,7 +1333,7 @@ fn with_computed_style<R>(
         let fresh = matches!(&*cache, Some((v, _)) if *v == version);
         if !fresh {
             let doc = state.doc.borrow();
-            let sheets = collect_author_sheets(&doc);
+            let sheets = collect_author_sheets(&doc, &state.fetcher);
             let map = style::cascade(&doc, &sheets);
             *cache = Some((version, map));
         }
@@ -1160,7 +1356,7 @@ fn with_cascade_map<R>(
         let fresh = matches!(&*cache, Some((v, _)) if *v == version);
         if !fresh {
             let doc = state.doc.borrow();
-            let sheets = collect_author_sheets(&doc);
+            let sheets = collect_author_sheets(&doc, &state.fetcher);
             let map = style::cascade(&doc, &sheets);
             *cache = Some((version, map));
         }
@@ -1188,7 +1384,7 @@ fn with_pseudo_style<R>(
         let fresh = matches!(&*cache, Some((v, _)) if *v == version);
         if !fresh {
             let doc = state.doc.borrow();
-            let sheets = collect_author_sheets(&doc);
+            let sheets = collect_author_sheets(&doc, &state.fetcher);
             let map = style::cascade(&doc, &sheets);
             *cache = Some((version, map));
         }
@@ -1198,7 +1394,7 @@ fn with_pseudo_style<R>(
     let doc = state.doc.borrow();
     let element_style = map.get(&id);
     let pseudo = element_style.and_then(|es| {
-        let sheets = collect_author_sheets(&doc);
+        let sheets = collect_author_sheets(&doc, &state.fetcher);
         style::compute_pseudo_style(&doc, &sheets, id, es, pseudo_key)
     });
     f(pseudo.as_ref())
@@ -7483,7 +7679,16 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     ss.__sync = function () {};
     ss.type = "text/css";
     ss.disabled = false;
-    Object.defineProperty(ss, "ownerNode", { get: function () { return ownerNode || null; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "ownerNode", { get: function () {
+      if (!ownerNode) { return null; }
+      // A disabled or disconnected stylesheet <link> is no longer associated with the document, so
+      // its sheet's ownerNode is null (CSSOM: a removed style sheet has no owner node).
+      try {
+        if (ownerNode.tagName === "LINK" && ownerNode.disabled) { return null; }
+        if (document.documentElement && !document.documentElement.contains(ownerNode)) { return null; }
+      } catch (e) {}
+      return ownerNode;
+    }, enumerable: true, configurable: true });
     Object.defineProperty(ss, "ownerRule", { get: function () { return ss.__ownerRule || null; }, enumerable: true, configurable: true });
     Object.defineProperty(ss, "parentStyleSheet", { get: function () { return null; }, enumerable: true, configurable: true });
     Object.defineProperty(ss, "href", { get: function () { return ss.__href != null ? ss.__href : null; }, enumerable: true, configurable: true });
@@ -9508,13 +9713,28 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     // HTMLLinkElement.disabled / HTMLStyleElement.disabled. For <link>, `disabled` is backed by the
     // content attribute (and excludes the sheet from document.styleSheets while set). For <style>,
     // `disabled` mirrors the sheet's `disabled` state.
+    // Fire `load` (async) on a connected, enabled stylesheet <link> — pages use link.onload to know
+    // when the sheet is ready, and enabling a previously-disabled link reloads it.
+    function __fireLinkLoad(link) {
+      try {
+        var rel = (link.getAttribute && link.getAttribute("rel") || "").toLowerCase();
+        if (rel.split(/\s+/).indexOf("stylesheet") < 0) { return; }
+        if (!link.getAttribute || !link.getAttribute("href")) { return; }
+        if (!(document.documentElement && document.documentElement.contains(link))) { return; }
+        // Defer to a later task (NOT a microtask): a stylesheet load is async, and firing it during
+        // the `disabled` setter would re-enter the caller's code mid-statement (e.g. an onload handler
+        // toggling `disabled` again before the setter's caller finishes).
+        setTimeout(function () { try { if (typeof link.dispatchEvent === "function") { link.dispatchEvent(new Event("load")); } } catch (e) {} }, 0);
+      } catch (e) {}
+    }
+    def(globalThis, "__fireLinkLoad", __fireLinkLoad);
     var __linkProto = globalThis.HTMLLinkElement && globalThis.HTMLLinkElement.prototype;
     if (__linkProto) {
       Object.defineProperty(__linkProto, "disabled", {
         get: function () { return this.getAttribute("disabled") != null || !!this.__sheetDisabled; },
         set: function (v) {
           if (v) { this.setAttribute("disabled", ""); def(this, "__sheetDisabled", true); }
-          else { this.removeAttribute("disabled"); def(this, "__sheetDisabled", false); }
+          else { this.removeAttribute("disabled"); def(this, "__sheetDisabled", false); __fireLinkLoad(this); }
         },
         enumerable: true, configurable: true
       });
