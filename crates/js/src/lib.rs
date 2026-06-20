@@ -4215,6 +4215,26 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   def(document, "getElementsByClassName", function (cls) { return __getElementsByClassName(String(cls)).map(wrap); });
   def(document, "querySelector", function (sel) { var r = __querySelectorAll(String(sel)); return r.length ? wrap(r[0]) : null; });
   def(document, "querySelectorAll", function (sel) { return __querySelectorAll(String(sel)).map(wrap); });
+  // document.write / writeln. We run scripts after the full parse (there is no live insertion point),
+  // so the written markup is parsed and appended to <body> (or the documentElement) — enough for the
+  // common case of a script writing extra elements (e.g. a <link>/<script>) into the page.
+  def(document, "write", function () {
+    var html = "";
+    for (var i = 0; i < arguments.length; i++) { html += String(arguments[i]); }
+    var target = document.body || document.documentElement;
+    if (!target) { return; }
+    var tmp = document.createElement("div");
+    tmp.innerHTML = html;
+    var kids = [];
+    var cn = tmp.childNodes;
+    for (var k = 0; k < cn.length; k++) { kids.push(cn[k]); }
+    for (var j = 0; j < kids.length; j++) { try { target.appendChild(kids[j]); } catch (e) {} }
+  });
+  def(document, "writeln", function () {
+    var a = Array.prototype.slice.call(arguments);
+    a.push("\n");
+    document.write.apply(document, a);
+  });
   def(document, "createElement", function (tag) {
     // HTML document: validate the name as an XML Name, then ASCII-lowercase it. namespaceURI is the
     // HTML namespace, prefix null, localName the lowercased name, tagName the uppercased localName.
@@ -5200,6 +5220,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     fireOn(document, "DOMContentLoaded");
     readyState = "complete";
     fireOn(document, "readystatechange");
+    // Fire `load` on each connected, enabled stylesheet <link> before the window load — pages use
+    // link.onload to know the sheet is ready (their sheets are already available to us).
+    try {
+      var __lks = document.querySelectorAll("link[rel~=stylesheet]");
+      for (var __i = 0; __i < __lks.length; __i++) {
+        var __lk = __lks[__i];
+        if (__lk.__loadFired || !__lk.getAttribute || !__lk.getAttribute("href") || __lk.disabled) { continue; }
+        def(__lk, "__loadFired", true);
+        try { __lk.dispatchEvent(new Event("load")); } catch (e) {}
+      }
+    } catch (e) {}
     fireOn(window, "load");
     fireOn(document, "load");
     fireOn(window, "pageshow");
@@ -8429,6 +8460,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (el.__enriched) { return el; }
     var node = el.__node;
     def(el, "__enriched", true);
+    // Compile inline event-handler content attributes (onload="...", onclick="...") into the matching
+    // on-handler so they run when the event is dispatched. The handler body runs with `event` in scope
+    // and `this` bound to the element (dispatchEvent calls `el.on<type>`).
+    try {
+      if (el.tagName && typeof el.getAttributeNames === "function") {
+        var __ons = el.getAttributeNames();
+        for (var __oi = 0; __oi < __ons.length; __oi++) {
+          var __on = __ons[__oi];
+          if (__on.length > 2 && __on.slice(0, 2) === "on" && typeof el[__on] !== "function") {
+            try { el[__on] = new Function("event", el.getAttribute(__on)); } catch (e) {}
+          }
+        }
+      }
+    } catch (e) {}
     // Graft the matching DOM interface prototype onto the wrapper's chain (own props survive).
     // Non-element nodes (Text=3, Comment=8, DocumentFragment=11) use their CharacterData/Node
     // interface prototype so `instanceof Text/Comment/DocumentFragment` holds; elements map by tag.
