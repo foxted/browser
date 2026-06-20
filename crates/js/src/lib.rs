@@ -1233,23 +1233,35 @@ fn collect_author_sheets(
     doc: &dom::Document,
     fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
 ) -> Vec<css::Stylesheet> {
+    /// One author stylesheet in document order, with the bits needed to apply the preferred-set rule.
+    /// `seq` is the node id, which (arena nodes are allocated in creation order) tracks the order the
+    /// sheet was added — what determines the preferred set, independent of final tree order.
+    struct SheetEntry {
+        title: Option<String>,
+        alternate: bool,
+        css: String,
+        seq: usize,
+    }
     fn walk(
         doc: &dom::Document,
         id: dom::NodeId,
-        out: &mut String,
+        out: &mut Vec<SheetEntry>,
         fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
     ) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag.eq_ignore_ascii_case("style") {
-                out.push_str(&text_content(doc, id));
-                out.push('\n');
+                out.push(SheetEntry {
+                    title: e.attrs.get("title").cloned(),
+                    alternate: false,
+                    css: text_content(doc, id),
+                    seq: id.0,
+                });
                 return; // don't descend into a <style>'s text as if it were markup
             }
             if e.tag.eq_ignore_ascii_case("link") {
-                // An enabled (no `disabled` attribute), non-alternate stylesheet `<link>` contributes
-                // its fetched CSS to the cascade, so `getComputedStyle` reflects `<link>` styles (not
-                // just inline `<style>`). `data:` URLs are decoded inline; others go through the host
-                // fetcher (which the engine has already warmed via the cascade fetch).
+                // An enabled (no `disabled` attribute) stylesheet `<link>` contributes its fetched CSS
+                // to the cascade so `getComputedStyle` reflects `<link>` styles. `data:` URLs are
+                // decoded inline; others go through the host fetcher (warmed by the cascade fetch).
                 let rels: Vec<&str> = e
                     .attrs
                     .get("rel")
@@ -1258,15 +1270,17 @@ fn collect_author_sheets(
                     .split_whitespace()
                     .collect();
                 let is_stylesheet = rels.iter().any(|r| r.eq_ignore_ascii_case("stylesheet"));
+                let is_alternate = rels.iter().any(|r| r.eq_ignore_ascii_case("alternate"));
                 let disabled = e.attrs.contains_key("disabled");
-                // Include any enabled (no `disabled` attribute) stylesheet link. Alternates count
-                // too: once explicitly enabled — which removes the `disabled` attribute — they apply
-                // like a normal sheet, and we can't otherwise distinguish them from the DOM.
                 if is_stylesheet && !disabled {
                     if let Some(href) = e.attrs.get("href") {
                         if let Some(css) = fetch_link_css(href, fetcher) {
-                            out.push_str(&css);
-                            out.push('\n');
+                            out.push(SheetEntry {
+                                title: e.attrs.get("title").cloned(),
+                                alternate: is_alternate,
+                                css,
+                                seq: id.0,
+                            });
                         }
                     }
                 }
@@ -1277,8 +1291,31 @@ fn collect_author_sheets(
             walk(doc, child, out, fetcher);
         }
     }
+    let mut entries: Vec<SheetEntry> = Vec::new();
+    walk(doc, doc.root(), &mut entries, fetcher);
+
+    // The "preferred style sheet set" name: the title of the first non-alternate sheet with a
+    // non-empty title. Sheets with no/empty title are persistent (always apply); a non-empty title
+    // names a set, and only the preferred set's sheets apply by default. Alternates we treat as
+    // enabled when present (the DOM doesn't tell us which set, if any, the user selected).
+    let preferred: Option<&str> = entries
+        .iter()
+        .filter(|e| !e.alternate && e.title.as_deref().map(|t| !t.is_empty()).unwrap_or(false))
+        .min_by_key(|e| e.seq)
+        .and_then(|e| e.title.as_deref());
+
     let mut css_src = String::new();
-    walk(doc, doc.root(), &mut css_src, fetcher);
+    for e in &entries {
+        let applies = e.alternate
+            || match e.title.as_deref() {
+                None | Some("") => true,
+                Some(t) => Some(t) == preferred,
+            };
+        if applies {
+            css_src.push_str(&e.css);
+            css_src.push('\n');
+        }
+    }
     if css_src.trim().is_empty() {
         Vec::new()
     } else {
