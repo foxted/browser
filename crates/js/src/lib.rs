@@ -787,10 +787,34 @@ fn parse_compound(s: &str) -> Option<Compound> {
 /// A complex selector: a chain of compounds joined by descendant combinators (whitespace).
 /// Splitting is escape-aware so a CSS escape that contains whitespace (`#\30 foo`) or a combinator
 /// character stays within its compound; only *unescaped* combinators/whitespace separate compounds.
-fn parse_complex(s: &str) -> Option<Vec<Compound>> {
+/// A CSS combinator between two compound selectors.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Combinator {
+    Descendant,        // `A B`
+    Child,             // `A > B`
+    NextSibling,       // `A + B`
+    SubsequentSibling, // `A ~ B`
+}
+
+/// The previous element sibling of `node` (skipping text / comment nodes), if any.
+fn prev_element_sibling(doc: &dom::Document, node: dom::NodeId) -> Option<dom::NodeId> {
+    let parent = doc.get(node).parent?;
+    let siblings = &doc.get(parent).children;
+    let pos = siblings.iter().position(|&s| s == node)?;
+    siblings[..pos]
+        .iter()
+        .rev()
+        .find(|&&s| matches!(doc.get(s).data, dom::NodeData::Element(_)))
+        .copied()
+}
+
+/// Parse a complex selector into `(combinator-to-previous, compound)` pairs in source order. The
+/// first pair's combinator is `Descendant` (unused — it has no left neighbor).
+fn parse_complex(s: &str) -> Option<Vec<(Combinator, Compound)>> {
     let bytes: Vec<char> = s.chars().collect();
-    let mut segments: Vec<String> = Vec::new();
+    let mut segments: Vec<(Combinator, String)> = Vec::new();
     let mut cur = String::new();
+    let mut pending = Combinator::Descendant; // combinator preceding the next segment
     let mut i = 0;
     let mut bracket_depth = 0;
     while i < bytes.len() {
@@ -825,9 +849,16 @@ fn parse_complex(s: &str) -> Option<Vec<Compound>> {
         }
         if bracket_depth == 0 && (matches!(ch, '>' | '+' | '~') || ch.is_whitespace()) {
             if !cur.trim().is_empty() {
-                segments.push(std::mem::take(&mut cur));
+                segments.push((pending, std::mem::take(&mut cur)));
+                pending = Combinator::Descendant;
             } else {
                 cur.clear();
+            }
+            match ch {
+                '>' => pending = Combinator::Child,
+                '+' => pending = Combinator::NextSibling,
+                '~' => pending = Combinator::SubsequentSibling,
+                _ => {} // whitespace → descendant (unless an explicit combinator follows)
             }
             i += 1;
             continue;
@@ -836,9 +867,12 @@ fn parse_complex(s: &str) -> Option<Vec<Compound>> {
         i += 1;
     }
     if !cur.trim().is_empty() {
-        segments.push(cur);
+        segments.push((pending, cur));
     }
-    let parts: Vec<Compound> = segments.iter().filter_map(|s| parse_compound(s)).collect();
+    let parts: Vec<(Combinator, Compound)> = segments
+        .iter()
+        .filter_map(|(c, s)| parse_compound(s).map(|cp| (*c, cp)))
+        .collect();
     if parts.is_empty() {
         None
     } else {
@@ -846,40 +880,61 @@ fn parse_complex(s: &str) -> Option<Vec<Compound>> {
     }
 }
 
-/// Does `node` match the complex selector `chain`?
-fn matches_complex(doc: &dom::Document, node: dom::NodeId, chain: &[Compound]) -> bool {
-    if chain.is_empty() {
+/// Does `node` match the complex selector `chain` (matched right-to-left, with backtracking for the
+/// descendant and subsequent-sibling combinators)?
+fn matches_complex(doc: &dom::Document, node: dom::NodeId, chain: &[(Combinator, Compound)]) -> bool {
+    let n = chain.len();
+    if n == 0 {
         return false;
     }
-    let last = &chain[chain.len() - 1];
-    if !last.matches(doc, node) {
+    if !chain[n - 1].1.matches(doc, node) {
         return false;
     }
-    let mut remaining = &chain[..chain.len() - 1];
-    let mut cur = doc.get(node).parent;
-    while !remaining.is_empty() {
-        let want = &remaining[remaining.len() - 1];
-        match cur {
-            None => return false,
-            Some(p) => {
-                if want.matches(doc, p) {
-                    remaining = &remaining[..remaining.len() - 1];
+    if n == 1 {
+        return true;
+    }
+    // `chain[n-1].0` links `chain[n-2]` (left) to `chain[n-1]` (which matched `node`).
+    let rest = &chain[..n - 1];
+    match chain[n - 1].0 {
+        Combinator::Child => match doc.get(node).parent {
+            Some(p) => matches_complex(doc, p, rest),
+            None => false,
+        },
+        Combinator::NextSibling => match prev_element_sibling(doc, node) {
+            Some(prev) => matches_complex(doc, prev, rest),
+            None => false,
+        },
+        Combinator::Descendant => {
+            let mut cur = doc.get(node).parent;
+            while let Some(p) = cur {
+                if matches_complex(doc, p, rest) {
+                    return true;
                 }
                 cur = doc.get(p).parent;
             }
+            false
+        }
+        Combinator::SubsequentSibling => {
+            let mut cur = prev_element_sibling(doc, node);
+            while let Some(s) = cur {
+                if matches_complex(doc, s, rest) {
+                    return true;
+                }
+                cur = prev_element_sibling(doc, s);
+            }
+            false
         }
     }
-    true
 }
 
 /// Collect every node matching any of the comma-separated selector groups, document order.
 fn query_selector_all(doc: &dom::Document, sel: &str) -> Vec<dom::NodeId> {
-    let groups: Vec<Vec<Compound>> = sel.split(',').filter_map(parse_complex).collect();
+    let groups: Vec<Vec<(Combinator, Compound)>> = sel.split(',').filter_map(parse_complex).collect();
     if groups.is_empty() {
         return Vec::new();
     }
     let mut out = Vec::new();
-    fn walk(doc: &dom::Document, node: dom::NodeId, groups: &[Vec<Compound>], out: &mut Vec<dom::NodeId>) {
+    fn walk(doc: &dom::Document, node: dom::NodeId, groups: &[Vec<(Combinator, Compound)>], out: &mut Vec<dom::NodeId>) {
         if matches!(doc.get(node).data, dom::NodeData::Element(_))
             && groups.iter().any(|g| matches_complex(doc, node, g))
         {
@@ -896,12 +951,12 @@ fn query_selector_all(doc: &dom::Document, sel: &str) -> Vec<dom::NodeId> {
 
 /// Like [`query_selector_all`] but scoped to the subtree under `root` (excluding `root` itself).
 fn query_within(doc: &dom::Document, root: dom::NodeId, sel: &str) -> Vec<dom::NodeId> {
-    let groups: Vec<Vec<Compound>> = sel.split(',').filter_map(parse_complex).collect();
+    let groups: Vec<Vec<(Combinator, Compound)>> = sel.split(',').filter_map(parse_complex).collect();
     let mut out = Vec::new();
     if groups.is_empty() {
         return out;
     }
-    fn walk(doc: &dom::Document, node: dom::NodeId, groups: &[Vec<Compound>], out: &mut Vec<dom::NodeId>) {
+    fn walk(doc: &dom::Document, node: dom::NodeId, groups: &[Vec<(Combinator, Compound)>], out: &mut Vec<dom::NodeId>) {
         if matches!(doc.get(node).data, dom::NodeData::Element(_))
             && groups.iter().any(|g| matches_complex(doc, node, g))
         {
