@@ -10357,6 +10357,31 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           root.__hostSel = '[data-wpt-shadow-host="' + seq + '"]';
         } catch (e) {}
         try { installAdoptedStyleSheets(root, document); } catch (e) {}
+        // shadowRoot.styleSheets: the <style>/<link> sheets within the shadow tree, in tree order.
+        // Per CSSOM this is SEPARATE from adoptedStyleSheets (the adopted-sheets mirror is excluded).
+        Object.defineProperty(root, "styleSheets", {
+          get: function () {
+            var els = root.querySelectorAll("style, link");
+            var sheets = [];
+            for (var i = 0; i < els.length; i++) {
+              // querySelectorAll results aren't canonicalized, so enrich each (gives `.sheet`).
+              var el = (typeof globalThis.__canonNode === "function") ? globalThis.__canonNode(els[i]) : els[i];
+              var tag = (el.tagName || "").toLowerCase();
+              if (el.getAttribute && el.getAttribute("data-adopted-stylesheets") != null) { continue; }
+              if (tag === "link") {
+                var rel = (el.getAttribute && el.getAttribute("rel") || "").toLowerCase();
+                if (rel.split(/\s+/).indexOf("stylesheet") < 0) { continue; }
+                if (el.getAttribute && el.getAttribute("disabled") != null) { continue; }
+              }
+              if (el.__sheetDisabled) { continue; }
+              try { var s = el.sheet; if (s) { sheets.push(s); } } catch (e) {}
+            }
+            sheets.item = function (n) { n = n >>> 0; return n < this.length ? this[n] : null; };
+            try { if (globalThis.StyleSheetList && globalThis.StyleSheetList.prototype) { Object.setPrototypeOf(sheets, globalThis.StyleSheetList.prototype); } } catch (e) {}
+            return sheets;
+          },
+          enumerable: true, configurable: true
+        });
         this.__shadow = root;
         return root;
       });
