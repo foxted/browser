@@ -7846,6 +7846,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     list.__delete = function (index) {
       index = index >>> 0;
       if (index >= structs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
+      // CSSOM "remove a CSS rule": a @namespace rule may only be deleted when the sheet contains
+      // nothing but @import / @namespace rules; otherwise InvalidStateError.
+      if (structs[index].kind === "@namespace") {
+        for (var k = 0; k < structs.length; k++) {
+          if (structs[k].kind !== "@namespace" && structs[k].kind !== "@import") {
+            throw new globalThis.DOMException("Cannot delete a namespace rule when other rules are present.", "InvalidStateError");
+          }
+        }
+      }
       structs[index].__detached = true; // detach the removed rule (parentStyleSheet/Rule -> null)
       structs.splice(index, 1);
       rebuild(); markDirty(sheet);
