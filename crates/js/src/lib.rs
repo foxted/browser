@@ -10080,6 +10080,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         Object.defineProperty(__sp.prototype, "sheet", {
           get: function () {
             if (!this.__sheetHost) { return null; }
+            // A <style>/<link>'s sheet exists only once the element is inserted into a tree; a freshly
+            // created, never-appended element has no parent and thus no associated sheet (`.sheet` is
+            // null). (An element in an <iframe> facade subtree has a parent, so it keeps its sheet.)
+            try { if (this.parentNode == null) { return null; } } catch (e) {}
             if (!this.__sheetObj) { def(this, "__sheetObj", makeStyleSheet(this)); }
             return this.__sheetObj;
           },
