@@ -8661,6 +8661,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       registerProperty: function () {},
       px: function (n) { return { value: Number(n) || 0, unit: "px", toString: function () { return (Number(n) || 0) + "px"; } }; }
     };
+    // WebIDL namespace object: @@toStringTag is the namespace name, non-writable/non-enumerable/
+    // configurable — so `Object.prototype.toString.call(CSS) === "[object CSS]"`.
+    try { Object.defineProperty(CSSns, Symbol.toStringTag, { value: "CSS", writable: false, enumerable: false, configurable: true }); } catch (e) {}
     def(globalThis, "CSS", CSSns);
   }
 
