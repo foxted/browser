@@ -6446,12 +6446,23 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     list.__rebuild = rebuild;
     list.__structs = structs;
     list.__insert = function (text, index) {
-      var newStructs = parseRuleStructs(text);
-      if (newStructs.length !== 1) { throw new globalThis.DOMException("Invalid rule", "SyntaxError"); }
       if (index === undefined) { index = 0; }
       index = index >>> 0;
+      // Per CSSOM "insert a CSS rule": index range is checked BEFORE parsing.
       if (index > structs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
-      structs.splice(index, 0, newStructs[0]);
+      // Parse — must be exactly one syntactically valid rule. A bare prelude with no "{" (e.g. "???")
+      // parses to a "style" struct but is NOT a rule, so reject it.
+      var newStructs = parseRuleStructs(text);
+      var st = newStructs[0];
+      if (newStructs.length !== 1 || (st.kind === "style" && String(text).indexOf("{") < 0)) {
+        throw new globalThis.DOMException("Failed to parse the rule", "SyntaxError");
+      }
+      // A grouping rule (CSSMediaRule/Supports/Container, parentRule set) cannot contain @import /
+      // @namespace / @charset — those are stylesheet-level only.
+      if (parentRule && (st.kind === "@import" || st.kind === "@namespace" || st.kind === "@charset")) {
+        throw new globalThis.DOMException("Cannot insert this rule into a grouping rule", "HierarchyRequestError");
+      }
+      structs.splice(index, 0, st);
       rebuild(); markDirty(sheet);
       return index;
     };
