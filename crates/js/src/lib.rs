@@ -9808,7 +9808,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       for (var i = 0; i < backing.length; i++) {
         var sh = backing[i];
         if (!sh || sh.disabled) { continue; }
-        try { s += (s ? "\n" : "") + sh.cssText; } catch (e) {}
+        try {
+          var t = sh.cssText;
+          // For a shadow root, rewrite `:host`/`:host(X)` to target the host element (the mirror is a
+          // global <style>, where `:host` matches nothing). `host.__hostSel` is the host's marker.
+          if (host && host.__hostSel) { t = t.replace(/:host\(([^)]*)\)/g, host.__hostSel + "$1").replace(/:host\b/g, host.__hostSel); }
+          s += (s ? "\n" : "") + t;
+        } catch (e) {}
       }
       return s;
     }
@@ -9929,6 +9935,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         try { __appendChild(this.__node, root.__node); } catch (e) {}
         root.host = this;
         root.mode = (init && init.mode) || "open";
+        // Mark the host so an adopted sheet's `:host` rules can target it from the global mirror.
+        try {
+          var seq = (globalThis.__shadowHostSeq = (globalThis.__shadowHostSeq || 0) + 1);
+          this.setAttribute("data-wpt-shadow-host", String(seq));
+          root.__hostSel = '[data-wpt-shadow-host="' + seq + '"]';
+        } catch (e) {}
         try { installAdoptedStyleSheets(root, document); } catch (e) {}
         this.__shadow = root;
         return root;
