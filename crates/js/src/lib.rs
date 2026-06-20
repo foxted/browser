@@ -2323,6 +2323,132 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
 
   var NODE = "__node";
 
+  // --- DOM namespace / case metadata ----------------------------------------------------------
+  // The Rust arena stores only a lowercased `tag` string per element, which loses the namespace,
+  // the prefix, and the original case that `createElementNS` must remember. We keep that extra
+  // metadata in a JS-side map keyed by the node id (mirroring how other per-node JS state is kept).
+  // Elements parsed from HTML source (no entry here) default to the HTML namespace, a lowercased
+  // localName, an uppercase tagName, and a null prefix.
+  var HTML_NS = "http://www.w3.org/1999/xhtml";
+  var XML_NS = "http://www.w3.org/XML/1998/namespace";
+  var XMLNS_NS = "http://www.w3.org/2000/xmlns/";
+  var __nsMeta = {}; // id -> { namespaceURI, prefix, localName, qualifiedName, isHTML }
+
+  function asciiLower(s) {
+    return String(s).replace(/[A-Z]/g, function (c) { return c.toLowerCase(); });
+  }
+  function asciiUpper(s) {
+    return String(s).replace(/[a-z]/g, function (c) { return c.toUpperCase(); });
+  }
+
+  // XML `Name` / `QName` validation. Matches the behaviour browsers (and the WPT suite) actually
+  // implement, which is more lenient than the strict XML grammar: a NameStartChar is an ASCII
+  // letter / underscore or any non-ASCII codepoint (>= U+0080); a NameChar additionally allows
+  // digits, '-' and '.', and in fact any character that is not whitespace or '>' (so '<', '}', and
+  // lone surrogates are accepted mid-name). The ':' separates a prefix from a local name.
+  function isNameStartChar(cc) {
+    return (cc >= 0x41 && cc <= 0x5A) || (cc >= 0x61 && cc <= 0x7A) || cc === 0x5F || cc >= 0x80;
+  }
+  function isNameChar(cc) {
+    if (isNameStartChar(cc)) { return true; }
+    if (cc >= 0x30 && cc <= 0x39) { return true; }      // 0-9
+    if (cc === 0x2D || cc === 0x2E) { return true; }    // - .
+    // Lenient: any non-whitespace, non-'>' character is accepted mid-name.
+    if (cc === 0x3E) { return false; }                  // '>'
+    if (cc === 0x20 || cc === 0x09 || cc === 0x0A || cc === 0x0C || cc === 0x0D) { return false; }
+    return true;
+  }
+  // A valid "Name" (colons permitted as NameChar when allowColon): NameStartChar NameChar*.
+  function isValidNameImpl(s, allowColon) {
+    if (s.length === 0) { return false; }
+    if (!isNameStartChar(s.charCodeAt(0))) { return false; }
+    for (var i = 1; i < s.length; i++) {
+      var cc = s.charCodeAt(i);
+      if (cc === 0x3A) { if (!allowColon) { return false; } continue; }
+      if (!isNameChar(cc)) { return false; }
+    }
+    return true;
+  }
+  function isValidName(s) { return isValidNameImpl(s, false); }
+
+  function invalidCharacterError() {
+    throw new globalThis.DOMException("The string contains invalid characters.", "InvalidCharacterError");
+  }
+  function namespaceError() {
+    throw new globalThis.DOMException("The namespace is not valid.", "NamespaceError");
+  }
+
+  // "validate and extract" (DOM standard): given a namespace + qualifiedName, validate the QName and
+  // split it into [namespace, prefix, localName], enforcing the xml/xmlns special cases.
+  function validateAndExtract(ns, qualifiedName) {
+    ns = (ns === undefined || ns === null || ns === "") ? null : String(ns);
+    var qname = String(qualifiedName);
+    var prefix = null;
+    var localName = qname;
+    var ci = qname.indexOf(":");
+    if (ci >= 0) {
+      prefix = qname.slice(0, ci);
+      localName = qname.slice(ci + 1);
+      // Prefix must be a non-empty colon-free Name; the local name (everything after the first
+      // colon) is validated as a Name that may itself contain further colons.
+      if (prefix.length === 0 || !isValidNameImpl(prefix, false)) { invalidCharacterError(); }
+      if (localName.length === 0 || !isValidNameImpl(localName, true)) { invalidCharacterError(); }
+    } else {
+      if (!isValidNameImpl(qname, false)) { invalidCharacterError(); }
+    }
+    if (prefix !== null && ns === null) { namespaceError(); }
+    if (prefix === "xml" && ns !== XML_NS) { namespaceError(); }
+    if ((qname === "xmlns" || prefix === "xmlns") && ns !== XMLNS_NS) { namespaceError(); }
+    if (ns === XMLNS_NS && qname !== "xmlns" && prefix !== "xmlns") { namespaceError(); }
+    return { namespace: ns, prefix: prefix, localName: localName };
+  }
+
+  // The qualified name of an element id (prefix:localName, or localName), honouring metadata.
+  function elQualifiedName(eid) {
+    var m = __nsMeta[eid];
+    if (m) { return m.qualifiedName; }
+    return __tag(eid); // parsed HTML: arena tag is the lowercased qualified name
+  }
+  function elNamespace(eid) {
+    var m = __nsMeta[eid];
+    if (m) { return m.namespaceURI; }
+    return __nodeType(eid) === 1 ? HTML_NS : null;
+  }
+  function elLocalName(eid) {
+    var m = __nsMeta[eid];
+    if (m) { return m.localName; }
+    return __tag(eid);
+  }
+  // getElementsByTagName matcher, per the DOM standard (HTML document branch). qualifiedName "*"
+  // matches all; HTML-namespace elements match their lowercased qualified name; other namespaces
+  // match the qualified name exactly.
+  function matchesTagName(eid, qualifiedName) {
+    if (qualifiedName === "*") { return true; }
+    var qn = elQualifiedName(eid);
+    // HTML-namespace elements compare their (as-stored) qualified name against the lowercased
+    // search string; other namespaces compare the qualified name exactly.
+    if (elNamespace(eid) === HTML_NS) {
+      return qn === asciiLower(qualifiedName);
+    }
+    return qn === qualifiedName;
+  }
+  function matchesTagNameNS(eid, ns, localName) {
+    if (ns !== "*" && elNamespace(eid) !== (ns === "" ? null : ns)) { return false; }
+    if (localName !== "*" && elLocalName(eid) !== localName) { return false; }
+    return true;
+  }
+  // Collect element-node descendants of `rootId` (excluding root) in tree order, matched by `pred`.
+  function collectDescendants(rootId, pred) {
+    var out = [];
+    function visit(nid, isRoot) {
+      if (!isRoot && __nodeType(nid) === 1 && pred(nid)) { out.push(wrap(nid)); }
+      var kids = __children(nid);
+      for (var i = 0; i < kids.length; i++) { visit(kids[i], false); }
+    }
+    visit(rootId, true);
+    return out;
+  }
+
   // Build a fresh element wrapper object for a node id. Carries `__node` plus accessors/methods
   // that delegate to the native primitives. Returns null for id === -1.
   function wrap(id) {
@@ -2332,13 +2458,38 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
 
     function uc(s) { return String(s == null ? "" : s).toUpperCase(); }
 
-    Object.defineProperty(el, "tagName", { get: function () { return uc(__tag(id)); }, enumerable: true, configurable: true });
+    // tagName resolution, honouring createElementNS metadata. HTML-namespace elements uppercase
+    // their tagName; other namespaces preserve the qualifiedName exactly as given. Parsed elements
+    // (no metadata) are HTML by default → uppercase of the lowercased arena tag.
+    function elTagName() {
+      var m = __nsMeta[id];
+      if (m) {
+        if (m.isHTML) { return asciiUpper(m.qualifiedName); }
+        return m.qualifiedName;
+      }
+      return uc(__tag(id));
+    }
+    Object.defineProperty(el, "tagName", { get: elTagName, enumerable: true, configurable: true });
     Object.defineProperty(el, "nodeName", { get: function () {
       var t = __nodeType(id);
       if (t === 3) { return "#text"; }
       if (t === 8) { return "#comment"; }
       if (t === 9) { return "#document"; }
-      return uc(__tag(id));
+      return elTagName();
+    }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "namespaceURI", { get: function () {
+      var m = __nsMeta[id];
+      if (m) { return m.namespaceURI; }
+      return __nodeType(id) === 1 ? HTML_NS : null;
+    }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "prefix", { get: function () {
+      var m = __nsMeta[id];
+      return m ? m.prefix : null;
+    }, enumerable: true, configurable: true });
+    Object.defineProperty(el, "localName", { get: function () {
+      var m = __nsMeta[id];
+      if (m) { return m.localName; }
+      return __nodeType(id) === 1 ? __tag(id) : null;
     }, enumerable: true, configurable: true });
     Object.defineProperty(el, "nodeType", { get: function () { return __nodeType(id); }, enumerable: true, configurable: true });
 
@@ -2379,16 +2530,78 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       enumerable: true, configurable: true
     });
 
+    // Per-element attribute namespace metadata: keyed by the qualified-name storage key, holds
+    // { namespaceURI, prefix, localName } so getAttributeNS / Attr.localName reflect correctly.
+    function elIsHtml() {
+      var m = __nsMeta[id];
+      return m ? m.isHTML : (__nodeType(id) === 1);
+    }
     def(el, "getAttribute", function (name) { return __getAttr(id, String(name)); });
-    def(el, "setAttribute", function (name, value) { __setAttr(id, String(name), value == null ? "" : String(value)); });
-    def(el, "removeAttribute", function (name) { __removeAttr(id, String(name)); });
-    def(el, "hasAttribute", function (name) { return __getAttr(id, String(name)) != null; });
+    def(el, "setAttribute", function (name, value) {
+      // HTML elements ASCII-lowercase the attribute's qualified name.
+      var nm = String(name);
+      if (elIsHtml()) { nm = asciiLower(nm); }
+      __setAttr(id, nm, value == null ? "" : String(value));
+    });
+    def(el, "removeAttribute", function (name) {
+      var nm = String(name);
+      if (elIsHtml()) { nm = asciiLower(nm); }
+      __removeAttr(id, nm); delete __attrNs[nm];
+    });
+    def(el, "hasAttribute", function (name) {
+      var nm = String(name);
+      if (elIsHtml()) { nm = asciiLower(nm); }
+      return __getAttr(id, nm) != null;
+    });
     def(el, "getAttributeNames", function () { return __attrNames(id); });
+
+    // Namespaced attribute accessors. The arena keys attrs by their qualified name; we keep the
+    // namespace/prefix/localName split in __attrNs so getAttributeNS and Attr reflection work.
+    var __attrNs = {};
+    def(el, "setAttributeNS", function (ns, qualifiedName, value) {
+      var ex = validateAndExtract(ns, qualifiedName);
+      var key = String(qualifiedName);
+      __setAttr(id, key, value == null ? "" : String(value));
+      __attrNs[key] = { namespaceURI: ex.namespace, prefix: ex.prefix, localName: ex.localName };
+    });
+    def(el, "getAttributeNS", function (ns, localName) {
+      var want = (ns === undefined || ns === null || ns === "") ? null : String(ns);
+      var ln = String(localName);
+      var names = __attrNames(id);
+      for (var i = 0; i < names.length; i++) {
+        var k = names[i];
+        var meta = __attrNs[k];
+        var kNs = meta ? meta.namespaceURI : null;
+        var kLocal = meta ? meta.localName : k;
+        if (kNs === want && kLocal === ln) { return __getAttr(id, k); }
+      }
+      return null;
+    });
+    def(el, "hasAttributeNS", function (ns, localName) {
+      return el.getAttributeNS(ns, localName) != null;
+    });
+    def(el, "removeAttributeNS", function (ns, localName) {
+      var want = (ns === undefined || ns === null || ns === "") ? null : String(ns);
+      var ln = String(localName);
+      var names = __attrNames(id);
+      for (var i = 0; i < names.length; i++) {
+        var k = names[i];
+        var meta = __attrNs[k];
+        var kNs = meta ? meta.namespaceURI : null;
+        var kLocal = meta ? meta.localName : k;
+        if (kNs === want && kLocal === ln) { __removeAttr(id, k); delete __attrNs[k]; return; }
+      }
+    });
+
     // A LIVE NamedNodeMap: React (and others) do `for (var a = el.attributes; a.length;)
     // el.removeAttributeNode(a[0])`, capturing the map once and relying on removals shrinking it —
     // so length/index must re-query the node each access (a static snapshot would infinite-loop).
     var makeAttr = function (attrName) {
-      return { name: attrName, localName: attrName, nodeName: attrName, nodeType: 2,
+      var meta = __attrNs[attrName];
+      return { name: attrName, nodeName: attrName, nodeType: 2,
+               namespaceURI: meta ? meta.namespaceURI : null,
+               prefix: meta ? meta.prefix : null,
+               localName: meta ? meta.localName : attrName,
                specified: true, ownerElement: el,
                get value() { return __getAttr(id, attrName); },
                set value(v) { __setAttr(id, attrName, v == null ? "" : String(v)); } };
@@ -2504,7 +2717,15 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
 
     def(el, "querySelector", function (sel) { var r = __querySelectorAllWithin(id, String(sel)); return r.length ? wrap(r[0]) : null; });
     def(el, "querySelectorAll", function (sel) { return __querySelectorAllWithin(id, String(sel)).map(wrap); });
-    def(el, "getElementsByTagName", function (tag) { return __getElementsByTagNameWithin(id, String(tag)).map(wrap); });
+    def(el, "getElementsByTagName", function (tag) {
+      var qn = String(tag);
+      return collectDescendants(id, function (eid) { return matchesTagName(eid, qn); });
+    });
+    def(el, "getElementsByTagNameNS", function (ns, localName) {
+      var n = (ns === "*" || ns == null) ? "*" : String(ns);
+      var ln = (localName === "*" || localName == null) ? "*" : String(localName);
+      return collectDescendants(id, function (eid) { return matchesTagNameNS(eid, n, ln); });
+    });
     def(el, "getElementsByClassName", function (cls) {
       // Scope getElementsByClassName by filtering the global result to descendants of `id`.
       var wanted = String(cls).split(/\s+/).filter(Boolean);
@@ -2574,11 +2795,110 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   // --- document --------------------------------------------------------------------------------
   var document = {};
   def(document, "getElementById", function (idStr) { var n = __getElementById(String(idStr)); return n >= 0 ? wrap(n) : null; });
-  def(document, "getElementsByTagName", function (tag) { return __getElementsByTagName(String(tag)).map(wrap); });
+  def(document, "getElementsByTagName", function (tag) {
+    var qn = String(tag);
+    return collectDescendants(0, function (eid) { return matchesTagName(eid, qn); });
+  });
   def(document, "getElementsByClassName", function (cls) { return __getElementsByClassName(String(cls)).map(wrap); });
   def(document, "querySelector", function (sel) { var r = __querySelectorAll(String(sel)); return r.length ? wrap(r[0]) : null; });
   def(document, "querySelectorAll", function (sel) { return __querySelectorAll(String(sel)).map(wrap); });
-  def(document, "createElement", function (tag) { return wrap(__createElement(String(tag))); });
+  def(document, "createElement", function (tag) {
+    // HTML document: validate the name as an XML Name, then ASCII-lowercase it. namespaceURI is the
+    // HTML namespace, prefix null, localName the lowercased name, tagName the uppercased localName.
+    var name = String(tag);
+    // createElement validates the name as an XML Name (colons permitted), without splitting it
+    // into prefix/localName. HTML documents then ASCII-lowercase the whole name.
+    if (!isValidNameImpl(name, true)) { invalidCharacterError(); }
+    var local = asciiLower(name);
+    var id = __createElement(local);
+    __nsMeta[id] = { namespaceURI: HTML_NS, prefix: null, localName: local, qualifiedName: local, isHTML: true };
+    return wrap(id);
+  });
+  def(document, "createElementNS", function (ns, qualifiedName) {
+    var ex = validateAndExtract(ns, qualifiedName);
+    var isHTML = ex.namespace === HTML_NS;
+    // The arena tag is the local name (lowercased only when HTML, to match parser behaviour).
+    var arenaTag = isHTML ? asciiLower(ex.localName) : ex.localName;
+    var id = __createElement(arenaTag);
+    __nsMeta[id] = {
+      namespaceURI: ex.namespace,
+      prefix: ex.prefix,
+      localName: ex.localName,
+      qualifiedName: String(qualifiedName),
+      isHTML: isHTML
+    };
+    return wrap(id);
+  });
+  // createAttribute / createAttributeNS return an Attr node (not arena-backed) with the correct
+  // name/localName/namespaceURI/prefix/value reflection.
+  function makeAttrNode(namespaceURI, prefix, localName, qualifiedName) {
+    var value = "";
+    var attr = {
+      nodeType: 2,
+      namespaceURI: namespaceURI,
+      prefix: prefix,
+      localName: localName,
+      name: qualifiedName,
+      nodeName: qualifiedName,
+      specified: true,
+      ownerElement: null
+    };
+    Object.defineProperty(attr, "value", {
+      get: function () { return value; },
+      set: function (v) { value = v == null ? "" : String(v); },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(attr, "nodeValue", {
+      get: function () { return value; },
+      set: function (v) { value = v == null ? "" : String(v); },
+      enumerable: true, configurable: true
+    });
+    Object.defineProperty(attr, "textContent", {
+      get: function () { return value; },
+      set: function (v) { value = v == null ? "" : String(v); },
+      enumerable: true, configurable: true
+    });
+    return attr;
+  }
+  def(document, "createAttribute", function (localName) {
+    // HTML document: validate (only the empty name is rejected here, matching browser behaviour)
+    // then ASCII-lowercase. namespaceURI/prefix null.
+    var name = String(localName);
+    if (name.length === 0) { invalidCharacterError(); }
+    var local = asciiLower(name);
+    return makeAttrNode(null, null, local, local);
+  });
+  def(document, "createAttributeNS", function (ns, qualifiedName) {
+    var ex = validateAndExtract(ns, qualifiedName);
+    return makeAttrNode(ex.namespace, ex.prefix, ex.localName, String(qualifiedName));
+  });
+  // Expose the Attr factory + the validation helpers so the off-document (XML) document objects
+  // built by document.implementation.createDocument can offer case-preserving createAttribute.
+  def(globalThis, "__makeAttrNode", makeAttrNode);
+  def(globalThis, "__validateAndExtractName", validateAndExtract);
+  def(globalThis, "__invalidCharacterError", invalidCharacterError);
+  // Create an element carrying explicit namespace metadata (used by XML-flavoured documents from
+  // document.implementation.createDocument, whose createElement does NOT lowercase or assign the
+  // HTML namespace). htmlNs => HTML-namespace semantics (lowercase + uppercase tagName).
+  def(globalThis, "__createElementWithNs", function (namespaceURI, name) {
+    var nm = String(name);
+    if (!isValidNameImpl(nm, true)) { invalidCharacterError(); }
+    var isHtml = namespaceURI === HTML_NS;
+    var local = isHtml ? asciiLower(nm) : nm;
+    var id = __createElement(local);
+    __nsMeta[id] = {
+      namespaceURI: (namespaceURI === undefined || namespaceURI === null || namespaceURI === "") ? null : String(namespaceURI),
+      prefix: null, localName: local, qualifiedName: local, isHTML: isHtml
+    };
+    return wrap(id);
+  });
+  // getElementsByTagNameNS(namespace, localName): all descendant elements matching namespace
+  // (or "*") and localName (or "*"). Returned as a plain array snapshot.
+  def(document, "getElementsByTagNameNS", function (namespace, localName) {
+    var ns = (namespace === "*" || namespace == null) ? "*" : String(namespace);
+    var ln = (localName === "*" || localName == null) ? "*" : String(localName);
+    return collectDescendants(0, function (eid) { return matchesTagNameNS(eid, ns, ln); });
+  });
   // Node-id-keyed attribute helpers the browser-env bootstrap uses for style/classList/dataset.
   def(document, "__getAttr", function (node, name) { return __getAttr(node, String(name)); });
   def(document, "__setAttr", function (node, name, value) { __setAttr(node, String(name), value == null ? "" : String(value)); });
@@ -4043,8 +4363,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     });
   }
   wrapReturningElement(document, "createElement");
+  wrapReturningElement(document, "createElementNS");
   wrapReturningElement(document, "getElementById");
   wrapReturningElement(document, "getElementsByTagName");
+  wrapReturningElement(document, "getElementsByTagNameNS");
   wrapReturningElement(document, "getElementsByClassName");
   wrapReturningElement(document, "querySelector");
   wrapReturningElement(document, "querySelectorAll");
@@ -4128,6 +4450,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           nodeType: 9, documentElement: htmlEl, head: headEl, body: bodyEl, title: title ? String(title) : "",
           createElement: function (tag) { return document.createElement(tag); },
           createElementNS: function (ns, tag) { return document.createElementNS ? document.createElementNS(ns, tag) : document.createElement(tag); },
+          createAttribute: function (name) {
+            var nm = String(name);
+            if (nm.length === 0) { globalThis.__invalidCharacterError(); }
+            return globalThis.__makeAttrNode(null, null, nm.toLowerCase(), nm.toLowerCase());
+          },
+          createAttributeNS: function (ns, qn) {
+            var ex = globalThis.__validateAndExtractName(ns, qn);
+            return globalThis.__makeAttrNode(ex.namespace, ex.prefix, ex.localName, String(qn));
+          },
           createTextNode: function (s) { return document.createTextNode(s); },
           createComment: function (s) { return document.createComment(s); },
           createDocumentFragment: function () { return document.createDocumentFragment(); },
@@ -4138,7 +4469,21 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           getElementsByTagName: function (t) { return htmlEl.getElementsByTagName ? htmlEl.getElementsByTagName(t) : []; },
         };
       },
-      createDocument: function () { return this.createHTMLDocument(""); },
+      createDocument: function (namespace) {
+        // An XML document: like createHTMLDocument but case-preserving for createAttribute, and
+        // createElement assigns the null namespace (the HTML namespace only when the document's own
+        // namespace is the HTML namespace, i.e. an application/xhtml+xml document).
+        var d = this.createHTMLDocument("");
+        var docNs = (namespace === undefined || namespace === null || namespace === "") ? null : String(namespace);
+        var elNs = docNs === "http://www.w3.org/1999/xhtml" ? docNs : null;
+        d.createElement = function (name) { return globalThis.__createElementWithNs(elNs, name); };
+        d.createAttribute = function (name) {
+          var nm = String(name);
+          if (nm.length === 0) { globalThis.__invalidCharacterError(); }
+          return globalThis.__makeAttrNode(null, null, nm, nm);
+        };
+        return d;
+      },
     });
   }
   if (typeof document.getElementsByName !== "function") {
@@ -4444,7 +4789,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
 
   // --- a few more constructors pages feature-detect ----------------------------------------
   if (typeof globalThis.DOMParser !== "function") {
-    def(globalThis, "DOMParser", function () { this.parseFromString = function () { return document; }; });
+    def(globalThis, "DOMParser", function () {
+      this.parseFromString = function (str, type) {
+        var t = String(type || "").toLowerCase();
+        // text/html parses as an HTML document (HTML namespace); XML flavours produce an XML
+        // document whose createElement assigns the null namespace.
+        if (t === "text/html") { return document; }
+        if (document.implementation && typeof document.implementation.createDocument === "function") {
+          // XHTML documents are in the HTML namespace; other XML flavours use the null namespace.
+          var ns = (t === "application/xhtml+xml") ? "http://www.w3.org/1999/xhtml" : null;
+          return document.implementation.createDocument(ns, "", null);
+        }
+        return document;
+      };
+    });
   }
   if (typeof globalThis.IntersectionObserverEntry !== "function") { def(globalThis, "IntersectionObserverEntry", function () {}); }
   if (typeof globalThis.MutationRecord !== "function") { def(globalThis, "MutationRecord", function () {}); }
@@ -4465,9 +4823,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return ctor;
   }
   var NodeCtor = defClass("Node");
-  NodeCtor.ELEMENT_NODE = 1; NodeCtor.ATTRIBUTE_NODE = 2; NodeCtor.TEXT_NODE = 3;
-  NodeCtor.CDATA_SECTION_NODE = 4; NodeCtor.PROCESSING_INSTRUCTION_NODE = 7; NodeCtor.COMMENT_NODE = 8;
-  NodeCtor.DOCUMENT_NODE = 9; NodeCtor.DOCUMENT_TYPE_NODE = 10; NodeCtor.DOCUMENT_FRAGMENT_NODE = 11;
+  // Node type constants live on both the constructor and the prototype, so `Node.ELEMENT_NODE` and
+  // `someNode.ELEMENT_NODE` (instance access, used by WPT) both resolve.
+  (function (proto) {
+    var consts = {
+      ELEMENT_NODE: 1, ATTRIBUTE_NODE: 2, TEXT_NODE: 3, CDATA_SECTION_NODE: 4,
+      ENTITY_REFERENCE_NODE: 5, ENTITY_NODE: 6, PROCESSING_INSTRUCTION_NODE: 7, COMMENT_NODE: 8,
+      DOCUMENT_NODE: 9, DOCUMENT_TYPE_NODE: 10, DOCUMENT_FRAGMENT_NODE: 11, NOTATION_NODE: 12
+    };
+    for (var k in consts) {
+      NodeCtor[k] = consts[k];
+      if (proto) { try { def(proto, k, consts[k]); } catch (e) {} }
+    }
+  })(NodeCtor.prototype);
   defClass("EventTarget");
   defClass("CharacterData", NodeCtor);
   defClass("Text", globalThis.CharacterData);
@@ -7769,6 +8137,145 @@ mod tests {
         assert_eq!(out[0].value.as_deref(), Some(r#"<span class="hi">x</span>"#));
     }
 
+    // --- createElement / createElementNS / createAttribute / namespaces ------------------
+
+    #[test]
+    fn create_element_lowercases_and_uppercases_tagname() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var e = document.createElement("DiV");
+                    [e.localName, e.tagName, e.nodeName, e.prefix, e.namespaceURI].join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("div|DIV|DIV||http://www.w3.org/1999/xhtml")
+        );
+    }
+
+    #[test]
+    fn create_element_invalid_name_throws_invalid_character_error() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var name="", code=null, isDom=false;
+                    try { document.createElement("1foo"); }
+                    catch (e) { name=e.name; code=e.code; isDom=(e instanceof DOMException); }
+                    [name, code, isDom].join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("InvalidCharacterError|5|true"));
+    }
+
+    #[test]
+    fn create_element_ns_records_namespace_prefix_localname_and_preserves_case() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var e = document.createElementNS("http://www.w3.org/2000/svg", "svg:Rect");
+                    [e.namespaceURI, e.prefix, e.localName, e.tagName, e.nodeName].join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // Non-HTML namespace preserves the qualifiedName case for tagName/nodeName.
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("http://www.w3.org/2000/svg|svg|Rect|svg:Rect|svg:Rect")
+        );
+    }
+
+    #[test]
+    fn create_element_ns_prefix_without_namespace_throws_namespace_error() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var name=null, code=null;
+                    try { document.createElementNS(null, "p:foo"); }
+                    catch (e) { name=e.name; code=e.code; }
+                    [name, code].join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("NamespaceError|14"));
+    }
+
+    #[test]
+    fn create_attribute_lowercases_in_html_document() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var a = document.createAttribute("Foo");
+                    [a.name, a.localName, a.value, a.nodeName, a.namespaceURI, a.prefix].join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("foo|foo||foo||"));
+    }
+
+    #[test]
+    fn get_elements_by_tag_name_ns_matches_namespace_and_localname() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var svg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+                    var html = document.createElement("rect");
+                    document.body.appendChild(svg);
+                    document.body.appendChild(html);
+                    var svgMatches = document.getElementsByTagNameNS("http://www.w3.org/2000/svg", "rect");
+                    var starMatches = document.getElementsByTagNameNS("*", "rect");
+                    [svgMatches.length, svgMatches[0].namespaceURI, starMatches.length].join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("1|http://www.w3.org/2000/svg|2")
+        );
+    }
+
+    #[test]
+    fn parsed_html_element_reports_html_namespace_and_case() {
+        // Elements that came from parsed HTML (no createElement metadata) still report the HTML
+        // namespace, a lowercase localName and an uppercase tagName.
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var b = document.body;
+                    [b.namespaceURI, b.localName, b.tagName, b.prefix].join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some("http://www.w3.org/1999/xhtml|body|BODY|")
+        );
+    }
+
+    #[test]
+    fn set_attribute_lowercases_name_on_html_element() {
+        let (doc, _) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"var d = document.createElement("div");
+                    d.setAttribute("DATA-X", "1");
+                    [d.attributes[0].localName, d.getAttribute("data-x")].join("|")"#
+                .to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("data-x|1"));
+    }
+
     #[test]
     fn window_self_globalthis_are_aliased_objects() {
         let (doc, _) = doc_with_body("");
@@ -9544,11 +10051,12 @@ mod tests {
              var el = document.createElementNS(ns, 'svg:path'); \
              el.setAttribute('d', 'M0 0'); \
              document.body.appendChild(el); \
-             [el.tagName.toLowerCase(), el.namespaceURI === ns, \
+             [el.tagName.toLowerCase(), el.namespaceURI === ns, el.localName, \
               typeof el.appendChild, document.body.lastChild === el].join('|')",
         );
         assert_eq!(out.error, None, "{out:?}");
-        assert_eq!(out.value.as_deref(), Some("path|true|function|true"));
+        // tagName preserves the given qualifiedName (non-HTML namespace); localName drops the prefix.
+        assert_eq!(out.value.as_deref(), Some("svg:path|true|path|function|true"));
     }
 
     // --- persistent Session ------------------------------------------------------------------
