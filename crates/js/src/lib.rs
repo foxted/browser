@@ -11136,6 +11136,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         } catch (e) { return false; }
       },
       escape: function (value) {
+        if (arguments.length < 1) { throw new TypeError("Failed to execute 'escape' on 'CSS': 1 argument required, but only 0 present."); }
         // CSSOM "serialize an identifier" (https://drafts.csswg.org/cssom/#serialize-an-identifier).
         var s = String(value), out = "";
         var len = s.length;
