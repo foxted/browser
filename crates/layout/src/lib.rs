@@ -213,6 +213,13 @@ pub struct LayoutBox {
     pub node: Option<dom::NodeId>,
     pub style: PaintStyle,
     pub children: Vec<LayoutBox>,
+    /// The CSSOM *used* values of the inset properties `[top, right, bottom, left]` (px), filled in
+    /// for positioned boxes (relative / absolute / fixed / sticky) once their containing block is
+    /// known. `getComputedStyle(el).top` etc. return these when the element has a box. `None` for
+    /// non-positioned / box-less elements (where the computed value is reported instead). Each side
+    /// is the offset from the containing block edge to the box's margin-box edge — including the
+    /// static-position fallback when both opposite insets are `auto`.
+    pub used_insets: Option<[f32; 4]>,
 }
 
 impl LayoutBox {
@@ -223,6 +230,7 @@ impl LayoutBox {
             node,
             style,
             children: Vec::new(),
+            used_insets: None,
         }
     }
 }
@@ -1547,13 +1555,17 @@ fn resolve_out_of_flow(
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
 ) {
+    // The out-of-flow box's static position (used for the resolved value when both opposite insets
+    // are `auto`) is its hypothetical in-flow origin — approximated by this parent's content-box
+    // top-left. Captured before the loop so each child sees the same parent content rect.
+    let parent_content = boxx.dimensions.content;
     for child in &mut boxx.children {
         match position_of(child, styles) {
             style::Position::Absolute => {
-                layout_out_of_flow(child, ctx.positioned, ctx, styles, measurer)
+                layout_out_of_flow(child, ctx.positioned, parent_content, ctx, styles, measurer)
             }
             style::Position::Fixed => {
-                layout_out_of_flow(child, ctx.viewport, ctx, styles, measurer)
+                layout_out_of_flow(child, ctx.viewport, parent_content, ctx, styles, measurer)
             }
             _ => {}
         }
@@ -1566,6 +1578,7 @@ fn resolve_out_of_flow(
 fn layout_out_of_flow(
     boxx: &mut LayoutBox,
     cb: Rect,
+    parent_content: Rect,
     ctx: Ctx,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
     measurer: &dyn TextMeasurer,
@@ -1663,6 +1676,22 @@ fn layout_out_of_flow(
         }
     }
     // Similarly for `right` with no `left` already handled above for x.
+
+    // Record the CSSOM *used* inset values. For each axis, a set side resolves to the offset from
+    // the containing block edge to the box's margin-box edge; when BOTH opposite sides are `auto`
+    // the box sits at its static position, so the used value is measured from the static origin
+    // (the parent's content-box top-left) instead of the laid-out (cb-origin) position.
+    let mb = boxx.dimensions.margin_box();
+    let (vert_auto, horiz_auto) =
+        ((cs.top.is_none() && cs.bottom.is_none()), (cs.left.is_none() && cs.right.is_none()));
+    // Vertical: margin-box top relative to cb top (or static origin when both auto).
+    let mb_top = if vert_auto { parent_content.y } else { mb.y };
+    let mb_left = if horiz_auto { parent_content.x } else { mb.x };
+    let used_top = mb_top - cb.y;
+    let used_left = mb_left - cb.x;
+    let used_bottom = (cb.y + cb.height) - (mb_top + mb.height);
+    let used_right = (cb.x + cb.width) - (mb_left + mb.width);
+    boxx.used_insets = Some([used_top, used_right, used_bottom, used_left]);
 
     // Recompute the containing block for nested absolutes now that this box's height (and any
     // `bottom` re-anchor shift) is final.

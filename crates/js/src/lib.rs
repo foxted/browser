@@ -172,6 +172,11 @@ struct HostState {
     /// `getBoundingClientRect` / `offsetWidth` / `scrollHeight` etc. The engine recomputes layout;
     /// the worker only serves what was pushed (it cannot reach the engine's layout from here).
     layout_rects: RefCell<HashMap<usize, (f32, f32, f32, f32)>>,
+    /// CSSOM *used* inset values per positioned box, keyed by node id, pushed by the engine
+    /// alongside `layout_rects`. `(top, right, bottom, left)` in CSS px. Read by `resolved_inset_value`
+    /// so `getComputedStyle(el).top` etc. report the used value when the element has a box; absent for
+    /// box-less / non-positioned elements (those fall back to the computed value).
+    used_insets: RefCell<HashMap<usize, (f32, f32, f32, f32)>>,
     /// Decoded intrinsic size of each `<img>`, keyed by node id, pushed by the engine alongside
     /// `layout_rects`. `(natural_width, natural_height)` in CSS px from the decoded bitmap. Read by
     /// the `__naturalSize` primitive backing `img.naturalWidth` / `img.naturalHeight`. Empty until
@@ -234,6 +239,7 @@ impl HostState {
             dom_version: Cell::new(0),
             computed_cache: RefCell::new(None),
             layout_rects: RefCell::new(HashMap::new()),
+            used_insets: RefCell::new(HashMap::new()),
             image_natural: RefCell::new(HashMap::new()),
             canvas_pixels: RefCell::new(HashMap::new()),
             viewport_scroll_y: Cell::new(0.0),
@@ -1218,6 +1224,7 @@ fn resolved_inset_value(
     map: &HashMap<dom::NodeId, style::ComputedStyle>,
     id: dom::NodeId,
     side: style::EdgeSide,
+    used: Option<f32>,
 ) -> Option<String> {
     let cs = map.get(&id)?;
     // A box-less element (display:none, or an ancestor is) has no used value → computed value.
@@ -1226,14 +1233,72 @@ fn resolved_inset_value(
         return Some(cs.resolved_inset(side, true, f32::NAN));
     }
 
+    // Absolute / fixed with BOTH opposite insets `auto`: the box sits at its static position, whose
+    // used inset value needs layout. We compute it synchronously from specified geometry (the WPT
+    // containers have explicit px sizes) — the engine-pushed used px (`used`) is a fallback for cases
+    // where the static position can't be derived from specified geometry alone.
+    if matches!(cs.position, style::Position::Absolute | style::Position::Fixed) {
+        let (spec, opposite) = match side {
+            style::EdgeSide::Top => (cs.top_spec, cs.bottom_spec),
+            style::EdgeSide::Bottom => (cs.bottom_spec, cs.top_spec),
+            style::EdgeSide::Left => (cs.left_spec, cs.right_spec),
+            style::EdgeSide::Right => (cs.right_spec, cs.left_spec),
+            style::EdgeSide::All => (cs.top_spec, cs.bottom_spec),
+        };
+        let both_auto =
+            matches!(spec, style::InsetValue::Auto) && matches!(opposite, style::InsetValue::Auto);
+        if both_auto {
+            // Prefer the engine-pushed used value (from real layout) when present; otherwise derive
+            // the static position synchronously from specified geometry (covers the synchronous
+            // mutate-then-read pattern the CSSOM tests use, before any layout/push has run).
+            if let Some(px_val) = used {
+                return Some(style::serialize_px(px_val));
+            }
+            let want_height = matches!(side, style::EdgeSide::Top | style::EdgeSide::Bottom);
+            let kind = if cs.position == style::Position::Absolute {
+                ContainingBlock::PositionedPadding
+            } else {
+                ContainingBlock::TransformedPadding
+            };
+            let cb_node = containing_block_node(doc, map, id, kind);
+            let static_off = static_position_offset(doc, map, id, cb_node, want_height);
+            // start side (top/left) = the static offset; end side (bottom/right) = cb extent minus
+            // the static offset minus the box's margin-box size on this axis.
+            let used_val = match side {
+                style::EdgeSide::Top | style::EdgeSide::Left => static_off,
+                _ => {
+                    let cb_extent = containing_block_extent(doc, map, id, kind, want_height);
+                    let mb_size = if want_height {
+                        cs.height.unwrap_or(0.0)
+                            + cs.padding.top + cs.padding.bottom
+                            + cs.border.top + cs.border.bottom
+                            + cs.margin.top + cs.margin.bottom
+                    } else {
+                        cs.width.unwrap_or(0.0)
+                            + cs.padding.left + cs.padding.right
+                            + cs.border.left + cs.border.right
+                            + cs.margin.left + cs.margin.right
+                    };
+                    cb_extent - static_off - mb_size
+                }
+            };
+            return Some(style::serialize_px(used_val));
+        }
+    }
+
     // Find the containing block and the relevant axis extent (height for top/bottom, width for
     // left/right). For in-flow / relative / sticky the cb is the parent's *content* box; for
     // absolute the nearest positioned ancestor's *padding* box; for fixed the nearest transformed
     // ancestor's padding box (the viewport otherwise — approximated by the document element).
     let want_height = matches!(side, style::EdgeSide::Top | style::EdgeSide::Bottom);
     let basis = match cs.position {
-        style::Position::Relative | style::Position::Sticky => {
+        style::Position::Relative => {
             containing_block_extent(doc, map, id, ContainingBlock::ParentContent, want_height)
+        }
+        // Sticky insets resolve against the nearest scrollport (overflow != visible) ancestor's
+        // content box, not the parent — per the CSSOM sticky resolved-value rule.
+        style::Position::Sticky => {
+            containing_block_extent(doc, map, id, ContainingBlock::StickyScrollport, want_height)
         }
         style::Position::Absolute => {
             containing_block_extent(doc, map, id, ContainingBlock::PositionedPadding, want_height)
@@ -1247,6 +1312,7 @@ fn resolved_inset_value(
 }
 
 /// Which ancestor establishes the containing block, and which box of it forms the basis.
+#[derive(Clone, Copy)]
 enum ContainingBlock {
     /// Parent element's content box (in-flow / relative / sticky).
     ParentContent,
@@ -1254,6 +1320,89 @@ enum ContainingBlock {
     PositionedPadding,
     /// Nearest ancestor with a transform's padding box, else the document element (fixed).
     TransformedPadding,
+    /// Nearest scroll-container (scrollport) ancestor's content box — the box a `position: sticky`
+    /// element's inset percentages resolve against (the nearest ancestor with `overflow != visible`,
+    /// else the parent). CSSOM resolved value for sticky insets.
+    StickyScrollport,
+}
+
+/// Find the containing-block element for `id` per `kind` (the abspos/fixed cb walk), returning its
+/// node id, or `None` if none is found (the cb is the viewport / initial containing block).
+fn containing_block_node(
+    doc: &dom::Document,
+    map: &HashMap<dom::NodeId, style::ComputedStyle>,
+    id: dom::NodeId,
+    kind: ContainingBlock,
+) -> Option<dom::NodeId> {
+    let mut cur = doc.get(id).parent;
+    match kind {
+        ContainingBlock::ParentContent => cur,
+        ContainingBlock::PositionedPadding => {
+            while let Some(a) = cur {
+                if map.get(&a).map(|acs| acs.position != style::Position::Static).unwrap_or(false) {
+                    return Some(a);
+                }
+                cur = doc.get(a).parent;
+            }
+            None
+        }
+        ContainingBlock::TransformedPadding => {
+            while let Some(a) = cur {
+                if map.get(&a).map(|acs| acs.transform.is_some()).unwrap_or(false) {
+                    return Some(a);
+                }
+                cur = doc.get(a).parent;
+            }
+            None
+        }
+        ContainingBlock::StickyScrollport => {
+            while let Some(a) = cur {
+                if map.get(&a).map(|acs| acs.overflow_scrollport).unwrap_or(false) {
+                    return Some(a);
+                }
+                cur = doc.get(a).parent;
+            }
+            None
+        }
+    }
+}
+
+/// The static-position offset of out-of-flow `id`'s margin box from its containing block's
+/// content-area start edge, on one axis (`want_height` → vertical/top, else horizontal/left), in px.
+///
+/// The hypothetical in-flow position of `id` is the start of its parent's content box; the parent's
+/// content box is in turn offset from the containing block (`cb`, exclusive) by each intervening
+/// ancestor's margin + border + padding start edge, plus the cb's own padding start edge. Computed
+/// from specified geometry (the WPT inset containers all have explicit px sizes), so it matches real
+/// layout for those tests without a layout pass. `cb` = `None` means the containing block is the
+/// initial containing block (the document root), so we accumulate up to (and including) the root.
+fn static_position_offset(
+    doc: &dom::Document,
+    map: &HashMap<dom::NodeId, style::ComputedStyle>,
+    id: dom::NodeId,
+    cb: Option<dom::NodeId>,
+    want_height: bool,
+) -> f32 {
+    let start_edge = |e: &style::Edges| if want_height { e.top } else { e.left };
+    let mut offset = 0.0;
+    // The cb's own padding start edge: its content box begins after its padding.
+    if let Some(cbid) = cb {
+        if let Some(cbcs) = map.get(&cbid) {
+            offset += start_edge(&cbcs.padding);
+        }
+    }
+    // Each ancestor strictly between `id` and the cb contributes its full start margin+border+padding.
+    let mut cur = doc.get(id).parent;
+    while let Some(a) = cur {
+        if Some(a) == cb {
+            break;
+        }
+        if let Some(acs) = map.get(&a) {
+            offset += start_edge(&acs.margin) + start_edge(&acs.border) + start_edge(&acs.padding);
+        }
+        cur = doc.get(a).parent;
+    }
+    offset
 }
 
 /// Walk up from `id` to find its containing block per `kind`, returning the requested axis extent
@@ -1306,6 +1455,23 @@ fn containing_block_extent(
             }
             0.0
         }
+        ContainingBlock::StickyScrollport => {
+            // Nearest scrollport ancestor's content box; fall back to the parent's content box when
+            // there's no scroll container (the box's normal containing block).
+            let mut fallback = None;
+            while let Some(a) = cur {
+                if let Some(acs) = map.get(&a) {
+                    if fallback.is_none() {
+                        fallback = Some(pick(box_extents(acs), false));
+                    }
+                    if acs.overflow_scrollport {
+                        return pick(box_extents(acs), false);
+                    }
+                }
+                cur = doc.get(a).parent;
+            }
+            fallback.unwrap_or(0.0)
+        }
     }
 }
 
@@ -1356,9 +1522,21 @@ fn prim_computed_style_prop(
                 _ => None,
             };
             match inset_side {
-                Some(side) => with_cascade_map(&state, |doc, map| {
-                    resolved_inset_value(doc, map, n, side).unwrap_or_default()
-                }),
+                Some(side) => {
+                    // The engine pushed this box's used inset values (px) keyed by node id; pick this
+                    // side. Used by the resolved-value algorithm for cases that need real layout
+                    // (absolute/fixed static position when both opposite insets are `auto`).
+                    let used = state.used_insets.borrow().get(&n.0).map(|&(t, r, b, l)| match side {
+                        style::EdgeSide::Top => t,
+                        style::EdgeSide::Right => r,
+                        style::EdgeSide::Bottom => b,
+                        style::EdgeSide::Left => l,
+                        style::EdgeSide::All => t,
+                    });
+                    with_cascade_map(&state, |doc, map| {
+                        resolved_inset_value(doc, map, n, side, used).unwrap_or_default()
+                    })
+                }
                 None => with_computed_style(&state, n, |cs| {
                     cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
                 }),
@@ -2822,6 +3000,14 @@ fn install_browser_environment(scope: &mut v8::PinScope, url: &str) {
         global.set(scope, k.into(), n.into());
     }
     eval_internal(scope, BROWSER_ENV_BOOTSTRAP, "<browser-env>");
+    // Expose elements with an `id` as named globals (HTML named-properties-on-window). The DOM is
+    // already fully parsed by the time the environment is installed (the engine batches scripts
+    // after `parser.finish()`), so every static-markup id is visible to author scripts that follow.
+    eval_internal(
+        scope,
+        "if (typeof __installNamedGlobals === 'function') { __installNamedGlobals(); }",
+        "<named-globals>",
+    );
 }
 
 /// JS bootstrap that builds `window`/`self`/`globalThis` aliases and the `document` object +
@@ -10126,6 +10312,46 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return w * px;
   }
 
+  // HTML "named properties on the window object": an element with an `id` is exposed as a bare
+  // global so `target1` resolves to `<div id="target1">` without `document.getElementById`.
+  // Browsers implement this via a live named-property getter; we install a configurable getter per
+  // id that delegates to `getElementById` (so it stays live, returns the canonical wrapper, and
+  // tree-order / duplicate-id resolution comes for free). Called once after the environment is
+  // installed and the DOM is parsed, before any author script runs. We never shadow an existing
+  // own/builtin global (e.g. an `id="location"` must not clobber `window.location`).
+  globalThis.__installNamedGlobals = function () {
+    var nodes;
+    try { nodes = __querySelectorAll("[id]"); } catch (e) { return; }
+    if (!nodes) { return; }
+    for (var i = 0; i < nodes.length; i++) {
+      var nid = nodes[i];
+      var idStr;
+      try { idStr = __getAttr(nid, "id"); } catch (e) { idStr = ""; }
+      if (!idStr) { continue; }
+      if (Object.prototype.hasOwnProperty.call(globalThis, idStr)) { continue; }
+      (function (name) {
+        try {
+          Object.defineProperty(globalThis, name, {
+            configurable: true,
+            enumerable: false,
+            get: function () { return document.getElementById(name); },
+            // HTML named properties are overridable: assigning (including a global `var name = ...`)
+            // replaces the named property with a plain data property. Without a setter, such an
+            // assignment throws in strict/module code and aborts the script.
+            set: function (v) {
+              Object.defineProperty(globalThis, name, {
+                value: v,
+                writable: true,
+                configurable: true,
+                enumerable: true,
+              });
+            },
+          });
+        } catch (e) {}
+      })(idStr);
+    }
+  };
+
   // The engine pulls every canvas's display list through this. Returns a JSON-ready array of
   // { id, width, height, commands:[...] }. Guard on the engine side: only called when the DOM has
   // a <canvas>.
@@ -11247,6 +11473,9 @@ enum SessionCmd {
         /// `(node_id, natural_width, natural_height)` per decoded `<img>`, CSS px. Backs
         /// `img.naturalWidth`/`naturalHeight`.
         naturals: Vec<(usize, f32, f32)>,
+        /// `(node_id, top, right, bottom, left)` per positioned box: the CSSOM *used* inset values
+        /// in CSS px. Backs `getComputedStyle(el).top` etc. when the element has a box.
+        insets: Vec<(usize, f32, f32, f32, f32)>,
         /// Vertical scroll offset in CSS px (subtracted to make rects viewport-relative).
         scroll_y_css: f32,
         /// Full document content height in CSS px (reported as documentElement/body scrollHeight).
@@ -11396,10 +11625,13 @@ impl Session {
         &self,
         rects: Vec<(usize, f32, f32, f32, f32)>,
         naturals: Vec<(usize, f32, f32)>,
+        insets: Vec<(usize, f32, f32, f32, f32)>,
         scroll_y_css: f32,
         doc_height_css: f32,
     ) {
-        let _ = self.tx.send(SessionCmd::SetRects { rects, naturals, scroll_y_css, doc_height_css });
+        let _ = self
+            .tx
+            .send(SessionCmd::SetRects { rects, naturals, insets, scroll_y_css, doc_height_css });
     }
 
     /// Push freshly-rasterized canvas/image RGBA pixels to the worker so `getImageData` returns real
@@ -11713,7 +11945,7 @@ fn session_thread_main(
                     let _ = reply.send(None);
                 }
             }
-            SessionCmd::SetRects { rects, naturals, scroll_y_css, doc_height_css } => {
+            SessionCmd::SetRects { rects, naturals, insets, scroll_y_css, doc_height_css } => {
                 // Store on HostState (no JS run needed — just update the geometry tables). Re-enter
                 // the persistent context to reach the slot. Fire-and-forget: no reply.
                 let ctx = context.clone();
@@ -11727,6 +11959,12 @@ fn session_thread_main(
                     map.insert(id, (x, y, w, h));
                 }
                 drop(map);
+                let mut ins = state.used_insets.borrow_mut();
+                ins.clear();
+                for (id, t, r, b, l) in insets {
+                    ins.insert(id, (t, r, b, l));
+                }
+                drop(ins);
                 let mut nat = state.image_natural.borrow_mut();
                 nat.clear();
                 for (id, w, h) in naturals {
@@ -13089,6 +13327,64 @@ mod tests {
         let (doc, _) = doc_with_body("");
         let (_doc, out) = run_with_dom(doc, vec![src.to_string()], url);
         out.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn computed_inset_uses_used_value_for_positioned_box() {
+        // position:absolute element with explicit top/left in a positioned container: the set sides
+        // resolve to their own px; an auto side resolves to the used value derived from the
+        // containing block geometry (CSSOM resolved value). For the all-auto static-position case the
+        // value is the box's hypothetical in-flow offset within the containing block.
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+              var cb = document.createElement('div');
+              cb.style.cssText = 'position:relative; width:200px; height:100px; padding:0;';
+              var inner = document.createElement('div');
+              cb.appendChild(inner);
+              var t = document.createElement('div');
+              inner.appendChild(t);
+              document.body.appendChild(cb);
+
+              // Set top/left, leave bottom/right auto (auto vs set -> used value = basis - opposite).
+              t.style.cssText = 'position:absolute; top:10px; left:20px; width:0; height:0;';
+              var cs = getComputedStyle(t);
+              var r1 = [cs.top, cs.left, cs.bottom, cs.right].join(',');
+
+              // All-auto: every side resolves to the static position (in-flow origin offset).
+              t.style.cssText = 'position:absolute; width:0; height:0;';
+              var cs2 = getComputedStyle(t);
+              var r2 = [cs2.top, cs2.left].join(',');
+              r1 + '|' + r2
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        // top=10, left=20 as set; bottom = 100 - 10 - 0 = 90; right = 200 - 20 - 0 = 180.
+        // Static position: the box is the first in-flow content of the cb (no padding/border), so
+        // both top and left resolve to 0px.
+        assert_eq!(out.value.as_deref(), Some("10px,20px,90px,180px|0px,0px"));
+    }
+
+    #[test]
+    fn named_global_resolves_element_by_id() {
+        // HTML named-properties-on-window: a bare global resolves to the element with that id, and is
+        // overridable by assignment (so `var name = ...` in author code doesn't throw).
+        let out = env_eval(
+            "https://example.com/",
+            r#"
+              var d = document.createElement('div');
+              d.id = 'widget';
+              d.style.cssText = 'position:absolute; top:7px;';
+              document.body.appendChild(d);
+              // Re-run the named-global install (the env install ran before this script created #widget).
+              __installNamedGlobals();
+              var byName = (typeof widget === 'object' && widget !== null) ? widget.id : '(none)';
+              var top = getComputedStyle(widget).top;
+              byName + ',' + top
+            "#,
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("widget,7px"));
     }
 
     #[test]

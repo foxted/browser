@@ -255,6 +255,10 @@ pub struct ComputedStyle {
     pub border: Edges,
     /// Border color (r, g, b).
     pub border_color: (u8, u8, u8),
+    /// Whether `overflow` (x or y) is anything other than `visible` (i.e. `hidden`/`scroll`/`auto`/
+    /// `clip`). Such a box is a *scroll container* / scrollport — the containing block against which a
+    /// `position: sticky` descendant's inset percentages resolve (CSSOM resolved value). Not inherited.
+    pub overflow_scrollport: bool,
 
     // --- Table properties ---
     /// `border-collapse` (`separate` default | `collapse`). On a `display: table`, `Collapse`
@@ -627,6 +631,7 @@ impl Default for ComputedStyle {
             padding: Edges::default(),
             border: Edges::default(),
             border_color: (0, 0, 0), // initial border-color is currentColor (black)
+            overflow_scrollport: false,
             border_collapse: BorderCollapse::Separate,
             border_spacing: 0.0,
             flex_direction: FlexDirection::Row,
@@ -692,6 +697,13 @@ fn num(v: f32) -> String {
 /// Format a length in CSS px (`<n>px`).
 fn px(v: f32) -> String {
     format!("{}px", num(v))
+}
+
+/// Format a CSS-px length the same way the CSSOM resolved-value serializer does (`<n>px`, trimming
+/// trailing zeros). Public so consumers (e.g. the JS `getComputedStyle` layer feeding engine-pushed
+/// used values) serialize insets/margins identically to the in-crate paths.
+pub fn serialize_px(v: f32) -> String {
+    px(v)
 }
 
 /// Format an opaque color as `rgb(r, g, b)`.
@@ -1607,6 +1619,7 @@ fn compute_element_style<'a>(
         padding: Edges::default(),
         border: Edges::default(),
         border_color: parent.color, // initial border-color is currentColor
+        overflow_scrollport: false, // not inherited; initial overflow is `visible`
         // border-collapse / border-spacing inherit (set on the table, read by cells).
         border_collapse: parent.border_collapse,
         border_spacing: parent.border_spacing,
@@ -2958,6 +2971,19 @@ fn apply_declaration(
             "sticky" => style.position = Position::Sticky,
             _ => {}
         },
+        // `overflow` (and the `-x`/`-y` longhands): we only need whether the box becomes a scroll
+        // container (anything but `visible`), which is the containing block for `sticky` insets.
+        "overflow" | "overflow-x" | "overflow-y" => {
+            // A single value applies to both axes; the shorthand may carry two. Any non-`visible`
+            // (and non-`clip`-without-scrollport — we treat `clip` as a scrollport too, matching the
+            // sticky containing-block rule) token marks this box as a scrollport.
+            let any_non_visible = val
+                .split_whitespace()
+                .any(|tok| !matches!(tok.trim().to_ascii_lowercase().as_str(), "visible" | ""));
+            if any_non_visible {
+                style.overflow_scrollport = true;
+            }
+        }
         "top" => {
             style.top = parse_length_fs(val, style.font_size);
             style.top_spec = parse_inset_value(val, style.font_size);

@@ -716,9 +716,17 @@ impl Engine {
             }
             _ => Vec::new(),
         };
+        // CSSOM used inset values per positioned box (device px -> CSS px), for getComputedStyle's
+        // resolved value of top/right/bottom/left when the element has a box.
+        let mut insets: HashMap<usize, [f32; 4]> = HashMap::new();
+        collect_used_insets(&cache.root, &mut insets);
+        let inset_list: Vec<(usize, f32, f32, f32, f32)> = insets
+            .iter()
+            .map(|(&id, v)| (id, v[0] * inv, v[1] * inv, v[2] * inv, v[3] * inv))
+            .collect();
         let scroll_y_css = self.scroll_y * inv;
         let doc_height_css = cache.content_h * inv;
-        session.set_layout_rects(list, naturals, scroll_y_css, doc_height_css);
+        session.set_layout_rects(list, naturals, inset_list, scroll_y_css, doc_height_css);
     }
 
     /// Paint the current state into a fresh framebuffer and return a reference to it.
@@ -2278,6 +2286,18 @@ fn collect_node_rects(b: &layout::LayoutBox, out: &mut HashMap<usize, layout::Re
     }
     for c in &b.children {
         collect_node_rects(c, out);
+    }
+}
+
+/// Collect each positioned box's CSSOM *used* inset values `[top, right, bottom, left]` (device px,
+/// as stored by layout). Pushed to the JS Session so `getComputedStyle(el).top` etc. report the used
+/// value when the element has a box (`crates/layout` fills `used_insets` during positioned layout).
+fn collect_used_insets(b: &layout::LayoutBox, out: &mut HashMap<usize, [f32; 4]>) {
+    if let (Some(node), Some(insets)) = (b.node, b.used_insets) {
+        out.entry(node.0).or_insert(insets);
+    }
+    for c in &b.children {
+        collect_used_insets(c, out);
     }
 }
 
