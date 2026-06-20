@@ -7227,7 +7227,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (!sawBrace) {
         // Statement at-rule (e.g. `@import ...;`, `@namespace ...;`). Consume the `;`.
         if (i < n && css[i] === ";") { i++; }
-        if (prelude) { out.push(structFromPrelude(prelude, "")); }
+        // `@charset` is a parse directive, not a CSS rule — it never appears in `cssRules` (CSSOM).
+        if (prelude) { var __st = structFromPrelude(prelude, ""); if (__st && __st.kind !== "@charset") { out.push(__st); } }
         continue;
       }
       // Read the brace-balanced body.
