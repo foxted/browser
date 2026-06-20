@@ -299,6 +299,18 @@ fn explicit_width(
     boxx.node.and_then(|n| styles.get(&n)).and_then(|cs| cs.width)
 }
 
+/// The used content width: an explicit px `width`, or a percentage `width` resolved against the
+/// containing block's content width (`cb_width`). `None` when width is `auto`.
+fn resolved_width(
+    boxx: &LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    cb_width: f32,
+) -> Option<f32> {
+    boxx.node
+        .and_then(|n| styles.get(&n))
+        .and_then(|cs| cs.width.or_else(|| cs.width_pct.map(|p| (cb_width * p).max(0.0))))
+}
+
 /// The explicit content height set on a box's node (if any).
 fn explicit_height(
     boxx: &LayoutBox,
@@ -1470,8 +1482,9 @@ fn layout_block(
     let border = boxx.dimensions.border;
     let padding = boxx.dimensions.padding;
 
-    // Explicit sizing comes from the box's DOM node's computed style.
-    let explicit_w = explicit_width(boxx, styles);
+    // Explicit sizing comes from the box's DOM node's computed style (percentage width resolves
+    // against the containing block's content width).
+    let explicit_w = resolved_width(boxx, styles, containing.width);
     let explicit_h = explicit_height(boxx, styles);
 
     // Content width: containing content width minus this box's horizontal margin+border+padding,

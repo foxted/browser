@@ -238,10 +238,15 @@ pub struct ComputedStyle {
     pub left_spec: InsetValue,
     /// Stacking `z-index` (`None` = auto). Parsed but not yet used for paint ordering.
     pub z_index: Option<i32>,
-    /// Explicit content `width` in px (`None` = auto). Percentages are ignored (None).
+    /// Explicit content `width` in px (`None` = auto/percentage; see `width_pct`).
     pub width: Option<f32>,
-    /// Explicit content `height` in px (`None` = auto).
+    /// Explicit content `height` in px (`None` = auto/percentage; see `height_pct`).
     pub height: Option<f32>,
+    /// `width` as a fraction (`50%` → `0.5`) when specified as a percentage; resolved against the
+    /// containing block's content width in layout. `None` unless `width` is a percentage.
+    pub width_pct: Option<f32>,
+    /// `height` as a fraction; resolved against the containing block's (definite) content height.
+    pub height_pct: Option<f32>,
     /// `min-width` constraint (`None` = 0/unset). Resolved against the containing block in layout.
     pub min_width: Option<SizeConstraint>,
     /// `max-width` constraint (`None`/`none` = no maximum).
@@ -629,6 +634,8 @@ impl Default for ComputedStyle {
             left_spec: InsetValue::Auto,
             z_index: None,
             width: None,
+            width_pct: None,
+            height_pct: None,
             height: None,
             min_width: None,
             max_width: None,
@@ -1856,6 +1863,8 @@ fn compute_element_style<'a>(
         z_index: None,
         // Box properties are not inherited: each element starts from initial values.
         width: None,
+        width_pct: None,
+        height_pct: None,
         height: None,
         min_width: None,
         max_width: None,
@@ -3477,9 +3486,13 @@ fn apply_declaration(
         // --- Box model: width / height ---
         "width" => {
             style.width = parse_length(val);
+            style.width_pct =
+                if style.width.is_none() { parse_percent(val).map(|p| p / 100.0) } else { None };
         }
         "height" => {
             style.height = parse_length(val);
+            style.height_pct =
+                if style.height.is_none() { parse_percent(val).map(|p| p / 100.0) } else { None };
         }
 
         // --- Sizing constraints (min/max) ---

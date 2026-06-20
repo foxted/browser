@@ -1770,7 +1770,43 @@ fn prim_computed_style_prop(
                 "margin-left" => Some(3),
                 _ => None,
             };
-            if let Some(idx) = margin_idx {
+            // width/height report the CSSOM *used* (content-box px) value when the element has a box
+            // and the property applies — e.g. a percentage width the cascade couldn't resolve.
+            let size_is_width = match name.as_str() {
+                "width" => Some(true),
+                "height" => Some(false),
+                _ => None,
+            };
+            if let Some(is_width) = size_is_width {
+                with_computed_style(&state, n, |cs| {
+                    let cs = match cs {
+                        Some(c) => c,
+                        None => return String::new(),
+                    };
+                    let computed = cs.get_property(&name);
+                    // A specified length is already the used value (and stays fresh between layouts);
+                    // only resolve `auto`/percentage via the laid-out box. width/height don't apply to
+                    // non-replaced inline boxes or display:none, where the computed value is reported.
+                    if computed != "auto"
+                        || cs.display_none
+                        || matches!(cs.display, style::Display::Inline)
+                    {
+                        return computed;
+                    }
+                    match state.layout_rects.borrow().get(&n.0) {
+                        Some(&(_, _, w, h)) => {
+                            let (b0, b1, p0, p1) = if is_width {
+                                (cs.border.left, cs.border.right, cs.padding.left, cs.padding.right)
+                            } else {
+                                (cs.border.top, cs.border.bottom, cs.padding.top, cs.padding.bottom)
+                            };
+                            let border_box = if is_width { w } else { h };
+                            style::serialize_px((border_box - b0 - b1 - p0 - p1).max(0.0))
+                        }
+                        None => computed,
+                    }
+                })
+            } else if let Some(idx) = margin_idx {
                 // Only an `auto` margin needs the engine's resolved used value; a specified margin's
                 // computed value is always current (and not stale between layouts). Falls back to the
                 // computed value if the engine hasn't pushed a used margin yet.
