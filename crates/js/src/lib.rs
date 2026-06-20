@@ -3326,11 +3326,14 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       var moving = __children(nodeId).slice();
       for (var i = 0; i < moving.length; i++) { __insertBefore(parentId, moving[i], refId); }
       if (globalThis.__ceOnInsert) { for (var k = 0; k < moving.length; k++) { try { globalThis.__ceOnInsert(moving[k]); } catch (e) {} } }
+      if (globalThis.__adoptOnInsert) { for (var m = 0; m < moving.length; m++) { try { globalThis.__adoptOnInsert(moving[m]); } catch (e) {} } }
       return nodeId;
     }
     __insertBefore(parentId, nodeId, refId);
     // Custom Elements: a newly-connected element (and its subtree) may need upgrading + connectedCallback.
     if (globalThis.__ceOnInsert) { try { globalThis.__ceOnInsert(nodeId); } catch (e) {} }
+    // Cross-document adoption: clear adoptedStyleSheets of shadow roots moved into a frame document.
+    if (globalThis.__adoptOnInsert) { try { globalThis.__adoptOnInsert(nodeId); } catch (e) {} }
     return nodeId;
   }
 
@@ -8626,7 +8629,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (typeof el.cloneNode !== "function") { def(el, "cloneNode", function () { return this; }); }
     if (typeof el.hasChildNodes !== "function") { def(el, "hasChildNodes", function () { try { return (this.childNodes || []).length > 0; } catch (e) { return false; } }); }
     if (!("nodeType" in el)) { def(el, "nodeType", 1); }
-    if (!("ownerDocument" in el)) { def(el, "ownerDocument", document); }
+    if (!("ownerDocument" in el)) {
+      // Dynamic: a node inside a <template>'s content belongs to that template's contents document,
+      // and a node inside an <iframe>'s content document belongs to that document. Resolved by
+      // walking the arena ancestry (so moving a node between documents updates its ownerDocument).
+      Object.defineProperty(el, "ownerDocument", {
+        get: function () {
+          return (typeof globalThis.__ownerDocumentOf === "function") ? globalThis.__ownerDocumentOf(this) : document;
+        },
+        configurable: true, enumerable: true
+      });
+    }
     if (!("scrollTop" in el)) { el.scrollTop = 0; }
     if (!("scrollLeft" in el)) { el.scrollLeft = 0; }
     if (!("offsetWidth" in el)) { el.offsetWidth = 0; }
@@ -9987,6 +10000,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
             var body = document.createElement("body");
             var doc = {
               body: body, head: body, documentElement: body, nodeType: 9,
+              // Marks this as a distinct (frame) document — moving a node here is a cross-document
+              // adoption, which clears the moved subtree's adoptedStyleSheets (see __adoptOnInsert).
+              __isFrameDoc: true,
               querySelector: function (s) { return body.querySelector(s); },
               querySelectorAll: function (s) { return body.querySelectorAll(s); },
               getElementById: function (id) { try { return body.querySelector('#' + id); } catch (e) { return null; } },
@@ -9997,6 +10013,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
               adoptedStyleSheets: [], styleSheets: { length: 0, item: function () { return null; } },
               defaultView: null,
             };
+            // Tag the content body so ownerDocument resolution maps it (and its subtree) to `doc`.
+            try { def(body, "__frameDoc", doc); } catch (e) {}
             this.__cdoc = doc;
           }
           return this.__cdoc;
@@ -10093,6 +10111,106 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         return __ceWhen[name].promise;
       },
       upgrade: function (root) { try { __ceWalk(root && root.__node); } catch (e) {} }
+    });
+  } catch (e) {}
+
+  // --- <template>.content + cross-document ownerDocument / adoption ----------------------------
+  // A <template>'s children belong to a "template contents document" (an inert document distinct
+  // from the main one). We model the content as a DocumentFragment facade over the template
+  // element's arena children, and resolve `ownerDocument` by walking ancestry: the nearest
+  // <template> ancestor maps a node to that template's contents document, an <iframe> content body
+  // maps to that frame's document, otherwise the main document. Moving a node thus updates its
+  // ownerDocument, and moving it into a *frame* document clears the moved shadow roots' adopted
+  // sheets (construct-stylesheets adoption steps) — but moving into a template does not.
+  try {
+    // Resolve a node id to its canonical, fully-enriched element wrapper (the one that carries
+    // tag prototype + __shadow/__frameDoc). __wrapNode builds a bare wrapper; __canonNode enriches
+    // and caches it. Reuse the cached wrapper when present.
+    def(globalThis, "__elFor", function (cid) {
+      if (cid == null || cid < 0) { return null; }
+      var c = (typeof globalThis.__nodeById === "function") ? globalThis.__nodeById(cid) : null;
+      if (c) { return c; }
+      var w = (typeof globalThis.__wrapNode === "function") ? globalThis.__wrapNode(cid) : null;
+      if (!w) { return null; }
+      return (typeof globalThis.__canonNode === "function") ? globalThis.__canonNode(w) : w;
+    });
+    // Stable contents-document object for a template element (lazily created).
+    function __templateDocFor(tpl) {
+      if (!tpl.__contentDoc) {
+        try { def(tpl, "__contentDoc", { __isTemplateContentsDoc: true, nodeType: 9, defaultView: null }); }
+        catch (e) { tpl.__contentDoc = { __isTemplateContentsDoc: true, nodeType: 9, defaultView: null }; }
+      }
+      return tpl.__contentDoc;
+    }
+    def(globalThis, "__ownerDocumentOf", function (node) {
+      try {
+        var id = node && node.__node;
+        if (typeof id !== "number") { return document; }
+        var cur = id, guard = 0;
+        while (cur >= 0 && guard++ < 100000) {
+          var w = globalThis.__elFor(cur);
+          if (w) {
+            // The iframe content body (and its subtree) belongs to the frame document.
+            if (w.__frameDoc) { return w.__frameDoc; }
+            // A <template> ANCESTOR (not the node itself) puts the node in its contents document.
+            if (cur !== id && w.tagName === "TEMPLATE") { return __templateDocFor(w); }
+          }
+          cur = __parent(cur);
+        }
+      } catch (e) {}
+      return document;
+    });
+
+    // <template>.content — a DocumentFragment facade over the template element's children.
+    if (globalThis.HTMLTemplateElement && globalThis.HTMLTemplateElement.prototype) {
+      Object.defineProperty(globalThis.HTMLTemplateElement.prototype, "content", {
+        get: function () {
+          if (this.__contentFrag) { return this.__contentFrag; }
+          var tpl = this, tplNode = tpl.__node;
+          var nodeAt = function (cid) { return globalThis.__elFor(cid); };
+          var frag = {
+            nodeType: 11,
+            host: tpl,
+            get ownerDocument() { return __templateDocFor(tpl); },
+            appendChild: function (child) { try { __appendChild(tplNode, child.__node); } catch (e) {} return child; },
+            insertBefore: function (child, ref) { try { __insertNode(tplNode, child.__node, ref ? ref.__node : -1); } catch (e) {} return child; },
+            removeChild: function (child) { try { __removeChild(child.__node); } catch (e) {} return child; },
+            get childNodes() { var k = __children(tplNode), a = []; for (var i = 0; i < k.length; i++) { a.push(nodeAt(k[i])); } return a; },
+            get children() { var k = __children(tplNode), a = []; for (var i = 0; i < k.length; i++) { if (__nodeType(k[i]) === 1) { a.push(nodeAt(k[i])); } } return a; },
+            get firstChild() { var k = __children(tplNode); return k.length ? nodeAt(k[0]) : null; },
+            get firstElementChild() { var k = __children(tplNode); for (var i = 0; i < k.length; i++) { if (__nodeType(k[i]) === 1) { return nodeAt(k[i]); } } return null; },
+            querySelector: function (s) { try { return tpl.querySelector(s); } catch (e) { return null; } },
+            querySelectorAll: function (s) { try { return tpl.querySelectorAll(s); } catch (e) { return []; } },
+            getElementById: function (gid) { try { return tpl.querySelector('#' + gid); } catch (e) { return null; } },
+            cloneNode: function () { return this; },
+          };
+          try { def(tpl, "__contentFrag", frag); } catch (e) { tpl.__contentFrag = frag; }
+          return frag;
+        },
+        enumerable: true, configurable: true
+      });
+    }
+
+    // Called from insertNode after a move: if a moved element with a shadow root now lives in a
+    // *frame* document (a real cross-document adoption — not a template), empty that shadow root's
+    // adoptedStyleSheets in place (keeping the same observable array object).
+    def(globalThis, "__adoptOnInsert", function (nodeId) {
+      try {
+        var od = null;
+        var walk = function (cid) {
+          if (cid == null || cid < 0) { return; }
+          var w = globalThis.__elFor(cid);
+          if (w && w.__shadow) {
+            var doc = globalThis.__ownerDocumentOf(w);
+            if (doc && doc.__isFrameDoc) {
+              try { var asl = w.__shadow.adoptedStyleSheets; if (asl && asl.length) { asl.splice(0, asl.length); } } catch (e) {}
+            }
+          }
+          var kids = __children(cid);
+          for (var i = 0; i < kids.length; i++) { walk(kids[i]); }
+        };
+        walk(nodeId);
+      } catch (e) {}
     });
   } catch (e) {}
 
