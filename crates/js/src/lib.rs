@@ -7989,11 +7989,23 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (!href) { return true; }
     if (href.slice(0, 5) === "data:" || href.slice(0, 6) === "about:") { return true; }
     try {
-      return new URL(href, document.baseURI).origin === location.origin;
+      if (new URL(href, document.baseURI).origin !== location.origin) { return false; }
     } catch (e) {
       // Unparseable/opaque URL (e.g. a cross-origin authority we can't resolve) → not origin-clean.
       return false;
     }
+    // A server-side redirect carries its destination in a `location=` query param (e.g. WPT's
+    // /common/redirect.py?location=…). Following it would land on that URL, so if the redirect
+    // target is another origin the resulting sheet is not origin-clean.
+    var m = /[?&]location=([^&]*)/.exec(href);
+    if (m) {
+      try {
+        if (new URL(decodeURIComponent(m[1]), document.baseURI).origin !== location.origin) { return false; }
+      } catch (e) {
+        return false;
+      }
+    }
+    return true;
   }
   function makeStyleSheetCore(structs, ownerNode) {
     var ss = {};
