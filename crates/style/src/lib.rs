@@ -6123,6 +6123,20 @@ pub fn parse_gcs_pseudo(arg: &str) -> GcsPseudo {
 }
 
 /// Parse the inside of `[...]` into an [`AttrSel`].
+/// Strip a CSS attribute-namespace prefix to the local name. `*|attr` (any namespace) and `|attr` /
+/// bare `attr` (no namespace) all match our HTML attributes (which carry no namespace), so they
+/// reduce to the local name. A specific `ns|attr` is left intact — we don't track per-attribute
+/// namespaces, so it won't match a no-namespace attribute, which is the correct result for HTML.
+fn strip_attr_namespace(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("*|") {
+        rest.to_string()
+    } else if let Some(rest) = name.strip_prefix('|') {
+        rest.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 fn parse_attr(inner: &str) -> Option<AttrSel> {
     let s = inner.trim();
     // Detect a trailing ` i` / ` s` case flag (only meaningful with a value, but tolerate it).
@@ -6158,7 +6172,7 @@ fn parse_attr(inner: &str) -> Option<AttrSel> {
             if name.is_empty() {
                 return None;
             }
-            return Some(AttrSel { name: name.to_ascii_lowercase(), op, value, case_insensitive });
+            return Some(AttrSel { name: strip_attr_namespace(&name.to_ascii_lowercase()), op, value, case_insensitive });
         }
     }
     // No operator → presence test.
@@ -6166,7 +6180,7 @@ fn parse_attr(inner: &str) -> Option<AttrSel> {
     if name.is_empty() {
         return None;
     }
-    Some(AttrSel { name: name.to_ascii_lowercase(), op: AttrOp::Exists, value: String::new(), case_insensitive })
+    Some(AttrSel { name: strip_attr_namespace(&name.to_ascii_lowercase()), op: AttrOp::Exists, value: String::new(), case_insensitive })
 }
 
 /// Strip optional surrounding quotes.
