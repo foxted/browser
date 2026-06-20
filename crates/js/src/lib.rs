@@ -7643,7 +7643,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     defOn(rule, "supportsText", { get: function () { return info.supports; }, enumerable: true });
     defOn(rule, "media", { get: function () { return mediaList; }, set: function (v) { mediaList.mediaText = v; }, enumerable: true });
     defOn(rule, "styleSheet", { get: function () {
-      if (!imported) { imported = makeConstructedSheet(""); imported.__constructed = false; imported.__ownerRule = rule; imported.__href = info.href; imported.__media = mediaList; }
+      if (!imported) {
+        imported = makeConstructedSheet(""); imported.__constructed = false; imported.__ownerRule = rule; imported.__href = info.href; imported.__media = mediaList;
+        // The imported sheet's parent is the sheet containing the @import — until that rule is
+        // removed (struct detached), at which point the child sheet is unlinked (parentStyleSheet null).
+        try { Object.defineProperty(imported, "parentStyleSheet", { get: function () { return struct.__detached ? null : sheet; }, configurable: true }); } catch (e) {}
+      }
       return imported;
     }, enumerable: true });
     defOn(rule, "cssText", { get: function () {
