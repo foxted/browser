@@ -1258,9 +1258,11 @@ fn collect_author_sheets(
                     .split_whitespace()
                     .collect();
                 let is_stylesheet = rels.iter().any(|r| r.eq_ignore_ascii_case("stylesheet"));
-                let is_alternate = rels.iter().any(|r| r.eq_ignore_ascii_case("alternate"));
                 let disabled = e.attrs.contains_key("disabled");
-                if is_stylesheet && !is_alternate && !disabled {
+                // Include any enabled (no `disabled` attribute) stylesheet link. Alternates count
+                // too: once explicitly enabled — which removes the `disabled` attribute — they apply
+                // like a normal sheet, and we can't otherwise distinguish them from the DOM.
+                if is_stylesheet && !disabled {
                     if let Some(href) = e.attrs.get("href") {
                         if let Some(css) = fetch_link_css(href, fetcher) {
                             out.push_str(&css);
