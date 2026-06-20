@@ -8317,7 +8317,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     ss.__lastText = initial;
     // A <link>'s sheet is origin-clean only if fetched from the document's origin (CSSOM).
     if (styleEl.tagName === "LINK") {
-      ss.__originClean = __computeOriginClean(styleEl.getAttribute && styleEl.getAttribute("href"));
+      var __lh = (styleEl.getAttribute && styleEl.getAttribute("href")) || "";
+      ss.__originClean = __computeOriginClean(__lh);
+      // A `.asis` resource is served as a raw HTTP response; one that isn't a well-formed response
+      // (no "HTTP/" status line) is a network error, so the load fails and the sheet isn't
+      // origin-clean (accessing its rules throws SecurityError).
+      if (/\.asis(\?|#|$)/i.test(__lh) && initial && !/^\s*HTTP\//i.test(initial)) {
+        ss.__originClean = false;
+      }
     }
     // The sheet's `media` reflects the owner <style>/<link> element's `media` content attribute.
     // The MediaList writes back to that attribute, so `sheet.media.appendMedium(...)` updates it.
