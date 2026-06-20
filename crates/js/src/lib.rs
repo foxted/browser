@@ -4181,10 +4181,14 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       for (var i = 0; i < els.length; i++) {
         var el = els[i];
         var tag = (el.tagName || "").toLowerCase();
+        // The internal mirror for adoptedStyleSheets is not part of document.styleSheets.
+        if (el.getAttribute && el.getAttribute("data-adopted-stylesheets") != null) { continue; }
         if (tag === "link") {
           var rel = (el.getAttribute && el.getAttribute("rel") || "").toLowerCase();
           if (rel.split(/\s+/).indexOf("stylesheet") < 0) { continue; }
         }
+        // A `<link disabled>` / disabled sheet is not represented in document.styleSheets.
+        if (el.__sheetDisabled || (el.getAttribute && el.getAttribute("disabled") != null && tag === "link")) { continue; }
         try { var s = el.sheet; if (s) { sheets.push(s); } } catch (e) {}
       }
       var list = sheets;
@@ -6740,7 +6744,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     defOn(rule, "supportsText", { get: function () { return info.supports; }, enumerable: true });
     defOn(rule, "media", { get: function () { return mediaList; }, set: function (v) { mediaList.mediaText = v; }, enumerable: true });
     defOn(rule, "styleSheet", { get: function () {
-      if (!imported) { imported = makeConstructedSheet(""); imported.__ownerRule = rule; imported.__href = info.href; imported.__media = mediaList; }
+      if (!imported) { imported = makeConstructedSheet(""); imported.__constructed = false; imported.__ownerRule = rule; imported.__href = info.href; imported.__media = mediaList; }
       return imported;
     }, enumerable: true });
     defOn(rule, "cssText", { get: function () {
@@ -6976,6 +6980,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (parentRule && (st.kind === "@import" || st.kind === "@namespace" || st.kind === "@charset")) {
         throw new globalThis.DOMException("Cannot insert this rule into a grouping rule", "HierarchyRequestError");
       }
+      // Constructed sheets can't import: inserting an @import rule throws SyntaxError (per the
+      // construct-stylesheets spec / disallow-import test).
+      if (!parentRule && st.kind === "@import" && sheet && sheet.__constructed) {
+        throw new globalThis.DOMException("Can't insert @import rules into a constructed stylesheet.", "SyntaxError");
+      }
       // Top-level ordering constraints (CSSOM "insert a CSS rule" step 6): @import rules precede all
       // other rules; @namespace rules precede everything except @import. Violating the position throws
       // HierarchyRequestError. (@charset can never be inserted.)
@@ -7013,10 +7022,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
 
   // Mark a sheet dirty (re-render its <style> ownerNode so the cascade picks up CSSOM edits).
+  // For a constructed sheet, notify any adoptedStyleSheets observers so their managed <style>
+  // mirror is refreshed (mutating an adopted sheet is reflected in rendering).
   function markDirty(sheet) {
     if (!sheet || sheet.__rendering) { return; }
     if (sheet.__ownerNode && typeof sheet.__renderToOwner === "function") {
       try { sheet.__rendering = true; sheet.__renderToOwner(); } finally { sheet.__rendering = false; }
+    }
+    if (sheet.__adoptHosts) {
+      for (var h = 0; h < sheet.__adoptHosts.length; h++) {
+        try { sheet.__adoptHosts[h].__refreshAdopted(); } catch (e) {}
+      }
     }
   }
 
@@ -7066,6 +7082,26 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     Object.defineProperty(ss, "cssText", { get: function () {
       var s = ""; for (var i = 0; i < ruleList.length; i++) { s += (s ? "\n" : "") + ruleList[i].cssText; } return s;
     }, enumerable: false, configurable: true });
+    // CSSOM `replace`/`replaceSync`: only constructed sheets allow it; a `<style>`/`<link>` live
+    // sheet (or an @import-target child sheet) throws NotAllowedError. `replaceSync` parses `text`,
+    // strips any `@import` rules (constructed sheets can't import), and replaces ALL the rules.
+    function doReplaceSync(text) {
+      if (!ss.__constructed) {
+        throw new globalThis.DOMException("Can't call replace/replaceSync on non-constructed CSSStyleSheet.", "NotAllowedError");
+      }
+      var ns = parseRuleStructs(String(text));
+      var kept = [];
+      for (var i = 0; i < ns.length; i++) { if (ns[i].kind !== "@import") { kept.push(ns[i]); } }
+      ss.__structs.length = 0;
+      for (var j = 0; j < kept.length; j++) { ss.__structs.push(kept[j]); }
+      ruleList.__rebuild();
+      markDirty(ss);
+    }
+    ss.replaceSync = function (text) { doReplaceSync(text); };
+    ss.replace = function (text) {
+      try { doReplaceSync(text); } catch (e) { return Promise.reject(e); }
+      return Promise.resolve(ss);
+    };
     try { if (globalThis.CSSStyleSheet && globalThis.CSSStyleSheet.prototype) { Object.setPrototypeOf(ss, globalThis.CSSStyleSheet.prototype); } } catch (e) {}
     return ss;
   }
@@ -7073,12 +7109,6 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   function makeConstructedSheet(cssText) {
     var ss = makeStyleSheetCore(parseRuleStructs(cssText), null);
     ss.__constructed = true;
-    ss.replaceSync = function (text) {
-      var ns = parseRuleStructs(String(text));
-      ss.__structs.length = 0; for (var i = 0; i < ns.length; i++) { ss.__structs.push(ns[i]); }
-      ss.cssRules.__rebuild();
-    };
-    ss.replace = function (text) { try { ss.replaceSync(text); return Promise.resolve(ss); } catch (e) { return Promise.reject(e); } };
     return ss;
   }
   // The live sheet for a <style>/<link> element. Parses textContent; re-renders on CSSOM edits, and
@@ -8860,6 +8890,28 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         });
       }
     }
+    // HTMLLinkElement.disabled / HTMLStyleElement.disabled. For <link>, `disabled` is backed by the
+    // content attribute (and excludes the sheet from document.styleSheets while set). For <style>,
+    // `disabled` mirrors the sheet's `disabled` state.
+    var __linkProto = globalThis.HTMLLinkElement && globalThis.HTMLLinkElement.prototype;
+    if (__linkProto) {
+      Object.defineProperty(__linkProto, "disabled", {
+        get: function () { return this.getAttribute("disabled") != null || !!this.__sheetDisabled; },
+        set: function (v) {
+          if (v) { this.setAttribute("disabled", ""); def(this, "__sheetDisabled", true); }
+          else { this.removeAttribute("disabled"); def(this, "__sheetDisabled", false); }
+        },
+        enumerable: true, configurable: true
+      });
+    }
+    var __styleProto = globalThis.HTMLStyleElement && globalThis.HTMLStyleElement.prototype;
+    if (__styleProto) {
+      Object.defineProperty(__styleProto, "disabled", {
+        get: function () { var s = this.sheet; return s ? !!s.disabled : false; },
+        set: function (v) { var s = this.sheet; if (s) { s.disabled = !!v; } },
+        enumerable: true, configurable: true
+      });
+    }
   } catch (e) {}
 
   // Document / Window and the other DOM interface constructors pages reference as globals
@@ -8889,36 +8941,6 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "TimeRanges", "ValidityState", "HTMLFormControlsCollection", "RadioNodeList",
   ];
   for (var di = 0; di < domIfaces.length; di++) { defClass(domIfaces[di]); }
-  // A constructable `new CSSStyleSheet()` backed by an in-memory rule buffer (no document). Enough
-  // for CSSOM tests that build a sheet, insertRule, and read `cssRules[i].style`.
-  try {
-    var CSSStyleSheetCtor = function CSSStyleSheet(opts) {
-      var fakeEl = { textContent: "" };
-      var sheet = makeStyleSheet(fakeEl);
-      sheet.insertRule = function (rule, index) {
-        var rs = parseCssRules(fakeEl.textContent);
-        index = index == null ? 0 : (index >>> 0);
-        if (index > rs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
-        rs.splice(index, 0, String(rule));
-        fakeEl.textContent = rs.join("\n");
-        return index;
-      };
-      sheet.deleteRule = function (index) {
-        var rs = parseCssRules(fakeEl.textContent);
-        index = index >>> 0;
-        if (index >= rs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
-        rs.splice(index, 1);
-        fakeEl.textContent = rs.join("\n");
-      };
-      sheet.replaceSync = function (text) { fakeEl.textContent = String(text); };
-      sheet.replace = function (text) { fakeEl.textContent = String(text); return Promise.resolve(sheet); };
-      try { Object.setPrototypeOf(sheet, CSSStyleSheetCtor.prototype); } catch (e) {}
-      return sheet;
-    };
-    var oldProto = (globalThis.CSSStyleSheet && globalThis.CSSStyleSheet.prototype) || {};
-    CSSStyleSheetCtor.prototype = oldProto;
-    try { def(globalThis, "CSSStyleSheet", CSSStyleSheetCtor); } catch (e) {}
-  } catch (e) {}
 
   // --- CSSOM interface hierarchy + CSSRule type constants ------------------------------------
   // StyleSheet <- CSSStyleSheet; CSSRule <- {CSSStyleRule, CSSGroupingRule <- {CSSMediaRule,
@@ -8957,13 +8979,158 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         options = options || {};
         if (options.media != null) { sheet.media.mediaText = String(options.media); }
         if (options.disabled) { sheet.disabled = true; }
-        if (options.baseURL != null) { sheet.__href = String(options.baseURL); }
+        // `baseURL` is resolved against the constructor document's base URL. An invalid result
+        // (e.g. a URL that fails to parse) is a NotAllowedError. The resolved URL becomes the
+        // constructed sheet's base for relative `url(...)` resolution in its rules.
+        if (options.baseURL != null) {
+          var base;
+          try { base = document.baseURI || (typeof location !== "undefined" ? location.href : undefined); } catch (e) { base = undefined; }
+          var resolved;
+          try { resolved = new URL(String(options.baseURL), base).href; }
+          catch (e) { throw new globalThis.DOMException("Constructed style sheet base URL is not valid.", "NotAllowedError"); }
+          sheet.__baseURL = resolved;
+        }
+        // The sheet's constructor document (used to validate adoptedStyleSheets membership).
+        try { sheet.__constructorDocument = document; } catch (e) {}
         return sheet;
       };
       Real.prototype = ctor.prototype;
       def(globalThis, "CSSStyleSheet", Real);
     }
   })();
+
+  // --- adoptedStyleSheets (Document / ShadowRoot) -------------------------------------------
+  // CSSOM ObservableArray<CSSStyleSheet>. Each entry must be a CONSTRUCTED sheet whose constructor
+  // document is `ownerDoc`; otherwise setting/inserting throws NotAllowedError. Adopted sheets are
+  // mirrored into a managed `<style>` element appended to <head> (for the Document) so the cascade
+  // applies them. `host.__refreshAdopted()` re-serializes the mirror; `markDirty` invokes it when an
+  // adopted sheet mutates so rule edits / replaceSync are reflected in rendering.
+  function installAdoptedStyleSheets(host, ownerDoc) {
+    var backing = [];          // the actual CSSStyleSheet entries
+    var mirror = null;         // managed <style> element (lazily created for the Document)
+    function ensureMirror() {
+      if (mirror) { return mirror; }
+      try {
+        mirror = ownerDoc.createElement("style");
+        mirror.setAttribute("data-adopted-stylesheets", "");
+        var head = ownerDoc.head || ownerDoc.getElementsByTagName("head")[0] || ownerDoc.documentElement || ownerDoc.body;
+        if (head) { head.appendChild(mirror); }
+      } catch (e) { mirror = null; }
+      return mirror;
+    }
+    function serialize() {
+      var s = "";
+      for (var i = 0; i < backing.length; i++) {
+        var sh = backing[i];
+        if (!sh || sh.disabled) { continue; }
+        try { s += (s ? "\n" : "") + sh.cssText; } catch (e) {}
+      }
+      return s;
+    }
+    function refresh() {
+      var m = ensureMirror();
+      if (!m) { return; }
+      try { m.textContent = serialize(); } catch (e) {}
+    }
+    host.__refreshAdopted = refresh;
+    // Track host on each sheet so mutating it (markDirty) refreshes our mirror.
+    function track(sh) {
+      if (!sh) { return; }
+      if (!sh.__adoptHosts) { try { def(sh, "__adoptHosts", []); } catch (e) { sh.__adoptHosts = []; } }
+      if (sh.__adoptHosts.indexOf(host) < 0) { sh.__adoptHosts.push(host); }
+    }
+    function untrack(sh) {
+      if (!sh || !sh.__adoptHosts) { return; }
+      // Only untrack if no longer present in backing.
+      if (backing.indexOf(sh) >= 0) { return; }
+      var idx = sh.__adoptHosts.indexOf(host);
+      if (idx >= 0) { sh.__adoptHosts.splice(idx, 1); }
+    }
+    function validate(v) {
+      var ctor = globalThis.CSSStyleSheet;
+      var ok = v && (typeof v === "object") && v.__constructed === true &&
+               (ctor && ctor.prototype ? (v instanceof ctor) : true);
+      if (!ok) {
+        throw new globalThis.DOMException("Can't adopt a non-constructed or foreign CSSStyleSheet.", "NotAllowedError");
+      }
+      if (v.__constructorDocument && v.__constructorDocument !== ownerDoc) {
+        throw new globalThis.DOMException("Sheet constructor document does not match.", "NotAllowedError");
+      }
+    }
+    // Build the observable-array proxy over `backing`. Index writes, length writes and the mutating
+    // Array methods (push/splice/...) validate new entries and refresh the mirror afterwards.
+    function makeArray(initial) {
+      var arr = [];
+      for (var i = 0; i < initial.length; i++) { arr.push(initial[i]); }
+      var proxy = new Proxy(arr, {
+        set: function (target, prop, value) {
+          if (typeof prop === "string" && /^[0-9]+$/.test(prop)) {
+            validate(value);
+            target[prop] = value;
+            rebuildBacking(target);
+            return true;
+          }
+          if (prop === "length") {
+            target.length = value;
+            rebuildBacking(target);
+            return true;
+          }
+          target[prop] = value;
+          return true;
+        },
+        deleteProperty: function (target, prop) {
+          delete target[prop];
+          if (typeof prop === "string" && /^[0-9]+$/.test(prop)) { rebuildBacking(target); }
+          return true;
+        }
+      });
+      // Wrap the mutating methods so validation/refresh runs even through the proxy.
+      ["push", "unshift", "splice", "fill", "copyWithin"].forEach(function (m) {
+        var orig = Array.prototype[m];
+        def(arr, m, function () {
+          // Validate any incoming sheet arguments before mutating.
+          if (m === "push" || m === "unshift") {
+            for (var i = 0; i < arguments.length; i++) { validate(arguments[i]); }
+          } else if (m === "splice") {
+            for (var j = 2; j < arguments.length; j++) { validate(arguments[j]); }
+          } else if (m === "fill") {
+            validate(arguments[0]);
+          }
+          var r = orig.apply(arr, arguments);
+          rebuildBacking(arr);
+          return r;
+        });
+      });
+      return proxy;
+    }
+    var liveArray = makeArray([]);
+    // Re-sync `backing` from the current array contents (after any mutation), retrack sheets,
+    // then refresh the mirror.
+    function rebuildBacking(arr) {
+      var old = backing.slice();
+      backing = [];
+      for (var i = 0; i < arr.length; i++) { if (arr[i] != null) { backing.push(arr[i]); track(arr[i]); } }
+      for (var k = 0; k < old.length; k++) { untrack(old[k]); }
+      refresh();
+    }
+    Object.defineProperty(host, "adoptedStyleSheets", {
+      get: function () { return liveArray; },
+      set: function (v) {
+        if (v == null) { throw new TypeError("adoptedStyleSheets requires a sequence"); }
+        var next = [];
+        var len = v.length >>> 0;
+        for (var i = 0; i < len; i++) { var item = v[i]; validate(item); next.push(item); }
+        var old = backing.slice();
+        liveArray = makeArray(next);
+        backing = next.slice();
+        for (var t = 0; t < backing.length; t++) { track(backing[t]); }
+        for (var u = 0; u < old.length; u++) { untrack(old[u]); }
+        refresh();
+      },
+      enumerable: true, configurable: true
+    });
+  }
+  try { installAdoptedStyleSheets(globalThis.document, globalThis.document); } catch (e) {}
 
   // --- Image / Audio / media element constructors ------------------------------------------
   if (typeof globalThis.Image !== "function") {
@@ -13371,6 +13538,93 @@ mod tests {
             out[0].value.as_deref(),
             Some("6|:left|1px|@page :left { margin: 1px; }")
         );
+    }
+
+    #[test]
+    fn constructed_stylesheet_replace_sync() {
+        // `new CSSStyleSheet()` then replaceSync(".a{color:red}") -> one rule. @import is stripped.
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var ss = new CSSStyleSheet(); ss.replaceSync('.a{color:red}'); \
+                 var n1 = ss.cssRules.length; \
+                 ss.replaceSync('@import url(x.css); .b{color:blue}'); \
+                 [n1, ss.cssRules.length, ss.cssRules[0].selectorText].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|1|.b"));
+    }
+
+    #[test]
+    fn replace_sync_on_regular_sheet_throws_not_allowed() {
+        // replaceSync on a <style>'s live (non-constructed) sheet throws NotAllowedError.
+        let (mut doc, body) = doc_with_body("");
+        let style = doc.append_element(body, "style");
+        doc.append_child(
+            style,
+            dom::NodeData::Text(".a { color: red }".to_string()),
+        );
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var s = document.querySelector('style').sheet; \
+                 var name = ''; try { s.replaceSync('.b{color:blue}'); name = 'no-throw'; } \
+                 catch (e) { name = e.name; } name"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("NotAllowedError"));
+    }
+
+    #[test]
+    fn constructed_sheet_insert_import_throws_syntax_error() {
+        let (doc, _) = doc_with_body("");
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var name = ''; try { (new CSSStyleSheet()).insertRule('@import url(x.css)'); name = 'no-throw'; } \
+                 catch (e) { name = e.name; } name"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("SyntaxError"));
+    }
+
+    #[test]
+    fn adopted_stylesheets_accepts_constructed_rejects_regular() {
+        // Setting document.adoptedStyleSheets to a constructed sheet works; a non-constructed
+        // (live <style>) sheet throws NotAllowedError.
+        let (mut doc, body) = doc_with_body("");
+        let style = doc.append_element(body, "style");
+        doc.append_child(
+            style,
+            dom::NodeData::Text(".a { color: red }".to_string()),
+        );
+        let (_d, out) = run_with_dom(
+            doc,
+            vec![
+                "var c = new CSSStyleSheet(); c.replaceSync('.a{color:red}'); \
+                 document.adoptedStyleSheets = [c]; \
+                 var okLen = document.adoptedStyleSheets.length; \
+                 var same = document.adoptedStyleSheets[0] === c; \
+                 var reg = document.querySelector('style').sheet; \
+                 var name = ''; try { document.adoptedStyleSheets = [reg]; name = 'no-throw'; } \
+                 catch (e) { name = e.name; } \
+                 [okLen, same, name].join('|')"
+                    .to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|true|NotAllowedError"));
     }
 
     #[test]
