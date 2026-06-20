@@ -7539,6 +7539,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // re-parses if the page mutates the element's text out-of-band (e.g. `styleEl.firstChild.data`).
   function makeStyleSheet(styleEl) {
     var initial = styleEl.textContent || "";
+    // A <link rel=stylesheet> has no textContent — its rules come from the fetched external CSS.
+    // `__fetch` is a synchronous GET via the host fetcher (the engine already fetched it for the
+    // cascade, so this hits the net cache).
+    if (!initial && styleEl.tagName === "LINK") {
+      try {
+        var __h = styleEl.getAttribute && styleEl.getAttribute("href");
+        if (__h && typeof __fetch === "function") { initial = __fetch(__h) || ""; }
+      } catch (e) {}
+    }
     var ss = makeStyleSheetCore(parseRuleStructs(initial), styleEl);
     ss.__lastText = initial;
     // The sheet's `media` reflects the owner <style>/<link> element's `media` content attribute.
@@ -7547,6 +7556,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     ss.__media = makeMediaList(mediaHolder, null);
     ss.__sync = function () {
       if (ss.__rendering) { return; }
+      // A <link>'s rules come from its fetched CSS, not textContent — don't let an empty textContent
+      // clear them (and the page can't mutate a link's CSS text via the DOM anyway).
+      if (styleEl.tagName === "LINK") { return; }
       var cur = styleEl.textContent || "";
       if (cur === ss.__lastText) { return; }
       ss.__lastText = cur;
