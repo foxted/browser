@@ -902,9 +902,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             responder.tryToPerform(#selector(NSText.copy(_:)), with: sender)
             return
         }
-        if copySelectionToPasteboard() { return }
-        // No page selection: let the focused responder (if any) handle a normal copy.
-        window?.firstResponder?.tryToPerform(#selector(NSText.copy(_:)), with: sender)
+        // Otherwise copy the page's text selection (a no-op if nothing is selected). We must NOT
+        // forward `copy:` up the responder chain here: the app delegate is itself in that chain, so
+        // it would route straight back into this method and recurse until the stack overflows.
+        copySelectionToPasteboard()
     }
 
     /// Route a key event to the focused page text field. Returns true if consumed. Lets anything
