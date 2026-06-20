@@ -285,9 +285,20 @@ fn request_streaming_inner(
     let mut reader = resp.into_reader().take(MAX_BODY_BYTES);
     let mut buf = [0u8; 32 * 1024];
     loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("failed to read body: {e}"))?;
+        let n = match reader.read(&mut buf) {
+            Ok(n) => n,
+            // Many servers (e.g. Python's wptserve) close the TLS connection without sending the
+            // `close_notify` alert; rustls reports that as `UnexpectedEof`. The HTTP body has already
+            // been received (and streamed via `on_chunk`), so — like real browsers — treat the
+            // unclean close as a clean end-of-stream instead of a fatal load error.
+            Err(e)
+                if e.kind() == std::io::ErrorKind::UnexpectedEof
+                    || e.to_string().contains("close_notify") =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("failed to read body: {e}")),
+        };
         if n == 0 {
             break;
         }
