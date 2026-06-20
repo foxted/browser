@@ -210,6 +210,9 @@ pub struct ComputedStyle {
     pub background_color: Option<(u8, u8, u8)>,
     /// Font size in pixels.
     pub font_size: f32,
+    /// The specified `font-family` list, serialized to CSSOM canonical form (quoting normalized).
+    /// `None` = the UA/initial default (reported as the empty string). Inherited.
+    pub font_family: Option<String>,
     pub bold: bool,
     pub italic: bool,
     pub text_align: TextAlign,
@@ -605,6 +608,7 @@ impl Default for ComputedStyle {
             color: ua_default_text_color(),
             background_color: None,
             font_size: 16.0,
+            font_family: None,
             bold: false,
             italic: false,
             text_align: TextAlign::Left,
@@ -791,6 +795,7 @@ impl ComputedStyle {
             "border-radius" => px(self.border_radius),
 
             // --- typography ---
+            "font-family" => self.font_family.clone().unwrap_or_default(),
             "font-size" => px(self.font_size),
             "font-weight" => if self.bold { "700" } else { "400" }.to_string(),
             "font-style" => if self.italic { "italic" } else { "normal" }.to_string(),
@@ -1159,6 +1164,119 @@ impl ComputedStyle {
         // Every name here maps to a tracked field, so all are non-empty.
         NAMES.to_vec()
     }
+}
+
+/// True if a quoted `<family-name>` body must stay quoted (it would otherwise be reinterpreted as a
+/// generic-family / CSS-wide keyword / `default`).
+fn is_reserved_font_family_word(body: &str) -> bool {
+    matches!(
+        body.to_ascii_lowercase().as_str(),
+        "serif" | "sans-serif" | "cursive" | "fantasy" | "monospace" | "system-ui" | "math"
+            | "ui-serif" | "ui-sans-serif" | "ui-monospace" | "ui-rounded"
+            | "default" | "inherit" | "initial" | "unset" | "revert" | "revert-layer"
+    )
+}
+
+fn is_css_ident_word(w: &str) -> bool {
+    let mut chars = w.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    // Optional leading hyphen.
+    let (first, rest_from): (char, bool) = if first == '-' {
+        match chars.next() {
+            Some(c) => (c, true),
+            None => return false,
+        }
+    } else {
+        (first, false)
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    let _ = rest_from;
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Serialize a `font-family` list to CSSOM canonical form: split on top-level commas, normalize the
+/// quoting of each family name (unquote a quoted name only when its body is a single-space-separated
+/// sequence of valid CSS identifiers that round-trips and isn't a reserved word), and join with
+/// `, `.
+pub fn serialize_font_family(val: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for part in split_top_level_commas(val) {
+        let fam = part.trim();
+        if fam.is_empty() {
+            continue;
+        }
+        let first = fam.chars().next().unwrap();
+        if first == '"' || first == '\'' {
+            let body: String = fam.chars().skip(1).take(fam.chars().count().saturating_sub(2)).collect();
+            let words: Vec<&str> = body.split(' ').collect();
+            let all_ident = !words.is_empty() && words.iter().all(|w| is_css_ident_word(w));
+            let round_trips = all_ident && words.join(" ") == body;
+            if round_trips && !is_reserved_font_family_word(&body) {
+                out.push(body);
+            } else {
+                out.push(format!("\"{}\"", body.replace('\\', "\\\\").replace('"', "\\\"")));
+            }
+        } else {
+            // Unquoted: collapse internal whitespace runs to single spaces.
+            let collapsed: Vec<&str> = fam.split_whitespace().collect();
+            out.push(collapsed.join(" "));
+        }
+    }
+    out.join(", ")
+}
+
+/// Split a string on top-level commas (not inside parens or quotes).
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let bytes: Vec<char> = s.chars().collect();
+    let mut i = 0usize;
+    let mut buf = String::new();
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            buf.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' => {
+                quote = Some(c);
+                buf.push(c);
+            }
+            '(' => {
+                depth += 1;
+                buf.push(c);
+            }
+            ')' => {
+                if depth > 0 {
+                    depth -= 1;
+                }
+                buf.push(c);
+            }
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut buf));
+            }
+            _ => buf.push(c),
+        }
+        i += 1;
+    }
+    out.push(buf);
+    out
 }
 
 /// Serialize a string value as a CSS `<string>` (double-quoted, with `"` and `\` escaped) — the
@@ -1645,6 +1763,7 @@ fn compute_element_style<'a>(
         color: parent.color,
         background_color: None, // not inherited
         font_size: parent.font_size,
+        font_family: parent.font_family.clone(),
         bold: parent.bold,
         italic: parent.italic,
         text_align: parent.text_align,
@@ -2973,6 +3092,18 @@ fn apply_declaration(
         "font-size" => {
             if let Some(sz) = parse_font_size(val, parent.font_size) {
                 style.font_size = sz;
+            }
+        }
+        "font-family" => {
+            let trimmed = val.trim();
+            let lower = trimmed.to_ascii_lowercase();
+            if lower == "inherit" {
+                style.font_family = parent.font_family.clone();
+            } else if lower == "initial" || lower == "unset" {
+                // font-family inherits, so `unset` == `inherit`; `initial` is the UA default (None).
+                style.font_family = if lower == "unset" { parent.font_family.clone() } else { None };
+            } else if !trimmed.is_empty() {
+                style.font_family = Some(serialize_font_family(trimmed));
             }
         }
         "font-weight" => match parse_font_weight(val) {
@@ -5133,6 +5264,9 @@ enum Pseudo {
     Active,
     FocusWithin,
     FocusVisible,
+    /// `:lang(<ident>)` — matches if the element's (inherited) `lang` equals the argument or begins
+    /// with `<arg>-`. The argument is stored lowercased.
+    Lang(String),
     // Functional
     Not(Vec<ComplexSelector>),
     Is(Vec<ComplexSelector>),
@@ -5914,6 +6048,11 @@ fn parse_pseudo(name: &str, arg: Option<&str>) -> Option<(Pseudo, Spec)> {
         | "in-range" | "out-of-range" | "valid" | "invalid" | "indeterminate" | "autofill" => {
             Pseudo::NeverMatch
         }
+        "lang" => {
+            let a = arg?.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+            if a.is_empty() { return None; }
+            Pseudo::Lang(a.to_ascii_lowercase())
+        }
         "nth-child" => Pseudo::NthChild(parse_nth(arg?)?),
         "nth-last-child" => Pseudo::NthLastChild(parse_nth(arg?)?),
         "nth-of-type" => Pseudo::NthOfType(parse_nth(arg?)?),
@@ -6248,6 +6387,12 @@ fn pseudo_matches(doc: &dom::Document, id: dom::NodeId, el: &dom::ElementData, p
             let f = interaction_focused();
             f == Some(id.0) || f.map(|fn_| is_ancestor(doc, id, dom::NodeId(fn_))).unwrap_or(false)
         }
+        Pseudo::Lang(want) => element_lang(doc, id)
+            .map(|l| {
+                let l = l.to_ascii_lowercase();
+                l == *want || l.starts_with(&format!("{want}-"))
+            })
+            .unwrap_or(false),
         Pseudo::Not(list) => !list.iter().any(|s| complex_matches(doc, id, s)),
         Pseudo::Is(list) | Pseudo::Where(list) => list.iter().any(|s| complex_matches(doc, id, s)),
         Pseudo::NeverMatch => false,
@@ -6256,6 +6401,28 @@ fn pseudo_matches(doc: &dom::Document, id: dom::NodeId, el: &dom::ElementData, p
 
 fn has_attr(el: &dom::ElementData, name: &str) -> bool {
     el.attrs.keys().any(|k| k.eq_ignore_ascii_case(name))
+}
+
+/// The content language of element `id` per HTML: the `lang` (or `xml:lang`) attribute of the
+/// nearest inclusive ancestor that has one. Returns `None` if no ancestor sets a language.
+fn element_lang(doc: &dom::Document, id: dom::NodeId) -> Option<String> {
+    let mut cur = Some(id);
+    while let Some(n) = cur {
+        if let Some(el) = el_of(doc, n) {
+            if let Some((_, v)) = el
+                .attrs
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("lang") || k.eq_ignore_ascii_case("xml:lang"))
+            {
+                let v = v.trim();
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        cur = parent_of(doc, n);
+    }
+    None
 }
 
 fn is_form_control(tag: &str) -> bool {
@@ -6661,6 +6828,41 @@ mod tests {
         let s = &map[&hr];
         assert_eq!(s.height, Some(1.0), "hr should have a 1px height so it paints");
         assert!(s.background_color.is_some(), "hr should have a visible background fill");
+    }
+
+    #[test]
+    fn lang_pseudo_class_matches_inherited_language() {
+        // `:lang(zh)` and `:lang(zh-CN)` both match an element whose inherited lang is `zh-CN`;
+        // `:lang(tr)` does not.
+        let sheet = css::parse(
+            ":lang(zh) { color: #010101 }
+             :lang(zh-CN) { background-color: #020202 }
+             :lang(tr) { font-size: 99px }",
+        );
+        let doc = html::parse(
+            r#"<html><body><div lang="zh-CN"><span>x</span></div></body></html>"#,
+        );
+        let map = cascade(&doc, &[sheet]);
+        let span = elem(&doc, |e| e.tag == "span");
+        // Inherited lang from the ancestor div: :lang(zh) and :lang(zh-CN) match (color/bg set),
+        // :lang(tr) does not (font-size stays the inherited default, not 99px).
+        assert_eq!(map[&span].color, (1, 1, 1), "span :lang(zh) should set color");
+        assert_eq!(map[&span].background_color, Some((2, 2, 2)), "span :lang(zh-CN) should set bg");
+        assert!((map[&span].font_size - 99.0).abs() > 0.5, ":lang(tr) must not match");
+    }
+
+    #[test]
+    fn font_family_serializes_with_canonical_quoting() {
+        // Generic families/CSS-wide keywords stay quoted; valid ident sequences unquote.
+        assert_eq!(serialize_font_family("'Times New Roman'"), "Times New Roman");
+        assert_eq!(serialize_font_family("\"serif\""), "\"serif\"");
+        assert_eq!(serialize_font_family("'34J'"), "\"34J\"");
+        assert_eq!(serialize_font_family("'A  B'"), "\"A  B\"");
+        assert_eq!(serialize_font_family("Veronica"), "Veronica");
+        assert_eq!(
+            serialize_font_family("Twisty Tie, '34J', \"serif\", Veronica, sans-serif"),
+            "Twisty Tie, \"34J\", \"serif\", Veronica, sans-serif"
+        );
     }
 
     #[test]

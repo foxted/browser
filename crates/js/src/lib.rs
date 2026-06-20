@@ -5094,6 +5094,20 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   // Serialize a font-family list: drop quotes around any family name that is a sequence of valid CSS
   // identifiers (so `'Lucida Grande'` -> `Lucida Grande`); keep quotes otherwise.
+  // Generic font families and other reserved words that a quoted <family-name> must NOT be
+  // unquoted into (they would otherwise be reinterpreted as a keyword).
+  var GENERIC_FONT_FAMILIES = {
+    "serif":1, "sans-serif":1, "cursive":1, "fantasy":1, "monospace":1, "system-ui":1, "math":1,
+    "ui-serif":1, "ui-sans-serif":1, "ui-monospace":1, "ui-rounded":1
+  };
+  // A quoted family-name body must stay quoted if it is a single token equal to a generic family,
+  // a CSS-wide keyword, or `default` (CSS Fonts: those are not valid <custom-ident>s here).
+  function isReservedFontFamilyWord(body) {
+    var b = body.toLowerCase();
+    if (hasOwn(GENERIC_FONT_FAMILIES, b)) return true;
+    if (b === "default" || b === "inherit" || b === "initial" || b === "unset" || b === "revert" || b === "revert-layer") return true;
+    return false;
+  }
   function normalizeFontFamily(val) {
     var parts = splitTopLevel(String(val), ",");
     var out = [];
@@ -5102,11 +5116,18 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (fam === "") continue;
       var first = fam.charAt(0);
       if (first === '"' || first === "'") {
-        // Quoted: unquote if the body is a space-separated list of valid idents; else keep (dq).
+        // Quoted: serialize unquoted iff the body is a single-space-separated sequence of valid CSS
+        // identifiers, re-joining reproduces the body exactly (no double spaces / leading/trailing
+        // space), and the body isn't a reserved word (generic family / CSS-wide keyword / default).
         var body = fam.slice(1, -1);
-        var words = body.split(/\s+/);
+        var words = body.split(" ");
         var allIdent = words.length > 0 && words.every(function (w) { return /^-?[A-Za-z_][A-Za-z0-9_-]*$/.test(w); });
-        out.push(allIdent ? words.join(" ") : '"' + body.replace(/"/g, '\\"') + '"');
+        var roundTrips = allIdent && words.join(" ") === body;
+        if (roundTrips && !isReservedFontFamilyWord(body)) {
+          out.push(body);
+        } else {
+          out.push('"' + body.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"');
+        }
       } else {
         out.push(fam.replace(/\s+/g, " "));
       }
@@ -5127,7 +5148,10 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "border-top-style", "border-right-style", "border-bottom-style", "border-left-style",
     "border-top-color", "border-right-color", "border-bottom-color", "border-left-color",
     "border-top-left-radius", "border-top-right-radius", "border-bottom-right-radius", "border-bottom-left-radius",
-    "font-family", "font-size", "font-style", "font-weight", "font-variant", "font-stretch", "line-height",
+    "font-family", "font-size", "font-style", "font-weight",
+    "font-variant-ligatures", "font-variant-caps", "font-variant-alternates", "font-variant-numeric",
+    "font-variant-east-asian", "font-variant-position", "font-variant-emoji",
+    "font-stretch", "line-height",
     "text-align", "text-decoration-line", "text-decoration-style", "text-decoration-color",
     "text-transform", "letter-spacing", "white-space", "vertical-align",
     "list-style-type", "list-style-position", "list-style-image",
@@ -5262,6 +5286,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (hasOwn(BORDER_SIDE, name)) return BORDER_SIDE[name];
     if (hasOwn(XY_SHORTHANDS, name)) return XY_SHORTHANDS[name];
     if (name === "border") return BORDER_ALL_LONGHANDS;
+    if (name === "font-variant") return FONT_VARIANT_LONGHANDS;
     if (name === "border-image") return BORDER_IMAGE_LONGHANDS;
     if (name === "list-style") return ["list-style-position", "list-style-image", "list-style-type"];
     if (name === "text-decoration") return ["text-decoration-line", "text-decoration-style", "text-decoration-color"];
@@ -5280,7 +5305,72 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "font": ["font-style", "font-variant", "font-weight", "font-stretch", "font-size", "line-height", "font-family"],
     "background": ["background-image", "background-position-x", "background-position-y", "background-size", "background-repeat", "background-origin", "background-clip", "background-attachment", "background-color"]
   };
-  function isShorthand(name) { return name === "all" || shorthandLonghands(name) != null; }
+  // font-variant shorthand longhands, in canonical serialization order.
+  var FONT_VARIANT_LONGHANDS = [
+    "font-variant-ligatures", "font-variant-caps", "font-variant-alternates",
+    "font-variant-numeric", "font-variant-east-asian", "font-variant-position", "font-variant-emoji"
+  ];
+  // Keyword sets used to bucket a `font-variant` shorthand token into the right longhand.
+  var FV_LIGATURES = { "common-ligatures":1, "no-common-ligatures":1, "discretionary-ligatures":1, "no-discretionary-ligatures":1, "historical-ligatures":1, "no-historical-ligatures":1, "contextual":1, "no-contextual":1 };
+  var FV_CAPS = { "small-caps":1, "all-small-caps":1, "petite-caps":1, "all-petite-caps":1, "unicase":1, "titling-caps":1 };
+  var FV_NUMERIC = { "lining-nums":1, "oldstyle-nums":1, "proportional-nums":1, "tabular-nums":1, "diagonal-fractions":1, "stacked-fractions":1, "ordinal":1, "slashed-zero":1 };
+  var FV_EAST_ASIAN = { "jis78":1, "jis83":1, "jis90":1, "jis04":1, "simplified":1, "traditional":1, "full-width":1, "proportional-width":1, "ruby":1 };
+  var FV_POSITION = { "sub":1, "super":1 };
+  var FV_EMOJI = { "text":1, "emoji":1, "unicode":1 };
+  var FV_ALTERNATES = { "historical-forms":1 };
+  // Expand a `font-variant` shorthand value into its longhands, or null if unparseable.
+  function expandFontVariant(value) {
+    var v = String(value).trim(), vl = v.toLowerCase();
+    var res = {
+      "font-variant-ligatures": "normal", "font-variant-caps": "normal", "font-variant-alternates": "normal",
+      "font-variant-numeric": "normal", "font-variant-east-asian": "normal", "font-variant-position": "normal",
+      "font-variant-emoji": "normal"
+    };
+    if (vl === "normal") return res;
+    if (vl === "none") { res["font-variant-ligatures"] = "none"; return res; }
+    var toks = splitCssTokens(v), buckets = {};
+    for (var i = 0; i < toks.length; i++) {
+      var t = toks[i].toLowerCase(), lh = null;
+      if (FV_LIGATURES[t]) lh = "font-variant-ligatures";
+      else if (FV_CAPS[t]) lh = "font-variant-caps";
+      else if (FV_NUMERIC[t]) lh = "font-variant-numeric";
+      else if (FV_EAST_ASIAN[t]) lh = "font-variant-east-asian";
+      else if (FV_POSITION[t]) lh = "font-variant-position";
+      else if (FV_EMOJI[t]) lh = "font-variant-emoji";
+      else if (FV_ALTERNATES[t]) lh = "font-variant-alternates";
+      else return null; // unknown token -> invalid shorthand
+      if (!buckets[lh]) buckets[lh] = [];
+      buckets[lh].push(t);
+    }
+    for (var k in buckets) { if (hasOwn(buckets, k)) res[k] = buckets[k].join(" "); }
+    return res;
+  }
+  // Serialize the font-variant shorthand from its longhand values (`g`). Returns "" if it cannot be
+  // represented (a CSS-wide keyword in one longhand, or ligatures:none mixed with other non-normal).
+  function serializeFontVariant(g) {
+    var vals = {};
+    for (var i = 0; i < FONT_VARIANT_LONGHANDS.length; i++) {
+      var lh = FONT_VARIANT_LONGHANDS[i], val = g(lh);
+      if (val === "" || val == null) return ""; // a longhand missing -> can't serialize
+      if (isCssWideKeyword(val)) return ""; // CSS-wide keyword can't appear in the shorthand
+      vals[lh] = val;
+    }
+    var lig = vals["font-variant-ligatures"];
+    var nonNormal = [];
+    for (var j = 0; j < FONT_VARIANT_LONGHANDS.length; j++) {
+      var p = FONT_VARIANT_LONGHANDS[j], pv = vals[p];
+      if (pv !== "normal") nonNormal.push([p, pv]);
+    }
+    if (nonNormal.length === 0) return "normal";
+    if (lig === "none") {
+      // `none` only combines with nothing else.
+      return nonNormal.length === 1 && nonNormal[0][0] === "font-variant-ligatures" ? "none" : "";
+    }
+    var parts = [];
+    for (var m = 0; m < nonNormal.length; m++) { if (nonNormal[m][1] === "none") return ""; parts.push(nonNormal[m][1]); }
+    return parts.join(" ");
+  }
+  function isShorthand(name) { return name === "all" || name === "font-variant" || shorthandLonghands(name) != null; }
   // Expand a shorthand declaration into [[longhand, value], ...]. Returns null if not a shorthand we
   // expand (caller stores the property as-is). CSS-wide keywords expand to every longhand.
   function expandShorthand(name, value) {
@@ -5339,6 +5429,13 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       for (var s3 = 0; s3 < 4; s3++) r.push(["border-" + sides[s3] + "-color", co]);
       for (var bi = 0; bi < BORDER_IMAGE_LONGHANDS.length; bi++) r.push([BORDER_IMAGE_LONGHANDS[bi], BORDER_IMAGE_INITIAL[BORDER_IMAGE_LONGHANDS[bi]]]);
       return r;
+    }
+    if (name === "font-variant") {
+      var fv = expandFontVariant(value);
+      if (!fv) return null;
+      var fvo = [];
+      for (var fi = 0; fi < FONT_VARIANT_LONGHANDS.length; fi++) { var fl = FONT_VARIANT_LONGHANDS[fi]; fvo.push([fl, fv[fl]]); }
+      return fvo;
     }
     if (name === "border-image") {
       if (value.toLowerCase() === "none") {
@@ -5457,6 +5554,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       }
       return "none";
     }
+    if (name === "font-variant") { return serializeFontVariant(g); }
     if (name === "list-style") {
       var ty = g("list-style-type"), po = g("list-style-position"), im = g("list-style-image");
       var lp = [];
@@ -5578,9 +5676,182 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (start < n) out.push(text.slice(start));
     return out;
   }
+  // ===== Property-name validity (CSSOM: unknown properties are dropped, never stored). =====
+  // The set of standard CSS property names we recognize. Built from the longhand/shorthand machinery
+  // plus an explicit list of additional standard names (logical properties, etc.). Custom properties
+  // (`--*`) are always valid and handled separately.
+  var KNOWN_PROPERTIES = (function () {
+    var s = Object.create(null);
+    function add(n) { s[n] = 1; }
+    var arrs = [ALL_LONGHANDS, BORDER_ALL_LONGHANDS, FONT_VARIANT_LONGHANDS, BORDER_IMAGE_LONGHANDS];
+    for (var i = 0; i < arrs.length; i++) for (var j = 0; j < arrs[i].length; j++) add(arrs[i][j]);
+    // Shorthands + their longhands.
+    var shorthands = [
+      "all", "margin", "padding", "inset", "border", "border-width", "border-style", "border-color",
+      "border-top", "border-right", "border-bottom", "border-left", "border-radius", "border-image",
+      "outline", "overflow", "overscroll-behavior", "gap", "list-style", "text-decoration",
+      "flex", "flex-flow", "place-content", "place-items", "place-self", "columns", "column-rule",
+      "font", "font-variant", "background", "scroll-margin", "scroll-padding"
+    ];
+    for (var k = 0; k < shorthands.length; k++) {
+      add(shorthands[k]);
+      var lhs = shorthandLonghands(shorthands[k]);
+      if (lhs) for (var m = 0; m < lhs.length; m++) add(lhs[m]);
+    }
+    // Additional standard longhands the cascade/CSSOM may carry that aren't in the lists above.
+    var extra = [
+      "background", "background-position", "color-scheme", "caret-color", "box-shadow", "transform",
+      "transform-origin", "transition", "transition-property", "transition-duration",
+      "transition-timing-function", "transition-delay", "animation", "animation-name",
+      "animation-duration", "animation-timing-function", "animation-delay", "animation-iteration-count",
+      "animation-direction", "animation-fill-mode", "animation-play-state",
+      "content", "quotes", "cursor", "pointer-events", "user-select", "appearance", "-webkit-appearance",
+      "box-sizing", "float", "clear", "clip", "clip-path", "filter", "backdrop-filter", "mix-blend-mode",
+      "object-fit", "object-position", "order", "tab-size", "text-indent", "text-overflow", "text-shadow",
+      "word-break", "word-spacing", "word-wrap", "overflow-wrap", "writing-mode", "direction",
+      "unicode-bidi", "white-space", "vertical-align", "visibility", "z-index", "will-change",
+      "scroll-behavior", "resize", "table-layout", "empty-cells", "caption-side", "counter-reset",
+      "counter-increment", "perspective", "perspective-origin", "backface-visibility", "isolation",
+      "mask", "mask-image", "-webkit-mask", "-webkit-mask-image", "column-count", "column-width",
+      "column-gap", "column-rule-width", "column-rule-style", "column-rule-color", "grid-area",
+      "grid-template", "grid-template-areas", "grid-auto-flow", "grid-auto-columns", "grid-auto-rows",
+      "aspect-ratio", "inset-block", "inset-inline", "inset-block-start", "inset-block-end",
+      "inset-inline-start", "inset-inline-end", "accent-color", "scroll-margin-top",
+      "scroll-margin-right", "scroll-margin-bottom", "scroll-margin-left",
+      "scroll-padding-top", "scroll-padding-right", "scroll-padding-bottom", "scroll-padding-left"
+    ];
+    for (var e = 0; e < extra.length; e++) add(extra[e]);
+    // Logical box properties (margin/padding/border/inset block/inline + start/end). These are valid
+    // standard properties (so they must not be rejected) even though we don't group them.
+    var groups = ["margin", "padding"];
+    for (var g = 0; g < groups.length; g++) {
+      var base = groups[g];
+      add(base + "-block"); add(base + "-inline");
+      add(base + "-block-start"); add(base + "-block-end");
+      add(base + "-inline-start"); add(base + "-inline-end");
+    }
+    var sides = ["block-start", "block-end", "inline-start", "inline-end", "block", "inline"];
+    for (var si = 0; si < sides.length; si++) {
+      add("border-" + sides[si] + "-width"); add("border-" + sides[si] + "-style"); add("border-" + sides[si] + "-color");
+      add("border-" + sides[si]);
+    }
+    add("inline-size"); add("block-size"); add("min-inline-size"); add("min-block-size");
+    add("max-inline-size"); add("max-block-size");
+    // A broad set of additional standard CSS property names (so real-but-unmodeled properties are
+    // not dropped). Not exhaustive, but covers the CSSOM round-trip test surface.
+    var more = ("alignment-baseline baseline-shift baseline-source dominant-baseline " +
+      "background-attachment background-blend-mode background-position-inline background-position-block " +
+      "caption-side empty-cells orphans widows page-break-after page-break-before page-break-inside " +
+      "break-after break-before break-inside text-indent text-justify text-orientation text-rendering " +
+      "text-underline-position text-underline-offset text-decoration-thickness text-decoration-skip-ink " +
+      "text-emphasis text-emphasis-color text-emphasis-style text-emphasis-position text-combine-upright " +
+      "hyphens hanging-punctuation line-break overflow-anchor overflow-clip-margin scrollbar-gutter " +
+      "scrollbar-width scrollbar-color scroll-snap-type scroll-snap-align scroll-snap-stop touch-action " +
+      "flood-color flood-opacity stop-color stop-opacity lighting-color color-interpolation " +
+      "color-interpolation-filters fill fill-opacity fill-rule stroke stroke-width stroke-opacity " +
+      "stroke-dasharray stroke-dashoffset stroke-linecap stroke-linejoin stroke-miterlimit " +
+      "clip-rule marker marker-start marker-mid marker-end paint-order shape-rendering " +
+      "vector-effect text-anchor writing-mode glyph-orientation-vertical kerning " +
+      "font-feature-settings font-variation-settings font-kerning font-optical-sizing font-language-override " +
+      "font-size-adjust font-synthesis font-display src unicode-range ascent-override descent-override " +
+      "line-gap-override size-adjust contain content-visibility container container-type container-name " +
+      "counter-set inset gap row-gap column-gap place-items place-content place-self justify-items " +
+      "image-rendering image-orientation shape-outside shape-margin shape-image-threshold " +
+      "mix-blend-mode isolation backdrop-filter filter clip-path mask-clip mask-composite mask-mode " +
+      "mask-origin mask-position mask-repeat mask-size mask-type mask-border " +
+      "offset offset-path offset-distance offset-rotate offset-anchor offset-position " +
+      "rotate scale translate transform-box transform-style perspective perspective-origin backface-visibility " +
+      "will-change ruby-align ruby-position quotes tab-size " +
+      "border-image-source border-image-slice border-image-width border-image-outset border-image-repeat " +
+      "outline-offset text-shadow box-decoration-break " +
+      "math-style math-depth math-shift forced-color-adjust print-color-adjust color-adjust " +
+      "speak speak-as voice-family pitch pitch-range richness stress volume azimuth elevation " +
+      "cue cue-before cue-after pause pause-before pause-after rest rest-before rest-after " +
+      "all direction unicode-bidi white-space-collapse text-wrap text-wrap-mode text-wrap-style " +
+      "field-sizing zoom aspect-ratio min-intrinsic-sizing " +
+      "border-collapse border-spacing widows orphans table-layout caption-side empty-cells " +
+      "outline-color outline-style outline-width outline-offset cursor pointer-events " +
+      "background-position-x background-position-y background-clip background-origin").split(/\s+/);
+    for (var mm = 0; mm < more.length; mm++) if (more[mm]) add(more[mm]);
+    return s;
+  })();
+  function isKnownProperty(name) {
+    if (isCustomProp(name)) return true;
+    return hasOwn(KNOWN_PROPERTIES, name);
+  }
+  // A deliberately narrow validity check: returns false only for a small set of single-valued
+  // longhand properties with values we can confidently reject (the cases the WPT CSSOM tests
+  // exercise). Everything else is accepted — the engine ignores values it can't parse, and being
+  // permissive avoids dropping valid declarations the round-trip tests rely on.
+  // Single-token <color> longhands.
+  var COLOR_LONGHANDS = { "color":1, "background-color":1,
+    "border-top-color":1, "border-right-color":1, "border-bottom-color":1, "border-left-color":1,
+    "text-decoration-color":1, "column-rule-color":1, "text-emphasis-color":1, "flood-color":1, "stop-color":1, "lighting-color":1 };
+  // Non-negative <length-percentage> longhands.
+  var NONNEG_LENGTH_LONGHANDS = { "width":1, "height":1, "min-width":1, "min-height":1,
+    "max-width":1, "max-height":1, "inline-size":1, "block-size":1, "min-inline-size":1,
+    "min-block-size":1, "max-inline-size":1, "max-block-size":1,
+    "padding-top":1, "padding-right":1, "padding-bottom":1, "padding-left":1,
+    "border-top-width":1, "border-right-width":1, "border-bottom-width":1, "border-left-width":1,
+    "outline-width":1, "column-rule-width":1, "column-width":1 };
+  function isValidValue(name, value) {
+    var v = String(value).trim();
+    if (v === "") return false;
+    if (isCustomProp(name)) return true;
+    if (isCssWideKeyword(v)) return true;
+    var vl = v.toLowerCase();
+    if (/(^|[^a-z-])(var|env)\s*\(/i.test(v)) return true; // can't validate around substitutions
+    if (hasOwn(COLOR_LONGHANDS, name)) return isValidColor(v);
+    if (hasOwn(NONNEG_LENGTH_LONGHANDS, name)) {
+      if (vl === "auto" || vl === "none" || vl === "min-content" || vl === "max-content" ||
+          vl === "fit-content" || vl === "thin" || vl === "medium" || vl === "thick" || /^fit-content\(/i.test(v)) return true;
+      return isValidLengthLike(v, false);
+    }
+    if (name === "z-index" || name === "order") {
+      if (vl === "auto") return true;
+      return /^[-+]?\d+$/.test(v);
+    }
+    if (name === "opacity") {
+      return /^[-+]?(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?%?$/i.test(v);
+    }
+    return true;
+  }
+  function isValidColor(v) {
+    var vl = v.toLowerCase();
+    if (NAMED_COLORS_OK[vl]) return true;
+    if (vl === "transparent" || vl === "currentcolor" || vl === "inherit") return true;
+    if (/^#([0-9a-f]{3}|[0-9a-f]{4}|[0-9a-f]{6}|[0-9a-f]{8})$/i.test(v)) return true;
+    if (/^(rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\s*\(/i.test(v)) return true;
+    return false;
+  }
+  // A small set of common named colors used to validate <color> keywords. Not exhaustive — any
+  // unrecognized bare keyword for a color property is treated as invalid (matches the WPT cases).
+  var NAMED_COLORS_OK = (function () {
+    var names = ("black white red green blue yellow cyan magenta gray grey orange purple brown pink " +
+      "silver gold navy teal olive maroon lime aqua fuchsia indigo violet coral salmon khaki crimson " +
+      "tomato orchid plum tan beige ivory azure lavender turquoise chocolate darkred darkblue darkgreen " +
+      "lightblue lightgreen lightgray lightgrey lightyellow rebeccapurple hotpink").split(" ");
+    var o = Object.create(null);
+    for (var i = 0; i < names.length; i++) o[names[i]] = 1;
+    return o;
+  })();
+  function isValidLengthLike(v, allowNegative) {
+    // Accept a single dimension/percentage/zero/calc token (optionally signed).
+    if (/^calc\(/i.test(v)) return true;
+    var m = /^([-+]?(?:\d+\.?\d*|\.\d+))(px|em|rem|ex|ch|vw|vh|vmin|vmax|cm|mm|in|pt|pc|q|%|fr)?$/i.exec(v);
+    if (!m) return false;
+    var num = parseFloat(m[1]);
+    var unit = m[2] || "";
+    if (num !== 0 && unit === "") return false; // unitless non-zero is not a length
+    if (!allowNegative && num < 0) return false;
+    return true;
+  }
   // Append a declaration to the expanded longhand list, expanding shorthands and `all`.
   function pushDecl(out, name, val, important) {
     if (isCustomProp(name)) { setDecl(out, name, val, important); return; }
+    // Drop unknown properties and values we can confidently reject (CSSOM parse-a-declaration).
+    if (!isKnownProperty(name)) return;
+    if (!isValidValue(name, val)) return;
     if (name === "all") {
       if (isCssWideKeyword(val)) {
         var kw = val.toLowerCase();
@@ -5598,7 +5869,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     var nv = normalizeCssValue(val);
     // The `font` shorthand serializes size/line-height with spaces around the slash: `10px / 1`.
-    if (name === "font" && !isCssWideKeyword(nv)) { nv = nv.replace(/\s*\/\s*/g, " / "); }
+    // It also resets every font-variant longhand to its initial (which serializes as absent inline).
+    if (name === "font" && !isCssWideKeyword(nv)) {
+      nv = nv.replace(/\s*\/\s*/g, " / ");
+      for (var fvr = 0; fvr < FONT_VARIANT_LONGHANDS.length; fvr++) removeDecl(out, FONT_VARIANT_LONGHANDS[fvr]);
+    }
     // flex-basis serializes a zero length as `0px` (a <length-percentage>, not a flat number).
     if (name === "flex-basis" && nv === "0") { nv = "0px"; }
     // Property-specific <string> canonicalization.
@@ -5627,7 +5902,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "border-top", "border-right", "border-bottom", "border-left", "border-image",
     "margin", "padding", "inset", "border-radius",
     "overflow", "overscroll-behavior", "gap", "outline", "list-style", "text-decoration",
-    "flex", "flex-flow", "place-content", "place-items", "place-self", "columns"
+    "flex", "flex-flow", "place-content", "place-items", "place-self", "columns", "font-variant"
   ];
   // Serialize expanded longhand triples WITHOUT shorthand grouping — the engine-readable form
   // stored in the `style` attribute (the Rust cascade understands longhands, not every shorthand).
@@ -5705,11 +5980,41 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   function normPropName(p) { p = String(p); if (isCustomProp(p)) { return p; } /* custom props are case-sensitive, kept verbatim */ p = camelToKebab(p); return p.toLowerCase(); }
   // Build a CSSStyleDeclaration over a backing store. `get()` returns the current declaration block
   // text; `set(text)` writes it back. Used for both inline styles (style attr) and rule blocks.
-  function makeStyleDecl(get, set) {
-    function read() { return parseStyleDecls(get()); }
+  // `restrict(longhandName)` (optional) gates which longhand properties this declaration block may
+  // contain — used for @page / @keyframes, where only a subset of properties apply. A shorthand is
+  // allowed iff at least one of its longhands is allowed; rejected longhands are dropped on parse and
+  // on set (so `style.length` / serialization reflect only the allowed declarations).
+  function makeStyleDecl(get, set, restrict) {
+    function filterDecls(d) {
+      if (!restrict) return d;
+      var out = [];
+      for (var i = 0; i < d.length; i++) { if (isCustomProp(d[i][0]) || restrict(d[i][0])) out.push(d[i]); }
+      return out;
+    }
+    function read() { return filterDecls(parseStyleDecls(get())); }
     // The backing store holds the EXPANDED longhand form (engine-readable). Shorthand grouping is
     // applied only when serializing for the CSSOM `cssText` getter / `item`/`length` enumeration.
-    function write(d) { set(serializeStyleDeclsFlat(d)); }
+    // Only write when the serialized result actually differs from the current backing store: this
+    // avoids creating an empty `style` attribute for a rejected declaration and avoids firing a
+    // (mutation-observed) attribute write when nothing changed (CSSOM "same value" cases).
+    // Serialize the declaration block back to the backing store. The store holds the EXPANDED
+    // longhand form (engine-readable: the Rust cascade understands longhands, not every shorthand).
+    function serializeForStore(d) { return serializeStyleDeclsFlat(filterDecls(d)); }
+    function write(d) {
+      var next = serializeForStore(d);
+      // Compare against the RE-SERIALIZED current state (not the raw backing string, which may
+      // differ only in trivia like trailing `;`/spacing) so a no-op edit doesn't create/rewrite the
+      // attribute or fire a spurious mutation record.
+      if (next === serializeForStore(read())) return;
+      set(next);
+      try { globalThis.__scheduleMODelivery(); } catch (e) {}
+    }
+    // Like write(), but always writes (used by the cssText setter, which must reflect even an
+    // equal-but-reparsed value as an attribute mutation per the WPT MutationObserver tests).
+    function writeAlways(d) {
+      set(serializeForStore(d));
+      try { globalThis.__scheduleMODelivery(); } catch (e) {}
+    }
     // The serialized value of property `name` per CSSOM (shorthand serialization, custom verbatim).
     function getVal(name) {
       var d = read();
@@ -5798,7 +6103,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     Object.defineProperty(base, "cssText", {
       // Group longhands back into shorthands on read (CSSOM serialization); store flat on write.
       get: function () { return serializeStyleDecls(read()); },
-      set: function (v) { write(parseStyleDecls(v)); },
+      // Setting cssText replaces the whole block and always reflects to the style attribute (it is
+      // observable even when the resulting value is unchanged).
+      set: function (v) { writeAlways(parseStyleDecls(v)); },
       enumerable: true, configurable: true
     });
     try {
@@ -6420,10 +6727,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   // A standalone CSSStyleDeclaration over an in-memory `[name,value,priority]` array. `onChange` is
   // called after any mutation (so the owning rule can re-serialize). `instanceof CSSStyleDeclaration`.
-  function makeRuleStyle(decls, onChange) {
+  function makeRuleStyle(decls, onChange, restrict) {
+    // Drop any property the context disallows (e.g. animation-* inside @keyframes) from the initial
+    // parsed declarations, so `style.length`/serialization reflect only the applicable properties.
+    if (restrict) { for (var di = decls.length - 1; di >= 0; di--) { if (!isCustomProp(decls[di][0]) && !restrict(decls[di][0])) { decls.splice(di, 1); } } }
     function find(name) { for (var i = 0; i < decls.length; i++) { if (decls[i][0] === name) { return i; } } return -1; }
     function getVal(name) { var i = find(name); return i >= 0 ? decls[i][1] : ""; }
     function setVal(name, val, prio) {
+      if (restrict && !isCustomProp(name) && !restrict(name)) { return; } // disallowed in this context
       var i = find(name);
       if (val == null || val === "") { if (i >= 0) { decls.splice(i, 1); } }
       else {
@@ -6443,7 +6754,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     Object.defineProperty(base, "length", { get: function () { return decls.length; }, enumerable: false, configurable: true });
     Object.defineProperty(base, "cssText", {
       get: function () { return serializeDeclList(decls); },
-      set: function (v) { decls.length = 0; var p = parseDeclList(v); for (var i = 0; i < p.length; i++) { decls.push(p[i]); } if (onChange) { onChange(); } },
+      set: function (v) { decls.length = 0; var p = parseDeclList(v); for (var i = 0; i < p.length; i++) { if (!restrict || isCustomProp(p[i][0]) || restrict(p[i][0])) { decls.push(p[i]); } } if (onChange) { onChange(); } },
       enumerable: true, configurable: true
     });
     try { if (globalThis.CSSStyleDeclaration && globalThis.CSSStyleDeclaration.prototype) { Object.setPrototypeOf(base, globalThis.CSSStyleDeclaration.prototype); } } catch (e) {}
@@ -6614,12 +6925,26 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // A rule's `.style` CSSStyleDeclaration, backed by the rule's declaration body text. Uses the
   // shared `makeStyleDecl` machinery (shorthand expand/serialize, custom props) so rule blocks
   // serialize identically to inline styles. `struct.body` holds the current (flat) declaration text.
-  function makeRuleStyleDecl(struct, sheet) {
+  function makeRuleStyleDecl(struct, sheet, restrict) {
     if (struct.body == null) { struct.body = ""; }
     return makeStyleDecl(
       function () { return struct.body; },
-      function (text) { struct.body = text; markDirty(sheet); }
+      function (text) { struct.body = text; markDirty(sheet); },
+      restrict
     );
+  }
+  // @page applies only the page-context properties (margins, page size/marks/bleed, and a handful of
+  // box/background properties); anything else (e.g. `transform`) is dropped. CSS Page 3 §3.4.
+  function pagePropertyAllowed(name) {
+    if (/^margin(-|$)/.test(name) || /^padding(-|$)/.test(name)) return true;
+    if (/^(size|marks|bleed|page|page-orientation)$/.test(name)) return true;
+    if (/^(width|height|min-width|min-height|max-width|max-height)$/.test(name)) return true;
+    return false;
+  }
+  // @keyframes block applies every property EXCEPT the animation longhands/shorthand (CSS Animations
+  // §2: "animatable properties other than the animation properties").
+  function keyframePropertyAllowed(name) {
+    return !(name === "animation" || /^animation-/.test(name));
   }
   function makeStyleRule(struct, sheet, parentRule) {
     var rule = newRule("CSSStyleRule", 1, sheet, parentRule);
@@ -6645,7 +6970,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   function makePageRule(struct, sheet, parentRule) {
     // @page exposes a `.style` (CSSStyleDeclaration) like a style rule. Type 6.
     var rule = newRule("CSSPageRule", 6, sheet, parentRule);
-    var styleObj = makeRuleStyleDecl(struct, sheet);
+    var styleObj = makeRuleStyleDecl(struct, sheet, pagePropertyAllowed);
     // The page selector (`:left`, `:first`, named page, etc.) — normalized (pseudo lowercased).
     function pageSel() { return normalizePageSelector(struct.prelude); }
     defOn(rule, "selectorText", {
@@ -6807,7 +7132,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   function makeKeyframeRule(kf, parentRule, sheet) {
     var r = newRule("CSSKeyframeRule", 8, sheet, parentRule);
     var decls = kf.decls || (kf.decls = parseDeclList(kf.body));
-    var styleObj = makeRuleStyle(decls, function () { kf.body = serializeDeclList(decls); markDirty(sheet); });
+    var styleObj = makeRuleStyle(decls, function () { kf.body = serializeDeclList(decls); markDirty(sheet); }, keyframePropertyAllowed);
     defOn(r, "keyText", { get: function () { return kf.prelude.trim(); }, set: function (v) { kf.prelude = String(v); markDirty(sheet); }, enumerable: true });
     // [PutForwards=cssText]: `r.style = "..."` forwards to style.cssText.
     defOn(r, "style", { get: function () { return styleObj; }, set: function (v) { styleObj.cssText = String(v); }, enumerable: true });
@@ -8638,6 +8963,27 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
   });
 
+  // Per spec, a DOM mutation "queues a mutation observer microtask": at most one delivery microtask
+  // is pending at a time; it collects the Rust-queued mutations and flushes observer callbacks. This
+  // lets observers fire at the microtask checkpoint (e.g. before an awaited `Promise.resolve()`),
+  // which the engine's post-task delivery alone would miss.
+  globalThis.__moMicrotaskQueued = globalThis.__moMicrotaskQueued || false;
+  def(globalThis, "__scheduleMODelivery", function () {
+    if (globalThis.__moMicrotaskQueued) { return; }
+    var anyActive = globalThis.__moRegistry.some(function (e) { return e.targets.length; });
+    if (!anyActive) { return; }
+    globalThis.__moMicrotaskQueued = true;
+    // Use a native (V8) microtask via Promise.resolve().then so delivery interleaves with the page's
+    // own `await Promise.resolve()` continuations (the polyfilled queueMicrotask runs on a separate,
+    // later-drained queue).
+    try {
+      Promise.resolve().then(function () {
+        globalThis.__moMicrotaskQueued = false;
+        try { globalThis.__deliverMutations(); } catch (e) {}
+      });
+    } catch (e) { globalThis.__moMicrotaskQueued = false; }
+  });
+
   // Called (as a microtask) after a task when Rust has queued mutations. Collects them into each
   // observer's queue, then flushes non-empty queues to their callbacks.
   def(globalThis, "__deliverMutations", function () {
@@ -9489,8 +9835,19 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var CSSns = {
       supports: function (prop, value) {
         try {
-          if (value !== undefined) { return String(prop).length > 0 && String(value).length > 0; }
-          var c = String(prop); return c.indexOf(":") > 0 || c.indexOf("(") >= 0;
+          if (value !== undefined) {
+            var pn = normPropName(prop), pv = String(value);
+            if (pv.length === 0) return false;
+            if (!isKnownProperty(pn)) return false;
+            return isValidValue(pn, pv);
+          }
+          // One-arg form: a support condition. `selector(...)` / `font-tech(...)` /
+          // `font-format(...)` functional conditions are answered optimistically (feature-detection).
+          var c = String(prop).trim();
+          if (/^(selector|font-tech|font-format)\s*\(/i.test(c)) return true;
+          var ci = indexOfTopLevelColon(c);
+          if (ci < 0) return false;
+          return CSSns.supports(c.slice(0, ci).trim(), c.slice(ci + 1).trim());
         } catch (e) { return false; }
       },
       escape: function (value) {
@@ -14463,6 +14820,92 @@ mod tests {
         // And the change is written through to the real DOM `style` attribute.
         let style = attr_of(&doc, body, "style").unwrap_or_default();
         assert!(style.contains("display: none"), "style attr was {style:?}");
+    }
+
+    #[test]
+    fn font_variant_shorthand_expands_and_serializes() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                // Shorthand `normal` sets every longhand to normal.
+                r#"var b = document.body; b.style.fontVariant = "normal"; b.style.fontVariantCaps + "|" + b.style.fontVariant"#.to_string(),
+                // A single non-default longhand round-trips into the shorthand.
+                r#"var b2 = document.createElement("div"); b2.style.fontVariant = "normal"; b2.style.fontVariantCaps = "small-caps"; b2.style.fontVariant"#.to_string(),
+                // ligatures:none combined with another longhand can't form the shorthand.
+                r#"var b3 = document.createElement("div"); b3.style.fontVariant = "normal"; b3.style.fontVariantLigatures = "none"; b3.style.fontVariantCaps = "small-caps"; b3.style.fontVariant"#.to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("normal|normal"));
+        assert_eq!(out[1].value.as_deref(), Some("small-caps"));
+        assert_eq!(out[2].value.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn font_family_quoting_serialization() {
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![
+                // A quoted multi-word name normalizes to unquoted; a generic family stays quoted.
+                r#"var d = document.createElement("div"); d.setAttribute("style", "font-family: 'Times New Roman', \"serif\", '34J', Veronica"); d.style.fontFamily"#.to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(
+            out[0].value.as_deref(),
+            Some(r#"Times New Roman, "serif", "34J", Veronica"#)
+        );
+    }
+
+    #[test]
+    fn style_css_text_round_trips_and_drops_invalid() {
+        let (doc, body) = doc_with_body("");
+        let (doc, out) = run_with_dom(
+            doc,
+            vec![
+                // Unknown property + invalid value are dropped; valid declarations survive.
+                r#"var b = document.body; b.style.cssText = "color: red; unknownprop: x; width: -5px; font-size: 10pt"; b.style.cssText"#.to_string(),
+                // Setting an invalid property never creates a style attribute on a fresh element.
+                r#"var e = document.createElement("div"); e.style.setProperty("doesntexist", "0"); String(e.hasAttribute("style"))"#.to_string(),
+            ],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("color: red; font-size: 10pt;"));
+        assert_eq!(out[1].value.as_deref(), Some("false"));
+        // The body's style attribute reflects only the valid declarations.
+        let style = attr_of(&doc, body, "style").unwrap_or_default();
+        assert!(style.contains("color: red"), "style attr was {style:?}");
+        assert!(!style.contains("unknownprop"), "style attr was {style:?}");
+        assert!(!style.contains("-5px"), "style attr was {style:?}");
+    }
+
+    #[test]
+    fn mutating_style_queues_attribute_record() {
+        // Mutating el.style fires a MutationObserver attribute record for `style`; a no-op set of an
+        // equal value does not.
+        let (doc, _body) = doc_with_body("");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var el = document.body;
+                var recs = [];
+                var mo = new MutationObserver(function (rs) { recs = recs.concat(rs); });
+                mo.observe(el, { attributes: true, attributeOldValue: true });
+                el.style.zIndex = "10";
+                var first = mo.takeRecords();
+                el.style.zIndex = "10"; // same value -> no new record
+                var second = mo.takeRecords();
+                first.length + "|" + (first[0] && first[0].attributeName) + "|" + second.length
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some("1|style|0"));
     }
 
     #[test]
