@@ -271,6 +271,14 @@ fn host_state(scope: &mut v8::PinScope) -> Rc<HostState> {
 
 /// Concatenate every descendant `Text` node under `id`, in document order.
 fn text_content(doc: &dom::Document, id: dom::NodeId) -> String {
+    // Per the DOM standard's `textContent` getter: for a Text/Comment/PI node it's the node's own
+    // data; for an Element/DocumentFragment it's the concatenation of all *descendant Text* node
+    // data in tree order (Comment data is NOT included for those).
+    match &doc.get(id).data {
+        dom::NodeData::Text(t) => return t.clone(),
+        dom::NodeData::Comment(c) => return c.clone(),
+        _ => {}
+    }
     let mut out = String::new();
     fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
         match &doc.get(id).data {
@@ -329,7 +337,7 @@ fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
                     out.push('>');
                 }
             }
-            dom::NodeData::Document => {
+            dom::NodeData::Document | dom::NodeData::DocumentFragment => {
                 for &child in &doc.get(id).children {
                     serialize_node(doc, child, out);
                 }
@@ -362,7 +370,10 @@ fn set_text_content(doc: &mut dom::Document, id: dom::NodeId, text: &str) {
     for child in old {
         doc.get_mut(child).parent = None;
     }
-    doc.append_child(id, dom::NodeData::Text(text.to_string()));
+    // Per spec: only insert a Text node when the new value is non-empty (empty string => no child).
+    if !text.is_empty() {
+        doc.append_child(id, dom::NodeData::Text(text.to_string()));
+    }
 }
 
 /// Parse `html` and replace `target`'s children with the resulting real nodes in the live `doc`.
@@ -794,6 +805,52 @@ fn prim_create_comment(
     let state = host_state(scope);
     let id = state.doc.borrow_mut().alloc(dom::NodeData::Comment(text), None);
     rv.set_double(id.0 as f64);
+}
+
+/// `__createDocumentFragment() -> id` — a parentless `DocumentFragment` arena node.
+fn prim_create_document_fragment(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let id = state.doc.borrow_mut().alloc(dom::NodeData::DocumentFragment, None);
+    rv.set_double(id.0 as f64);
+}
+
+/// Deep/shallow clone of `id` in the arena. The clone is parentless. Element attributes are copied;
+/// with `deep`, children are recursively cloned and appended. Returns the new node id (or the
+/// original `id` if it's out of range). `__nsMeta` is copied JS-side by the wrapper.
+fn clone_node_arena(doc: &mut dom::Document, id: dom::NodeId, deep: bool) -> dom::NodeId {
+    let data = doc.get(id).data.clone();
+    let new_id = doc.alloc(data, None);
+    if deep {
+        let kids = doc.get(id).children.clone();
+        for child in kids {
+            let cloned = clone_node_arena(doc, child, true);
+            doc.get_mut(cloned).parent = Some(new_id);
+            doc.get_mut(new_id).children.push(cloned);
+        }
+    }
+    new_id
+}
+
+/// `__cloneNode(id, deep) -> id` — clone an arena node (see [`clone_node_arena`]).
+fn prim_clone_node(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let node = arg_node(scope, &args, 0);
+    let deep = args.get(1).boolean_value(scope);
+    let state = host_state(scope);
+    match node {
+        Some(n) => {
+            let new_id = clone_node_arena(&mut state.doc.borrow_mut(), n, deep);
+            rv.set_double(new_id.0 as f64);
+        }
+        None => rv.set_double(-1.0),
+    }
 }
 
 /// `__getAttr(id, name) -> string | null`
@@ -1346,6 +1403,7 @@ fn prim_node_type(
             dom::NodeData::Text(_) => 3,
             dom::NodeData::Comment(_) => 8,
             dom::NodeData::Document => 9,
+            dom::NodeData::DocumentFragment => 11,
         })
         .unwrap_or(1);
     rv.set_int32(ty);
@@ -2141,6 +2199,8 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__createElement", prim_create_element);
     set_fn(scope, global, "__createText", prim_create_text);
     set_fn(scope, global, "__createComment", prim_create_comment);
+    set_fn(scope, global, "__createDocumentFragment", prim_create_document_fragment);
+    set_fn(scope, global, "__cloneNode", prim_clone_node);
     set_fn(scope, global, "__getAttr", prim_get_attr);
     set_fn(scope, global, "__setAttr", prim_set_attr);
     set_fn(scope, global, "__removeAttr", prim_remove_attr);
@@ -2449,6 +2509,186 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     return out;
   }
 
+  // --- DOM mutation shared helpers (used across the ChildNode/ParentNode mixins) --------------
+  function hierarchyRequestError(msg) {
+    throw new globalThis.DOMException(msg || "The operation would yield an incorrect node tree.", "HierarchyRequestError");
+  }
+  function notFoundError(msg) {
+    throw new globalThis.DOMException(msg || "The object can not be found here.", "NotFoundError");
+  }
+  // The node id of an argument: real DOM-arena nodes carry `__node`; strings/anything else => -1.
+  function nodeIdOf(x) { return (x && typeof x.__node === "number") ? x.__node : -1; }
+  // WebIDL: a non-nullable `Node` parameter throws a TypeError (not a DOMException) when the value
+  // isn't a Node. Returns the node id on success.
+  function requireNodeArg(x, methodName) {
+    var nid = nodeIdOf(x);
+    if (nid < 0) {
+      throw new TypeError("Failed to execute '" + methodName + "': parameter is not of type 'Node'.");
+    }
+    return nid;
+  }
+
+  // "convert nodes into a node" (DOM standard): a list of (Node | string) becomes a single node.
+  // Strings become Text nodes. A single node is returned as-is; multiple nodes (or zero) are
+  // collected into a DocumentFragment. Returns a node id (or -1 if the result is an empty fragment
+  // that the caller may still insert as a no-op).
+  function convertNodesIntoNode(args) {
+    var ids = [];
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      var nid = nodeIdOf(a);
+      if (nid >= 0) { ids.push(nid); }
+      // Non-Node args are DOMStrings: null -> "null", undefined -> "undefined" (WebIDL stringify).
+      else { ids.push(__createText(String(a))); }
+    }
+    if (ids.length === 1) { return ids[0]; }
+    var frag = __createDocumentFragment();
+    for (var j = 0; j < ids.length; j++) { __appendChild(frag, ids[j]); }
+    return frag;
+  }
+
+  // True if `ancestorId` is an inclusive ancestor of `nodeId` (would create a cycle on insert).
+  function isInclusiveAncestor(ancestorId, nodeId) {
+    var cur = nodeId;
+    while (cur >= 0) { if (cur === ancestorId) { return true; } cur = __parent(cur); }
+    return false;
+  }
+
+  // Pre-insertion validity (subset relevant here): parent must be a Document/Fragment/Element, the
+  // node must not be an inclusive ancestor of parent, and `ref` (if given) must be a child of parent.
+  function ensurePreInsertValid(parentId, nodeId, refId) {
+    var pt = __nodeType(parentId);
+    if (pt !== 1 && pt !== 9 && pt !== 11) {
+      hierarchyRequestError("Cannot insert into a node that is not a Document, DocumentFragment, or Element.");
+    }
+    if (nodeId >= 0 && isInclusiveAncestor(nodeId, parentId)) {
+      hierarchyRequestError("The new child element contains the parent.");
+    }
+    var nt = nodeId >= 0 ? __nodeType(nodeId) : -1;
+    if (nt === 9) { hierarchyRequestError("Nodes of type Document may not be inserted."); }
+    if (nodeId >= 0 && (nt === 1 || nt === 3 || nt === 8 || nt === 11) && (pt === 9)) {
+      // Documents have additional constraints, but our tree is HTML-shaped; allow elements/fragments.
+    }
+    if (refId >= 0 && __parent(refId) !== parentId) {
+      notFoundError("The reference child is not a child of this node.");
+    }
+  }
+
+  // Insert `nodeId` (possibly a DocumentFragment, whose children are moved) into `parentId` before
+  // `refId` (-1 = append). Returns the inserted node id. Validity must be checked by the caller.
+  function insertNode(parentId, nodeId, refId) {
+    if (nodeId < 0) { return nodeId; }
+    if (__nodeType(nodeId) === 11) {
+      var moving = __children(nodeId).slice();
+      for (var i = 0; i < moving.length; i++) { __insertBefore(parentId, moving[i], refId); }
+      return nodeId;
+    }
+    __insertBefore(parentId, nodeId, refId);
+    return nodeId;
+  }
+
+  // The set of arg node-ids (used to skip them when picking a viable reference sibling).
+  function argNodeIdSet(args) {
+    var set = {};
+    for (var i = 0; i < args.length; i++) { var n = nodeIdOf(args[i]); if (n >= 0) { set[n] = true; } }
+    return set;
+  }
+
+  // ChildNode.before/after: insert `args` among this node's siblings. No-op if no parent. The
+  // reference child is computed BEFORE the nodes are converted/moved, skipping any sibling that's
+  // itself one of the arguments (DOM standard's "viable previous/next sibling").
+  function childBefore(id, args) {
+    var parent = __parent(id);
+    if (parent < 0) { return; }
+    var set = argNodeIdSet(args);
+    var sibs = __children(parent);
+    var idx = sibs.indexOf(id);
+    // viablePreviousSibling: first preceding sibling not in args (it survives the conversion since
+    // it isn't an arg), or null. Captured BEFORE conversion; resolved to a reference AFTER, per spec.
+    var viablePrev = -1;
+    for (var i = idx - 1; i >= 0; i--) { if (!set[sibs[i]]) { viablePrev = sibs[i]; break; } }
+    var node = convertNodesIntoNode(args);
+    var ref;
+    if (viablePrev < 0) { var k = __children(parent); ref = k.length ? k[0] : -1; }
+    else { var nk = __children(parent); var pi = nk.indexOf(viablePrev); ref = (pi >= 0 && pi + 1 < nk.length) ? nk[pi + 1] : -1; }
+    insertNode(parent, node, ref);
+  }
+  function childAfter(id, args) {
+    var parent = __parent(id);
+    if (parent < 0) { return; }
+    var set = argNodeIdSet(args);
+    var sibs = __children(parent);
+    var idx = sibs.indexOf(id);
+    // viableNextSibling: first following sibling not in args, else null (append).
+    var ref = -1;
+    for (var i = idx + 1; i < sibs.length; i++) { if (!set[sibs[i]]) { ref = sibs[i]; break; } }
+    var node = convertNodesIntoNode(args);
+    insertNode(parent, node, ref);
+  }
+  function childReplaceWith(id, args) {
+    var parent = __parent(id);
+    if (parent < 0) { return; }
+    var set = argNodeIdSet(args);
+    var sibs = __children(parent);
+    var idx = sibs.indexOf(id);
+    var ref = -1;
+    for (var i = idx + 1; i < sibs.length; i++) { if (!set[sibs[i]]) { ref = sibs[i]; break; } }
+    var node = convertNodesIntoNode(args);
+    // Spec: if this node still has the same parent (it wasn't moved into the fragment), replace it;
+    // otherwise just insert before the viable next sibling. We always remove `id` then insert.
+    if (__parent(id) === parent) { __removeChild(parent, id); }
+    insertNode(parent, node, ref);
+  }
+  // Validate that no argument node is a host-including inclusive ancestor of `parentId`, and that
+  // parentId is a valid insertion parent (Document/Fragment/Element). Run before any conversion.
+  function ensureParentNodeArgsValid(parentId, args) {
+    var pt = __nodeType(parentId);
+    if (pt !== 1 && pt !== 9 && pt !== 11) {
+      hierarchyRequestError("Cannot insert into a node that is not a Document, DocumentFragment, or Element.");
+    }
+    for (var i = 0; i < args.length; i++) {
+      var n = nodeIdOf(args[i]);
+      if (n >= 0 && isInclusiveAncestor(n, parentId)) {
+        hierarchyRequestError("The new child element contains the parent.");
+      }
+    }
+  }
+  // ParentNode.prepend/append/replaceChildren on `id`.
+  function parentPrepend(id, args) {
+    ensureParentNodeArgsValid(id, args);
+    var node = convertNodesIntoNode(args);
+    var kids = __children(id);
+    insertNode(id, node, kids.length ? kids[0] : -1);
+  }
+  function parentAppend(id, args) {
+    ensureParentNodeArgsValid(id, args);
+    var node = convertNodesIntoNode(args);
+    insertNode(id, node, -1);
+  }
+  function parentReplaceChildren(id, args) {
+    ensureParentNodeArgsValid(id, args);
+    var node = convertNodesIntoNode(args);
+    var old = __children(id).slice();
+    for (var i = 0; i < old.length; i++) { __removeChild(id, old[i]); }
+    insertNode(id, node, -1);
+  }
+  def(globalThis, "__convertNodesIntoNode", convertNodesIntoNode);
+  def(globalThis, "__insertNode", insertNode);
+
+  // Mirror the JS-side `__nsMeta` (namespace metadata for createElementNS elements) from a source
+  // subtree onto a freshly-cloned subtree. The Rust clone preserves child order, so we walk both
+  // trees in lockstep. Attributes themselves are copied arena-side; only namespace info lives in JS.
+  function copyNsMetaDeep(srcId, dstId) {
+    var m = __nsMeta[srcId];
+    if (m) {
+      __nsMeta[dstId] = { namespaceURI: m.namespaceURI, prefix: m.prefix, localName: m.localName,
+                          qualifiedName: m.qualifiedName, isHTML: m.isHTML };
+    }
+    var sk = __children(srcId), dk = __children(dstId);
+    var n = Math.min(sk.length, dk.length);
+    for (var i = 0; i < n; i++) { copyNsMetaDeep(sk[i], dk[i]); }
+  }
+
   // Build a fresh element wrapper object for a node id. Carries `__node` plus accessors/methods
   // that delegate to the native primitives. Returns null for id === -1.
   function wrap(id) {
@@ -2475,6 +2715,7 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
       if (t === 3) { return "#text"; }
       if (t === 8) { return "#comment"; }
       if (t === 9) { return "#document"; }
+      if (t === 11) { return "#document-fragment"; }
       return elTagName();
     }, enumerable: true, configurable: true });
     Object.defineProperty(el, "namespaceURI", { get: function () {
@@ -2494,8 +2735,11 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     Object.defineProperty(el, "nodeType", { get: function () { return __nodeType(id); }, enumerable: true, configurable: true });
 
     Object.defineProperty(el, "textContent", {
-      get: function () { return __textContent(id); },
-      set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
+      // Per spec: null for Document (9) and DocumentType (10); for everything else (Element,
+      // DocumentFragment, Text, Comment, PI) the concatenation / data computed natively.
+      get: function () { var t = __nodeType(id); return (t === 9 || t === 10) ? null : __textContent(id); },
+      // Setter is a no-op on Document/DocumentType (textContent is null there).
+      set: function (v) { var t = __nodeType(id); if (t === 9 || t === 10) { return; } __setTextContent(id, v == null ? "" : String(v)); },
       enumerable: true, configurable: true
     });
     // `data` mirrors textContent — used by Vue when patching text/comment anchors. This is a
@@ -2647,34 +2891,55 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     });
 
     def(el, "appendChild", function (child) {
-      if (child && typeof child.__node === "number") { __appendChild(id, child.__node); }
+      var cid = requireNodeArg(child, "appendChild");
+      ensurePreInsertValid(id, cid, -1);
+      insertNode(id, cid, -1);
       return child;
     });
     def(el, "removeChild", function (child) {
-      if (child && typeof child.__node === "number") { __removeChild(id, child.__node); }
+      var cid = requireNodeArg(child, "removeChild");
+      if (__parent(cid) !== id) { notFoundError("The node to be removed is not a child of this node."); }
+      __removeChild(id, cid);
       return child;
     });
     def(el, "insertBefore", function (newNode, refNode) {
-      if (newNode && typeof newNode.__node === "number") {
-        var refId = (refNode && typeof refNode.__node === "number") ? refNode.__node : -1;
-        __insertBefore(id, newNode.__node, refId);
-      }
+      var cid = requireNodeArg(newNode, "insertBefore");
+      var refId = (refNode == null) ? -1 : nodeIdOf(refNode);
+      if (refNode != null && refId < 0) { notFoundError("The reference child is not a child of this node."); }
+      ensurePreInsertValid(id, cid, refId);
+      insertNode(id, cid, refId);
       return newNode;
     });
     def(el, "replaceChild", function (newNode, oldNode) {
-      if (newNode && typeof newNode.__node === "number" && oldNode && typeof oldNode.__node === "number") {
-        __insertBefore(id, newNode.__node, oldNode.__node);
-        __removeChild(id, oldNode.__node);
+      var nid = requireNodeArg(newNode, "replaceChild"), oid = requireNodeArg(oldNode, "replaceChild");
+      if (__parent(oid) !== id) { notFoundError("The node to be replaced is not a child of this node."); }
+      if (isInclusiveAncestor(nid, id)) { hierarchyRequestError("The new child element contains the parent."); }
+      // Reference child = oldNode's next sibling, unless that's newNode itself (then newNode's next).
+      var sibs = __children(id); var idx = sibs.indexOf(oid);
+      var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
+      if (ref === nid) {
+        var ni = sibs.indexOf(nid);
+        ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1;
       }
+      __removeChild(id, oid);
+      insertNode(id, nid, ref);
       return oldNode;
     });
     def(el, "remove", function () { var p = __parent(id); if (p >= 0) { __removeChild(p, id); } });
-    def(el, "append", function () {
-      for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; if (c && typeof c.__node === "number") { __appendChild(id, c.__node); } }
-    });
-    def(el, "prepend", function () {
-      var kids = __children(id); var first = kids.length ? kids[0] : -1;
-      for (var i = 0; i < arguments.length; i++) { var c = arguments[i]; if (c && typeof c.__node === "number") { __insertBefore(id, c.__node, first); } }
+    def(el, "append", function () { parentAppend(id, arguments); });
+    def(el, "prepend", function () { parentPrepend(id, arguments); });
+    def(el, "replaceChildren", function () { parentReplaceChildren(id, arguments); });
+    def(el, "before", function () { childBefore(id, arguments); });
+    def(el, "after", function () { childAfter(id, arguments); });
+    def(el, "replaceWith", function () { childReplaceWith(id, arguments); });
+    def(el, "cloneNode", function (deep) {
+      var nid = __cloneNode(id, !!deep);
+      if (nid < 0) { return null; }
+      copyNsMetaDeep(id, nid);
+      var w = wrap(nid);
+      // Route through the canonical-wrapper cache (when the browser-env layer is present) so the
+      // clone has a stable identity and full enrichment (style/classList/childNodes === checks).
+      return (typeof globalThis.__canonNode === "function") ? globalThis.__canonNode(w) : w;
     });
 
     def(el, "insertAdjacentElement", function (position, node) {
@@ -4655,10 +4920,16 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var node = el.__node;
     def(el, "__enriched", true);
     // Graft the matching DOM interface prototype onto the wrapper's chain (own props survive).
+    // Non-element nodes (Text=3, Comment=8, DocumentFragment=11) use their CharacterData/Node
+    // interface prototype so `instanceof Text/Comment/DocumentFragment` holds; elements map by tag.
     if (typeof node === "number") {
       try {
-        var tag = el.tagName;
-        var proto = ifaceProtoForTag(tag);
+        var nt = __nodeType(node);
+        var proto = null;
+        if (nt === 3) { proto = globalThis.Text && globalThis.Text.prototype; }
+        else if (nt === 8) { proto = globalThis.Comment && globalThis.Comment.prototype; }
+        else if (nt === 11) { proto = globalThis.DocumentFragment && globalThis.DocumentFragment.prototype; }
+        else { proto = ifaceProtoForTag(el.tagName); }
         if (proto && Object.getPrototypeOf(el) !== proto) { Object.setPrototypeOf(el, proto); }
       } catch (e) {}
     }
@@ -5166,12 +5437,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   if (typeof document.createDocumentFragment !== "function") {
     def(document, "createDocumentFragment", function () {
-      var kids = [];
-      return { nodeType: 11, nodeName: "" + String.fromCharCode(35) + "document-fragment", childNodes: kids,
-               appendChild: function (c) { kids.push(c); return c; },
-               querySelector: function () { return null; }, querySelectorAll: function () { return []; },
-               cloneNode: function () { return this; }, get firstChild() { return kids[0] || null; },
-               get lastChild() { return kids[kids.length - 1] || null; }, get children() { return kids; } };
+      // Real arena-backed DocumentFragment (nodeType 11): its children move on insertion, and it
+      // supports the full ParentNode mixin (append/prepend/replaceChildren/appendChild/insertBefore).
+      return __wrapNode(__createDocumentFragment());
     });
   }
   // document.implementation.createHTMLDocument — used to build/parse HTML off to the side (e.g.
@@ -11596,5 +11864,127 @@ mod tests {
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         let body = find_by_tag(&doc, doc.root(), "body").expect("body");
         assert_eq!(attr_of(&doc, body, "data-runs").as_deref(), Some("0"));
+    }
+
+    // ---- Node mutation method cluster (cloneNode / textContent / ChildNode / ParentNode) --------
+
+    #[test]
+    fn clone_node_deep_copies_attrs_and_children_and_is_detached() {
+        let out = env_eval(
+            "https://example.com/",
+            "var d = document.createElement('div'); d.setAttribute('class', 'a b'); d.id = 'x'; \
+             var s = document.createElement('span'); s.textContent = 'hi'; d.appendChild(s); \
+             var deep = d.cloneNode(true); \
+             var shallow = d.cloneNode(false); \
+             [deep === d, deep.parentNode === null, deep.getAttribute('class'), deep.id, \
+              deep.childNodes.length, deep.childNodes[0].tagName, deep.textContent, \
+              shallow.childNodes.length, shallow.getAttribute('class'), \
+              deep instanceof HTMLDivElement].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("false|true|a b|x|1|SPAN|hi|0|a b|true")
+        );
+    }
+
+    #[test]
+    fn text_content_get_and_set() {
+        let out = env_eval(
+            "https://example.com/",
+            "var d = document.createElement('div'); \
+             d.appendChild(document.createTextNode('foo')); \
+             var b = document.createElement('b'); b.appendChild(document.createTextNode('bar')); \
+             d.appendChild(b); \
+             var got = d.textContent; \
+             d.textContent = 'replaced'; \
+             var afterChildren = d.childNodes.length; \
+             var afterText = d.childNodes[0].nodeType; \
+             var replacedText = d.textContent; \
+             d.textContent = ''; \
+             var c = document.createComment('cmt'); \
+             [got, replacedText, afterChildren, afterText, d.childNodes.length, \
+              c.textContent, document.textContent].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        // doc.textContent is null per spec; empty set removes children (length 0).
+        assert_eq!(out.value.as_deref(), Some("foobar|replaced|1|3|0|cmt|"));
+    }
+
+    #[test]
+    fn child_before_inserts_strings_and_nodes() {
+        let out = env_eval(
+            "https://example.com/",
+            "var p = document.createElement('p'); \
+             var mid = document.createElement('mid'); p.appendChild(mid); \
+             var other = document.createElement('o'); \
+             mid.before('x', other); \
+             [p.childNodes.length, p.childNodes[0].nodeType, p.childNodes[0].textContent, \
+              p.childNodes[1].tagName, p.childNodes[2].tagName].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("3|3|x|O|MID"));
+    }
+
+    #[test]
+    fn replace_with_fragment() {
+        let out = env_eval(
+            "https://example.com/",
+            "var p = document.createElement('p'); \
+             var old = document.createElement('old'); p.appendChild(old); \
+             var f = document.createDocumentFragment(); \
+             f.appendChild(document.createElement('a')); \
+             f.appendChild(document.createElement('b')); \
+             old.replaceWith(f); \
+             [p.childNodes.length, p.childNodes[0].tagName, p.childNodes[1].tagName, \
+              old.parentNode === null].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("2|A|B|true"));
+    }
+
+    #[test]
+    fn replace_children_replaces_all() {
+        let out = env_eval(
+            "https://example.com/",
+            "var p = document.createElement('p'); \
+             p.appendChild(document.createElement('keep1')); \
+             p.appendChild(document.createElement('keep2')); \
+             var a = document.createElement('a'); var b = document.createElement('b'); \
+             p.replaceChildren(a, b, 'tail'); \
+             [p.childNodes.length, p.childNodes[0].tagName, p.childNodes[1].tagName, \
+              p.childNodes[2].textContent].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("3|A|B|tail"));
+    }
+
+    #[test]
+    fn insert_before_throws_not_found_for_non_child_ref() {
+        let out = env_eval(
+            "https://example.com/",
+            "var p = document.createElement('p'); \
+             var n = document.createElement('n'); \
+             var stranger = document.createElement('s'); \
+             var name = ''; var code = -1; \
+             try { p.insertBefore(n, stranger); } catch (e) { name = e.name; code = e.code; } \
+             [name, code].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("NotFoundError|8"));
+    }
+
+    #[test]
+    fn append_child_ancestor_throws_hierarchy_request() {
+        let out = env_eval(
+            "https://example.com/",
+            "var a = document.createElement('a'); \
+             var b = document.createElement('b'); a.appendChild(b); \
+             var name = ''; var code = -1; \
+             try { b.appendChild(a); } catch (e) { name = e.name; code = e.code; } \
+             [name, code].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("HierarchyRequestError|3"));
     }
 }

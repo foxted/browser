@@ -4884,7 +4884,7 @@ fn collect_text(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
                 out.push('\n');
             }
         }
-        dom::NodeData::Document => {
+        dom::NodeData::Document | dom::NodeData::DocumentFragment => {
             for &child in &doc.get(id).children {
                 collect_text(doc, child, out);
             }

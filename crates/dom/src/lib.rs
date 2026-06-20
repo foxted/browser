@@ -20,6 +20,8 @@ pub enum NodeData {
     Text(String),
     /// A comment `<!-- ... -->`.
     Comment(String),
+    /// A `DocumentFragment` — a parentless container whose children move on insertion.
+    DocumentFragment,
 }
 
 #[derive(Debug, Clone)]
