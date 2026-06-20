@@ -6354,18 +6354,75 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }, enumerable: true });
     return rule;
   }
+  // A single keyframe (`0% { ... }`) as a CSSKeyframeRule.
+  function makeKeyframeRule(kf, parentRule, sheet) {
+    var r = newRule("CSSKeyframeRule", 8, sheet, parentRule);
+    var decls = kf.decls || (kf.decls = parseDeclList(kf.body));
+    var styleObj = makeRuleStyle(decls, function () { kf.body = serializeDeclList(decls); markDirty(sheet); });
+    defOn(r, "keyText", { get: function () { return kf.prelude.trim(); }, set: function (v) { kf.prelude = String(v); markDirty(sheet); }, enumerable: true });
+    // [PutForwards=cssText]: `r.style = "..."` forwards to style.cssText.
+    defOn(r, "style", { get: function () { return styleObj; }, set: function (v) { styleObj.cssText = String(v); }, enumerable: true });
+    defOn(r, "cssText", { get: function () { var b = serializeDeclList(decls); return kf.prelude.trim() + " { " + (b ? b + " " : "") + "}"; }, enumerable: true });
+    return r;
+  }
   function makeKeyframesRule(struct, sheet, parentRule) {
     var rule = newRule("CSSKeyframesRule", 7, sheet, parentRule);
     var name = struct.prelude.trim();
     var childRules = parseRuleStructs(struct.body);
+    // Serialize the @keyframes name: a CSS-wide keyword (or otherwise non-custom-ident) name must be
+    // serialized as a string, else as an identifier.
+    function serializeKfName(n) {
+      n = unquoteCss(n);
+      var lower = n.toLowerCase();
+      if (/^(initial|inherit|unset|revert|revert-layer|default|none)$/.test(lower) ||
+          !/^-?[_a-zA-Z -￿][-_a-zA-Z0-9 -￿]*$/.test(n)) {
+        return '"' + n.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+      }
+      return n;
+    }
+    // Normalize a keyframe selector list (from->0%, to->100%, lowercase, trimmed) for find/delete.
+    function normKey(s) {
+      return String(s).trim().split(",").map(function (t) {
+        t = t.trim().toLowerCase(); return t === "from" ? "0%" : (t === "to" ? "100%" : t);
+      }).join(", ");
+    }
+    function buildList() {
+      var list = [];
+      for (var i = 0; i < childRules.length; i++) { list.push(makeKeyframeRule(childRules[i], rule, sheet)); }
+      list.item = function (i) { return this[i] || null; };
+      try { if (globalThis.CSSRuleList && globalThis.CSSRuleList.prototype) { Object.setPrototypeOf(list, globalThis.CSSRuleList.prototype); } } catch (e) {}
+      return list;
+    }
     defOn(rule, "name", { get: function () { return unquoteCss(name); }, set: function (v) { name = String(v); markDirty(sheet); }, enumerable: true });
+    defOn(rule, "cssRules", { get: function () { return buildList(); }, enumerable: true });
+    defOn(rule, "length", { get: function () { return childRules.length; }, enumerable: true });
+    // Indexed getter: rule[i] -> the i-th CSSKeyframeRule (or undefined). Defined over a fixed range.
+    for (var __ix = 0; __ix < 64; __ix++) {
+      (function (k) {
+        defOn(rule, String(k), { get: function () { return k < childRules.length ? makeKeyframeRule(childRules[k], rule, sheet) : undefined; }, enumerable: true });
+      })(__ix);
+    }
+    defOn(rule, "appendRule", { value: function (text) {
+      var s = parseRuleStructs(String(text));
+      for (var i = 0; i < s.length; i++) { childRules.push(s[i]); }
+      markDirty(sheet);
+    }, enumerable: true });
+    defOn(rule, "findRule", { value: function (select) {
+      var key = normKey(select);
+      for (var i = childRules.length - 1; i >= 0; i--) { if (normKey(childRules[i].prelude) === key) { return makeKeyframeRule(childRules[i], rule, sheet); } }
+      return null;
+    }, enumerable: true });
+    defOn(rule, "deleteRule", { value: function (select) {
+      var key = normKey(select);
+      for (var i = childRules.length - 1; i >= 0; i--) { if (normKey(childRules[i].prelude) === key) { childRules.splice(i, 1); markDirty(sheet); return; } }
+    }, enumerable: true });
     defOn(rule, "cssText", { get: function () {
       var inner = "";
       for (var i = 0; i < childRules.length; i++) {
         var c = childRules[i];
         inner += "  " + c.prelude.trim() + " { " + (serializeDeclList(c.decls || (c.decls = parseDeclList(c.body))) ? serializeDeclList(c.decls) + " " : "") + "}\n";
       }
-      return "@keyframes " + unquoteCss(name) + " {\n" + inner + "}";
+      return "@keyframes " + serializeKfName(name) + " {\n" + inner + "}";
     }, enumerable: true });
     return rule;
   }
