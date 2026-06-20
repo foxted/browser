@@ -9854,8 +9854,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     function validate(v) {
       var ctor = globalThis.CSSStyleSheet;
-      var ok = v && (typeof v === "object") && v.__constructed === true &&
-               (ctor && ctor.prototype ? (v instanceof ctor) : true);
+      var isSheet = v && (typeof v === "object") && (ctor && ctor.prototype ? (v instanceof ctor) : true);
+      // Standard CSSOM only allows constructed sheets. The tentative proposal (csswg-drafts #10013)
+      // also allows adopting a sheet owned by an element in this document (a <link>/<style> sheet) —
+      // which is what lets pages adopt an existing stylesheet into a shadow root.
+      var ok = isSheet && (v.__constructed === true || v.__ownerNode != null);
       if (!ok) {
         throw new globalThis.DOMException("Can't adopt a non-constructed or foreign CSSStyleSheet.", "NotAllowedError");
       }
