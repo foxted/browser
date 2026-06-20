@@ -3927,6 +3927,30 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
   Object.defineProperty(document, "textContent", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
   Object.defineProperty(document, "nodeValue", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
 
+  // document.styleSheets: a StyleSheetList of the CSSStyleSheet objects for each <style> and
+  // <link rel=stylesheet> element, in document order. Each entry is the element's own `.sheet`
+  // (SameObject), so `styleSheets[i] === el.sheet`.
+  Object.defineProperty(document, "styleSheets", {
+    get: function () {
+      var els = document.querySelectorAll("style, link");
+      var sheets = [];
+      for (var i = 0; i < els.length; i++) {
+        var el = els[i];
+        var tag = (el.tagName || "").toLowerCase();
+        if (tag === "link") {
+          var rel = (el.getAttribute && el.getAttribute("rel") || "").toLowerCase();
+          if (rel.split(/\s+/).indexOf("stylesheet") < 0) { continue; }
+        }
+        try { var s = el.sheet; if (s) { sheets.push(s); } } catch (e) {}
+      }
+      var list = sheets;
+      list.item = function (n) { n = n >>> 0; return n < this.length ? this[n] : null; };
+      try { if (globalThis.StyleSheetList && globalThis.StyleSheetList.prototype) { Object.setPrototypeOf(list, globalThis.StyleSheetList.prototype); } } catch (e) {}
+      return list;
+    },
+    enumerable: true, configurable: true
+  });
+
   globalThis.document = document;
 })();
 "##;
@@ -5101,7 +5125,15 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     return { prefix: "", rest: rest };   // named namespace not declared → still serialize bare
   }
   var HASH = String.fromCharCode(35); // the id-prefix char, built via charcode to dodge Rust raw-string quoting.
-  function normalizeComplexSelector(sel) {
+  // True if `chars[i]` begins another simple selector in the same compound (class/id/attr/pseudo),
+  // i.e. the universal `*` would be redundant and should be dropped during serialization.
+  function compoundHasMore(chars, i) {
+    if (i >= chars.length) { return false; }
+    var c = chars[i];
+    return c === "." || c === HASH || c === "[" || c === ":";
+  }
+  function normalizeComplexSelector(sel, nsCtx) {
+    nsCtx = nsCtx || { hasDefault: false, prefixes: {} };
     sel = sel.trim();
     if (!sel) { return null; }
     var chars = Array.from(sel);
@@ -5143,17 +5175,29 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           else { var lid = ""; while (i < n && isIdentChar(chars[i], lid === "")) { lid += chars[i]; i++; } local = lid; }
           // Validate the local part.
           if (local !== "*" && !isIdent(local)) { return err(); }
-          // Serialize the prefix: `*|` → drop; `|` (empty default ns) → keep `|`; named → keep.
+          // Serialize the prefix per CSSOM. `|local` (no namespace) → keep `|`. `*|local` (any
+          // namespace) → keep `*|` only when a default namespace is declared, else drop. A named
+          // prefix `ns|` → keep when declared; bare (no prefixes declared) → drop.
           var serPre = "";
-          if (pre === "*" || pre === "") {
-            serPre = (pre === "") ? "|" : ""; // empty prefix means the default namespace, kept as `|`
-          } else if (isIdent(pre)) {
-            serPre = ""; // undeclared named namespace: serialize bare (no namespaces declared)
-          } else { return err(); }
-          out += serPre + local;
+          if (pre === "") { serPre = "|"; }
+          else if (pre === "*") { serPre = nsCtx.hasDefault ? "*|" : ""; }
+          else if (isIdent(pre)) {
+            var puri = nsCtx.prefixes[pre];
+            // Declared named prefix whose URI equals the default namespace URI -> serialize bare.
+            serPre = (puri != null && nsCtx.hasDefault && puri === nsCtx.defaultUri) ? "" : (puri != null ? pre + "|" : "");
+          }
+          else { return err(); }
+          if (local === "*") {
+            // A universal local is kept when a prefix is serialized; otherwise it's dropped if the
+            // compound has more simple selectors (`*.c` -> `.c`), kept if it stands alone (`*` -> `*`).
+            if (serPre) { out += serPre + "*"; }
+            else { out += compoundHasMore(chars, i) ? "" : "*"; }
+          } else {
+            out += serPre + local;
+          }
         } else {
           // No prefix: a bare universal or type selector.
-          if (pre === "*") { out += "*"; }
+          if (pre === "*") { out += compoundHasMore(chars, i) ? "" : "*"; }
           else if (pre !== null && isIdent(pre)) { out += pre; }
           else { return err(); }
         }
@@ -5198,7 +5242,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         if (!dbl && __cssPseudoClasses[lower]) {
           if (lower === "not" || lower === "is" || lower === "where" || lower === "has") {
             // Recursively validate the argument as a selector list.
-            var inner = arg.split(",").map(function (s) { return normalizeComplexSelector(s); });
+            var inner = arg.split(",").map(function (s) { return normalizeComplexSelector(s, nsCtx); });
             if (inner.indexOf(null) >= 0 || inner.length === 0) { return err(); }
             out += ":" + lower + "(" + inner.join(", ") + ")";
           } else {
@@ -5214,9 +5258,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (!out) { return null; }
     // A trailing combinator is invalid.
     if (/[>+~]\s*$/.test(out)) { return null; }
-    // A universal `*` is dropped when another simple selector follows it in the same compound
-    // (e.g. `*:not(:active)` serializes as `:not(:active)`, `*.x` as `.x`).
-    out = out.replace(/\*(?=[.#:\[])/g, "");
+    // (Redundant universal `*` dropping is handled per-compound during type-selector serialization,
+    // so a namespaced universal like `|*.c` keeps its `*`.)
     return out;
   }
   // Validate/normalize the inside of `[...]`. Accepts `attr`, `ns|attr`, `*|attr`, and
@@ -5257,71 +5300,645 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   // The CSSOM "serialize a selector" / "parse a group of selectors": validate every comma
   // component; if any is invalid the whole group is invalid (null). Otherwise join with ", ".
-  function normalizeSelectorList(sel) {
+  function normalizeSelectorList(sel, nsCtx) {
     sel = String(sel == null ? "" : sel);
     var parts = sel.split(",");
     var outs = [];
     for (var i = 0; i < parts.length; i++) {
-      var nrm = normalizeComplexSelector(parts[i]);
+      var nrm = normalizeComplexSelector(parts[i], nsCtx);
       if (nrm === null) { return null; }
       outs.push(nrm);
     }
     if (!outs.length) { return null; }
     return outs.join(", ");
   }
-  function makeRule(text, sheet, index) {
-    var rule = {
-      type: 1, cssRules: [], parentRule: null,
-      get parentStyleSheet() { return sheet || null; },
-      get cssText() { return sheet ? sheet.__ruleCssText(index) : text; }
+  // Build a namespace context {hasDefault, defaultUri, prefixes:{name:uri}} from a sheet's
+  // @namespace rule structs. Tracks each prefix's URI and the default namespace's URI so a named
+  // prefix bound to the default namespace's URI can serialize bare (per CSSOM).
+  function nsUri(raw) { return unquoteCss(String(raw).replace(/^url\(\s*|\s*\)$/g, "").trim()); }
+  function sheetNsContext(sheet) {
+    var ctx = { hasDefault: false, defaultUri: null, prefixes: {} };
+    if (!sheet || !sheet.__structs) { return ctx; }
+    var structs = sheet.__structs;
+    for (var i = 0; i < structs.length; i++) {
+      var st = structs[i];
+      if (st.kind !== "@namespace") { continue; }
+      var parts = splitTopLevel(st.prelude, " ").filter(function (x) { return x !== ""; });
+      if (parts.length >= 2) { ctx.prefixes[parts[0]] = nsUri(parts.slice(1).join(" ")); }
+      else { ctx.hasDefault = true; ctx.defaultUri = nsUri(parts[0] || ""); }
+    }
+    return ctx;
+  }
+  // ============================================================================================
+  // CSSOM rule object model.
+  //
+  // Parsed CSS rules reach JS by re-parsing the sheet's raw CSS text on the JS side (the Rust `css`
+  // crate flattens nesting for the cascade and isn't a faithful CSSOM source). `parseRuleStructs`
+  // tokenizes top-level rules (brace-balanced, string/comment aware) into structured nodes
+  // {kind, prelude, body, decls?, children?}. Each structured node is wrapped once in a *stable*
+  // CSSRule object (cached by identity) so page-set expandos (e.g. `rule.randomProperty = 1`)
+  // survive insert/delete — the CSSOM `[SameObject]` requirement. The owning CSSStyleSheet keeps an
+  // ordered list of rule models and exposes a single stable CSSRuleList whose contents are kept in
+  // sync as rules are inserted/deleted. Serialization (`cssText`) is spec-faithful so the WPT exact
+  // string comparisons pass.
+  // ============================================================================================
+
+  // Tokenize a CSS string into top-level rule structs. `parentSheet`/`parentRule` thread ownership.
+  function parseRuleStructs(css) {
+    css = String(css == null ? "" : css);
+    var out = [], n = css.length, i = 0;
+    while (i < n) {
+      // Skip whitespace and comments between rules.
+      while (i < n && /\s/.test(css[i])) { i++; }
+      if (i < n && css[i] === "/" && css[i + 1] === "*") { var e = css.indexOf("*/", i + 2); i = e < 0 ? n : e + 2; continue; }
+      if (i >= n) { break; }
+      // Read prelude up to `{` or `;` at depth 0 (string/comment aware).
+      var preStart = i, sawBrace = false;
+      while (i < n) {
+        var c = css[i];
+        if (c === "/" && css[i + 1] === "*") { var ce = css.indexOf("*/", i + 2); i = ce < 0 ? n : ce + 2; continue; }
+        if (c === '"' || c === "'") { i++; while (i < n && css[i] !== c) { if (css[i] === "\\") { i++; } i++; } i++; continue; }
+        if (c === "{") { sawBrace = true; break; }
+        if (c === ";") { break; }
+        i++;
+      }
+      var prelude = css.slice(preStart, i).trim();
+      if (!sawBrace) {
+        // Statement at-rule (e.g. `@import ...;`, `@namespace ...;`). Consume the `;`.
+        if (i < n && css[i] === ";") { i++; }
+        if (prelude) { out.push(structFromPrelude(prelude, "")); }
+        continue;
+      }
+      // Read the brace-balanced body.
+      i++; var bodyStart = i, depth = 1;
+      while (i < n && depth > 0) {
+        var d = css[i];
+        if (d === "/" && css[i + 1] === "*") { var be = css.indexOf("*/", i + 2); i = be < 0 ? n : be + 2; continue; }
+        if (d === '"' || d === "'") { i++; while (i < n && css[i] !== d) { if (css[i] === "\\") { i++; } i++; } i++; continue; }
+        if (d === "{") { depth++; }
+        else if (d === "}") { depth--; if (depth === 0) { break; } }
+        i++;
+      }
+      var body = css.slice(bodyStart, i);
+      if (i < n && css[i] === "}") { i++; }
+      out.push(structFromPrelude(prelude, body));
+    }
+    return out;
+  }
+  // Classify a prelude + body into a rule struct.
+  function structFromPrelude(prelude, body) {
+    if (prelude.charAt(0) === "@") {
+      var m = /^@([-\w]+)\s*([\s\S]*)$/.exec(prelude);
+      var name = (m ? m[1] : "").toLowerCase();
+      var rest = m ? m[2].trim() : "";
+      return { kind: "@" + name, atName: name, prelude: rest, body: body };
+    }
+    return { kind: "style", prelude: prelude, body: body };
+  }
+  // Parse a declaration block body into an array of [name, value, priority] tuples (CSSOM order).
+  function parseDeclList(body) {
+    var out = [], parts = splitTopLevel(body, ";");
+    for (var i = 0; i < parts.length; i++) {
+      var seg = parts[i], c = seg.indexOf(":");
+      if (c < 0) { continue; }
+      var name = seg.slice(0, c).trim().toLowerCase();
+      var val = seg.slice(c + 1).trim();
+      if (!name) { continue; }
+      var prio = "";
+      var pm = /!\s*important\s*$/i.exec(val);
+      if (pm) { prio = "important"; val = val.slice(0, val.length - pm[0].length).trim(); }
+      out.push([name, normalizeCssValue(val), prio]);
+    }
+    return out;
+  }
+  // Split on `sep` at brace/paren/string depth 0.
+  function splitTopLevel(s, sep) {
+    s = String(s); var out = [], depth = 0, start = 0, n = s.length;
+    for (var i = 0; i < n; i++) {
+      var c = s[i];
+      if (c === '"' || c === "'") { i++; while (i < n && s[i] !== c) { if (s[i] === "\\") { i++; } i++; } continue; }
+      if (c === "{" || c === "(" || c === "[") { depth++; }
+      else if (c === "}" || c === ")" || c === "]") { depth--; }
+      else if (c === sep && depth === 0) { out.push(s.slice(start, i)); start = i + 1; }
+    }
+    out.push(s.slice(start));
+    return out;
+  }
+  function serializeDeclList(decls) {
+    var s = "";
+    for (var i = 0; i < decls.length; i++) {
+      s += (s ? " " : "") + decls[i][0] + ": " + decls[i][1] + (decls[i][2] ? " !" + decls[i][2] : "") + ";";
+    }
+    return s;
+  }
+  // A standalone CSSStyleDeclaration over an in-memory `[name,value,priority]` array. `onChange` is
+  // called after any mutation (so the owning rule can re-serialize). `instanceof CSSStyleDeclaration`.
+  function makeRuleStyle(decls, onChange) {
+    function find(name) { for (var i = 0; i < decls.length; i++) { if (decls[i][0] === name) { return i; } } return -1; }
+    function getVal(name) { var i = find(name); return i >= 0 ? decls[i][1] : ""; }
+    function setVal(name, val, prio) {
+      var i = find(name);
+      if (val == null || val === "") { if (i >= 0) { decls.splice(i, 1); } }
+      else {
+        val = normalizeCssValue(String(val));
+        if (i >= 0) { decls[i][1] = val; decls[i][2] = prio || ""; } else { decls.push([name, val, prio || ""]); }
+      }
+      if (onChange) { onChange(); }
+    }
+    var base = {
+      getPropertyValue: function (p) { return getVal(String(p).toLowerCase()); },
+      getPropertyPriority: function (p) { var i = find(String(p).toLowerCase()); return i >= 0 ? decls[i][2] : ""; },
+      setProperty: function (p, v, prio) { setVal(String(p).toLowerCase(), v, String(prio || "").toLowerCase() === "important" ? "important" : ""); },
+      removeProperty: function (p) { p = String(p).toLowerCase(); var old = getVal(p); setVal(p, ""); return old; },
+      item: function (i) { return i >= 0 && i < decls.length ? decls[i][0] : ""; },
+      parentRule: null
     };
-    Object.defineProperty(rule, "selectorText", {
-      get: function () {
-        var t = sheet ? sheet.__ruleCssText(index) : text;
-        var raw = (String(t).split("{")[0] || "").trim();
-        var nrm = normalizeSelectorList(raw);
-        return nrm == null ? raw : nrm;
-      },
-      set: function (v) {
-        var nrm = normalizeSelectorList(v);
-        if (nrm == null) { return; } // invalid selector: leave the rule unchanged (per spec)
-        if (sheet) { sheet.__setRuleSelector(index, nrm); }
-      },
+    Object.defineProperty(base, "length", { get: function () { return decls.length; }, enumerable: false, configurable: true });
+    Object.defineProperty(base, "cssText", {
+      get: function () { return serializeDeclList(decls); },
+      set: function (v) { decls.length = 0; var p = parseDeclList(v); for (var i = 0; i < p.length; i++) { decls.push(p[i]); } if (onChange) { onChange(); } },
       enumerable: true, configurable: true
     });
+    try { if (globalThis.CSSStyleDeclaration && globalThis.CSSStyleDeclaration.prototype) { Object.setPrototypeOf(base, globalThis.CSSStyleDeclaration.prototype); } } catch (e) {}
+    try {
+      return new Proxy(base, {
+        get: function (t, p) {
+          if (typeof p !== "string") { return t[p]; }
+          if (p in t) { return t[p]; }
+          return getVal(camelToKebab(p));
+        },
+        set: function (t, p, v) {
+          if (typeof p !== "string") { t[p] = v; return true; }
+          if (p === "cssText") { t.cssText = v; return true; }
+          if (p in t && p !== "length") { t[p] = v; return true; }
+          setVal(camelToKebab(p), v); return true;
+        }
+      });
+    } catch (e) { return base; }
+  }
+
+  // --- @media condition serialization (CSSOM "serialize a media query list") ------------------
+  // Lowercase a media type token; drop a leading `all` (unless negated). Per serialize-media-rule.
+  function serializeMediaQuery(q) {
+    q = q.trim().replace(/\s+/g, " ");
+    if (q === "") { return ""; }
+    // Lowercase media features inside parens and bare type/keyword tokens, preserving values.
+    // Split into the leading "<not>? <type>?" head and " and (...)" tail features.
+    var parts = splitTopLevel(q, " ").filter(function (x) { return x !== ""; });
+    // Reconstruct by lowercasing keywords (not/and/or/only/type names) and feature names in parens.
+    var negated = false, typeTok = null, feats = [], idx = 0;
+    if (parts[idx] && parts[idx].toLowerCase() === "not") { negated = true; idx++; }
+    if (parts[idx] && parts[idx].toLowerCase() === "only") { idx++; }
+    if (parts[idx] && parts[idx].charAt(0) !== "(") { typeTok = parts[idx].toLowerCase(); idx++; }
+    // Remaining: `and (feature)` groups. Re-join the rest and split on top-level " and ".
+    var tail = parts.slice(idx).join(" ");
+    var featGroups = tail ? splitTopLevel(tail, " ") : [];
+    // Rebuild feature list: each `(...)` token lowercased on the feature name.
+    var rebuilt = [];
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i];
+      if (t.charAt(0) === "(") { rebuilt.push(serializeMediaFeature(t)); }
+    }
+    var head;
+    if (typeTok === "all" && !negated && rebuilt.length) { head = ""; }
+    else { head = (negated ? "not " : "") + (typeTok || (negated || rebuilt.length === 0 ? "all" : "")); head = head.trim(); }
+    var s = head;
+    for (var j = 0; j < rebuilt.length; j++) { s += (s ? " and " : "") + rebuilt[j]; }
+    return s.trim();
+  }
+  // Lowercase a `(feature: value)` token's feature name (and bare `(color)`), preserve value casing.
+  function serializeMediaFeature(tok) {
+    var inner = tok.replace(/^\(\s*/, "").replace(/\s*\)$/, "");
+    var c = inner.indexOf(":");
+    if (c < 0) { return "(" + inner.trim().toLowerCase() + ")"; }
+    return "(" + inner.slice(0, c).trim().toLowerCase() + ": " + inner.slice(c + 1).trim() + ")";
+  }
+  function serializeMediaList(text) {
+    text = String(text == null ? "" : text).trim();
+    if (text === "") { return ""; }
+    var queries = splitTopLevel(text, ",").map(function (q) { return serializeMediaQuery(q); }).filter(function (q) { return q !== ""; });
+    return queries.join(", ");
+  }
+  // A MediaList over a mutable backing string holder {text}. `onChange` re-serializes the owner.
+  function makeMediaList(holder, onChange) {
+    function items() { var t = serializeMediaList(holder.text); return t === "" ? [] : splitTopLevel(t, ",").map(function (x) { return x.trim(); }); }
+    var ml = {
+      item: function (i) { var it = items(); return i >= 0 && i < it.length ? it[i] : null; },
+      appendMedium: function (m) { var it = items(); m = serializeMediaQuery(String(m)); if (it.indexOf(m) < 0) { it.push(m); } holder.text = it.join(", "); if (onChange) { onChange(); } },
+      deleteMedium: function (m) { var it = items(); m = serializeMediaQuery(String(m)); var k = it.indexOf(m); if (k < 0) { throw new globalThis.DOMException("Not found", "NotFoundError"); } it.splice(k, 1); holder.text = it.join(", "); if (onChange) { onChange(); } },
+      toString: function () { return serializeMediaList(holder.text); }
+    };
+    Object.defineProperty(ml, "length", { get: function () { return items().length; }, enumerable: true, configurable: true });
+    Object.defineProperty(ml, "mediaText", {
+      get: function () { return serializeMediaList(holder.text); },
+      set: function (v) { holder.text = (v == null) ? "" : String(v); if (onChange) { onChange(); } },
+      enumerable: true, configurable: true
+    });
+    try { if (globalThis.MediaList && globalThis.MediaList.prototype) { Object.setPrototypeOf(ml, globalThis.MediaList.prototype); } } catch (e) {}
+    try {
+      return new Proxy(ml, { get: function (t, p) {
+        if (typeof p === "string" && /^\d+$/.test(p)) { var v = t.item(parseInt(p, 10)); return v == null ? undefined : v; }
+        return t[p];
+      } });
+    } catch (e) { return ml; }
+  }
+
+  // --- @import prelude parsing/serialization ---------------------------------------------------
+  // Parse `@import` prelude: url + optional layer + optional supports() + optional media query.
+  function parseImportPrelude(prelude) {
+    var s = String(prelude).trim();
+    var href = "", rest = s;
+    var um = /^url\(\s*("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|[^)\s]*)\s*\)/i.exec(s);
+    if (um) { href = unquoteCss(um[1]); rest = s.slice(um[0].length).trim(); }
+    else {
+      var qm = /^("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/.exec(s);
+      if (qm) { href = unquoteCss(qm[1]); rest = s.slice(qm[0].length).trim(); }
+    }
+    var layer = null, supports = null;
+    var lm = /^layer\((.*?)\)/i.exec(rest);
+    if (lm) { layer = lm[1].trim(); rest = rest.slice(lm[0].length).trim(); }
+    else if (/^layer\b/i.test(rest)) { layer = ""; rest = rest.replace(/^layer\b/i, "").trim(); }
+    var sm = /^supports\(([\s\S]*?)\)\s*/i.exec(rest);
+    if (sm) {
+      // Balance parens for nested conditions.
+      var depth = 0, k = rest.indexOf("(") , start = k + 1, end = -1;
+      for (var p = k; p < rest.length; p++) { if (rest[p] === "(") { depth++; } else if (rest[p] === ")") { depth--; if (depth === 0) { end = p; break; } } }
+      if (end > start) { supports = rest.slice(start, end).trim(); rest = rest.slice(end + 1).trim(); }
+    }
+    var media = rest.trim();
+    return { href: href, layer: layer, supports: supports, media: media };
+  }
+  function unquoteCss(s) {
+    s = String(s);
+    if ((s.charAt(0) === '"' && s.charAt(s.length - 1) === '"') || (s.charAt(0) === "'" && s.charAt(s.length - 1) === "'")) {
+      return s.slice(1, -1).replace(/\\(.)/g, "$1");
+    }
+    return s;
+  }
+  // Serialize a string as a double-quoted CSS string (escape `"` and `\`).
+  function cssQuote(s) { return '"' + String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"'; }
+
+  // --- Stable CSSRule object construction ------------------------------------------------------
+  // Build a CSSRule object for `struct` owned by `sheet` (a CSSStyleSheet) with `parentRule`.
+  function makeCssRule(struct, sheet, parentRule) {
+    var kind = struct.kind;
+    if (kind === "style") { return makeStyleRule(struct, sheet, parentRule); }
+    if (kind === "@media") { return makeMediaRule(struct, sheet, parentRule); }
+    if (kind === "@import") { return makeImportRule(struct, sheet, parentRule); }
+    if (kind === "@font-feature-values") { return makeFontFeatureValuesRule(struct, sheet, parentRule); }
+    if (kind === "@font-face") { return makeFontFaceRule(struct, sheet, parentRule); }
+    if (kind === "@namespace") { return makeNamespaceRule(struct, sheet, parentRule); }
+    if (kind === "@supports") { return makeSupportsRule(struct, sheet, parentRule); }
+    if (kind === "@keyframes" || kind === "@-webkit-keyframes") { return makeKeyframesRule(struct, sheet, parentRule); }
+    if (kind === "@page") { return makePageRule(struct, sheet, parentRule); }
+    // Unknown at-rule: a generic rule that serializes its raw text.
+    return makeGenericRule(struct, sheet, parentRule, 0);
+  }
+  // Define an accessor/value on a rule's INTERMEDIATE prototype (not the instance), so the CSSOM
+  // [SameObject]/inherited-attribute semantics hold: `rule.hasOwnProperty("type")` is false but
+  // `rule.type` resolves (assert_idl_attribute). The instance stays empty for page expandos.
+  function defOn(rule, name, desc) { desc.configurable = true; Object.defineProperty(Object.getPrototypeOf(rule), name, desc); }
+  // Create a fresh rule instance whose prototype holds the per-instance accessors and chains up to
+  // the global interface constructor's prototype (for `instanceof`). Stores `type` on the proto.
+  function newRule(ctorName, type, sheet, parentRule) {
+    var proto = {};
+    try { var ctor = globalThis[ctorName]; if (ctor && ctor.prototype) { Object.setPrototypeOf(proto, ctor.prototype); } } catch (e) {}
+    Object.defineProperty(proto, "type", { get: function () { return type; }, enumerable: true, configurable: true });
+    Object.defineProperty(proto, "parentStyleSheet", { get: function () { return sheet || null; }, enumerable: true, configurable: true });
+    Object.defineProperty(proto, "parentRule", { get: function () { return parentRule || null; }, enumerable: true, configurable: true });
+    return Object.create(proto);
+  }
+  function makeStyleRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSStyleRule", 1, sheet, parentRule);
+    var decls = struct.decls || (struct.decls = parseDeclList(struct.body));
+    function reserialize() { struct.body = serializeDeclList(decls); }
+    var styleObj = makeRuleStyle(decls, function () { reserialize(); markDirty(sheet); });
+    function selText() { var nrm = normalizeSelectorList(struct.prelude, sheetNsContext(sheet)); return nrm == null ? struct.prelude.trim() : nrm; }
+    defOn(rule, "selectorText", {
+      get: selText,
+      set: function (v) { var nrm = normalizeSelectorList(v, sheetNsContext(sheet)); if (nrm != null) { struct.prelude = nrm; markDirty(sheet); } },
+      enumerable: true
+    });
+    defOn(rule, "style", {
+      get: function () { return styleObj; },
+      set: function (v) { styleObj.cssText = v == null ? "" : String(v); },
+      enumerable: true
+    });
+    defOn(rule, "cssText", { get: function () {
+      var sel = selText();
+      var body = serializeDeclList(decls);
+      return sel + " { " + (body ? body + " " : "") + "}";
+    }, enumerable: true });
     return rule;
   }
-  function makeStyleSheet(styleEl) {
-    function rawRules() { return parseCssRules(styleEl.textContent); }
-    var ss = {
-      type: "text/css", disabled: false, href: null, title: null, media: { length: 0 },
-      ownerNode: styleEl, parentStyleSheet: null,
-      // The cssText of rule `index` (re-read live so a selector edit is reflected).
-      __ruleCssText: function (index) { var rs = rawRules(); return rs[index] || ""; },
-      // Rewrite the selector of rule `index`, preserving its declaration block, and write the whole
-      // sheet back to the <style> element so the cascade (and getComputedStyle) re-applies.
-      __setRuleSelector: function (index, newSel) {
-        var rs = rawRules();
-        if (index < 0 || index >= rs.length) { return; }
-        var brace = rs[index].indexOf("{");
-        var block = brace >= 0 ? rs[index].slice(brace) : "{ }";
-        rs[index] = newSel + " " + block;
-        styleEl.textContent = rs.join("\n");
-      },
-      get cssRules() {
-        var raw = rawRules();
-        var rs = [];
-        for (var i = 0; i < raw.length; i++) { rs.push(makeRule(raw[i], ss, i)); }
-        rs.item = function (i) { return this[i] || null; };
-        return rs;
-      },
-      insertRule: function (rule, index) {
-        var t = styleEl.textContent || ""; styleEl.textContent = (index ? t : "") + String(rule) + (index ? "" : t); return index || 0;
-      },
-      deleteRule: function () {},
-      replaceSync: function (text) { styleEl.textContent = String(text); }
+  function makePageRule(struct, sheet, parentRule) {
+    // @page exposes a `.style` (CSSStyleDeclaration) like a style rule. Type 6.
+    var rule = newRule("CSSPageRule", 6, sheet, parentRule);
+    var decls = struct.decls || (struct.decls = parseDeclList(struct.body));
+    var styleObj = makeRuleStyle(decls, function () { struct.body = serializeDeclList(decls); markDirty(sheet); });
+    defOn(rule, "selectorText", { get: function () { return struct.prelude.trim(); }, enumerable: true });
+    defOn(rule, "style", { get: function () { return styleObj; }, set: function (v) { styleObj.cssText = v == null ? "" : String(v); }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var body = serializeDeclList(decls); var sel = struct.prelude.trim();
+      return "@page" + (sel ? " " + sel : "") + " { " + (body ? body + " " : "") + "}";
+    }, enumerable: true });
+    return rule;
+  }
+  function makeMediaRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSMediaRule", 4, sheet, parentRule);
+    var holder = { text: struct.prelude };
+    var mediaList = makeMediaList(holder, function () { markDirty(sheet); });
+    var childRules = parseRuleStructs(struct.body);
+    var childList = makeRuleList(childRules, sheet, rule);
+    defOn(rule, "media", { get: function () { return mediaList; }, set: function (v) { mediaList.mediaText = v; }, enumerable: true });
+    // conditionText getter mirrors media.mediaText; the setter is a no-op for @media (per browsers).
+    defOn(rule, "conditionText", { get: function () { return serializeMediaList(holder.text); }, set: function () {}, enumerable: true });
+    defOn(rule, "cssRules", { get: function () { return childList; }, enumerable: true });
+    defOn(rule, "insertRule", { value: function (text, index) { return childList.__insert(String(text), index); }, enumerable: true });
+    defOn(rule, "deleteRule", { value: function (index) { return childList.__delete(index); }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var cond = serializeMediaList(holder.text);
+      var inner = "";
+      for (var i = 0; i < childList.length; i++) { inner += "  " + childList[i].cssText + "\n"; }
+      return "@media " + cond + " {\n" + inner + "}";
+    }, enumerable: true });
+    return rule;
+  }
+  function makeSupportsRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSSupportsRule", 12, sheet, parentRule);
+    var childList = makeRuleList(parseRuleStructs(struct.body), sheet, rule);
+    defOn(rule, "conditionText", { get: function () { return struct.prelude.trim(); }, enumerable: true });
+    defOn(rule, "cssRules", { get: function () { return childList; }, enumerable: true });
+    defOn(rule, "insertRule", { value: function (text, index) { return childList.__insert(String(text), index); }, enumerable: true });
+    defOn(rule, "deleteRule", { value: function (index) { return childList.__delete(index); }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var inner = ""; for (var i = 0; i < childList.length; i++) { inner += "  " + childList[i].cssText + "\n"; }
+      return "@supports " + struct.prelude.trim() + " {\n" + inner + "}";
+    }, enumerable: true });
+    return rule;
+  }
+  function makeImportRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSImportRule", 3, sheet, parentRule);
+    var info = parseImportPrelude(struct.prelude);
+    var holder = { text: info.media };
+    var mediaList = makeMediaList(holder, function () { markDirty(sheet); });
+    // The imported sheet object (we don't fetch external CSS; provide an empty CSSStyleSheet so
+    // `instanceof CSSStyleSheet` holds and ownerRule is wired).
+    var imported = null;
+    defOn(rule, "href", { get: function () { return info.href; }, enumerable: true });
+    defOn(rule, "layerName", { get: function () { return info.layer; }, enumerable: true });
+    defOn(rule, "supportsText", { get: function () { return info.supports; }, enumerable: true });
+    defOn(rule, "media", { get: function () { return mediaList; }, set: function (v) { mediaList.mediaText = v; }, enumerable: true });
+    defOn(rule, "styleSheet", { get: function () {
+      if (!imported) { imported = makeConstructedSheet(""); imported.__ownerRule = rule; imported.__href = info.href; imported.__media = mediaList; }
+      return imported;
+    }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var s = "@import " + 'url(' + cssQuote(info.href) + ')';
+      if (info.layer === "") { s += " layer"; } else if (info.layer != null) { s += " layer(" + info.layer + ")"; }
+      if (info.supports != null) { s += " supports(" + info.supports + ")"; }
+      var mt = serializeMediaList(holder.text);
+      if (mt) { s += " " + mt; }
+      return s + ";";
+    }, enumerable: true });
+    return rule;
+  }
+  function makeNamespaceRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSNamespaceRule", 10, sheet, parentRule);
+    var parts = splitTopLevel(struct.prelude, " ").filter(function (x) { return x !== ""; });
+    var prefix = "", uri = "";
+    if (parts.length >= 2) { prefix = parts[0]; uri = parts.slice(1).join(" "); } else { uri = parts[0] || ""; }
+    defOn(rule, "prefix", { get: function () { return prefix; }, enumerable: true });
+    defOn(rule, "namespaceURI", { get: function () { return unquoteCss(uri.replace(/^url\(\s*|\s*\)$/g, "")); }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var u = unquoteCss(uri.replace(/^url\(\s*|\s*\)$/g, ""));
+      return "@namespace " + (prefix ? prefix + " " : "") + "url(" + cssQuote(u) + ");";
+    }, enumerable: true });
+    return rule;
+  }
+  function makeFontFaceRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSFontFaceRule", 5, sheet, parentRule);
+    var decls = struct.decls || (struct.decls = parseDeclList(struct.body));
+    var styleObj = makeRuleStyle(decls, function () { struct.body = serializeDeclList(decls); markDirty(sheet); });
+    defOn(rule, "style", { get: function () { return styleObj; }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var body = serializeDeclList(decls);
+      return "@font-face { " + (body ? body + " " : "") + "}";
+    }, enumerable: true });
+    return rule;
+  }
+  function makeKeyframesRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSKeyframesRule", 7, sheet, parentRule);
+    var name = struct.prelude.trim();
+    var childRules = parseRuleStructs(struct.body);
+    defOn(rule, "name", { get: function () { return unquoteCss(name); }, set: function (v) { name = String(v); markDirty(sheet); }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var inner = "";
+      for (var i = 0; i < childRules.length; i++) {
+        var c = childRules[i];
+        inner += "  " + c.prelude.trim() + " { " + (serializeDeclList(c.decls || (c.decls = parseDeclList(c.body))) ? serializeDeclList(c.decls) + " " : "") + "}\n";
+      }
+      return "@keyframes " + unquoteCss(name) + " {\n" + inner + "}";
+    }, enumerable: true });
+    return rule;
+  }
+  function makeGenericRule(struct, sheet, parentRule, type) {
+    var rule = newRule("CSSRule", type, sheet, parentRule);
+    defOn(rule, "cssText", { get: function () {
+      if (struct.body != null && struct.body !== "") { return struct.kind + " " + struct.prelude + " { " + struct.body.trim() + " }"; }
+      return struct.kind + " " + struct.prelude + ";";
+    }, enumerable: true });
+    return rule;
+  }
+  // --- @font-feature-values ------------------------------------------------------------------
+  function makeFontFeatureValuesRule(struct, sheet, parentRule) {
+    var rule = newRule("CSSFontFeatureValuesRule", 14, sheet, parentRule);
+    var family = struct.prelude.trim();
+    // Parse inner @blocks into maps: blockName -> { ident: [numbers] }.
+    var blocks = {};
+    var inner = parseRuleStructs(struct.body);
+    var blockNames = ["stylistic", "styleset", "character-variant", "swash", "ornaments", "annotation"];
+    for (var bi = 0; bi < blockNames.length; bi++) { blocks[blockNames[bi]] = {}; }
+    for (var i = 0; i < inner.length; i++) {
+      var ir = inner[i];
+      if (ir.kind && ir.kind.charAt(0) === "@") {
+        var bn = ir.atName;
+        if (!blocks[bn]) { blocks[bn] = {}; }
+        var dl = splitTopLevel(ir.body, ";");
+        for (var j = 0; j < dl.length; j++) {
+          var seg = dl[j], c = seg.indexOf(":");
+          if (c < 0) { continue; }
+          var key = seg.slice(0, c).trim();
+          var nums = seg.slice(c + 1).trim().split(/\s+/).filter(function (x) { return x !== ""; }).map(Number);
+          if (key) { blocks[bn][key] = nums; }
+        }
+      }
+    }
+    function makeValuesMap(store) {
+      var m = {
+        get: function (k) { return store[k]; },
+        set: function (k, v) { store[k] = (typeof v === "number") ? [v] : v.slice(); markDirty(sheet); },
+        has: function (k) { return Object.prototype.hasOwnProperty.call(store, k); },
+        "delete": function (k) { var had = Object.prototype.hasOwnProperty.call(store, k); delete store[k]; markDirty(sheet); return had; },
+        clear: function () { for (var k in store) { delete store[k]; } markDirty(sheet); },
+        forEach: function (cb, thisArg) { for (var k in store) { cb.call(thisArg, store[k], k, m); } }
+      };
+      Object.defineProperty(m, "size", { get: function () { return Object.keys(store).length; }, enumerable: true, configurable: true });
+      try { m[Symbol.iterator] = function () { var keys = Object.keys(store), idx = 0; return { next: function () { return idx < keys.length ? { value: [keys[idx], store[keys[idx++]]], done: false } : { value: undefined, done: true }; } }; }; } catch (e) {}
+      return m;
+    }
+    var maps = {
+      stylistic: makeValuesMap(blocks["stylistic"]),
+      styleset: makeValuesMap(blocks["styleset"]),
+      characterVariant: makeValuesMap(blocks["character-variant"]),
+      swash: makeValuesMap(blocks["swash"]),
+      ornaments: makeValuesMap(blocks["ornaments"]),
+      annotation: makeValuesMap(blocks["annotation"])
     };
-    Object.defineProperty(ss, "rules", { get: function () { return this.cssRules; }, enumerable: false, configurable: true });
+    for (var mk in maps) { (function (k) { defOn(rule, k, { get: function () { return maps[k]; }, enumerable: true }); })(mk); }
+    defOn(rule, "fontFamily", { get: function () { return family; }, set: function (v) { family = String(v); markDirty(sheet); }, enumerable: true });
+    defOn(rule, "cssText", { get: function () {
+      var s = "@font-feature-values " + family + " {\n";
+      var order = [["@stylistic", blocks["stylistic"]], ["@styleset", blocks["styleset"]], ["@character-variant", blocks["character-variant"]], ["@swash", blocks["swash"]], ["@ornaments", blocks["ornaments"]], ["@annotation", blocks["annotation"]]];
+      for (var oi = 0; oi < order.length; oi++) {
+        var store = order[oi][1], keys = Object.keys(store);
+        if (!keys.length) { continue; }
+        s += "  " + order[oi][0] + " {\n";
+        for (var ki = 0; ki < keys.length; ki++) { s += "    " + keys[ki] + ": " + store[keys[ki]].join(" ") + ";\n"; }
+        s += "  }\n";
+      }
+      return s + "}";
+    }, enumerable: true });
+    return rule;
+  }
+
+  // --- CSSRuleList (stable, indexed list of rule objects) -------------------------------------
+  // Builds CSSRule objects lazily and caches them per struct so expandos persist. `structs` is the
+  // mutable backing array (shared with the sheet). insert/delete keep the cached wrappers aligned.
+  function makeRuleList(structs, sheet, parentRule) {
+    var list = [];
+    function rebuild() {
+      // Reuse cached wrappers (keyed on struct identity) so [SameObject] holds.
+      for (var i = 0; i < structs.length; i++) {
+        var st = structs[i];
+        if (!st.__rule) { st.__rule = makeCssRule(st, sheet, parentRule); }
+        list[i] = st.__rule;
+      }
+      list.length = structs.length;
+    }
+    rebuild();
+    list.item = function (i) { i = i >>> 0; return i < structs.length ? list[i] : null; };
+    list.__rebuild = rebuild;
+    list.__structs = structs;
+    list.__insert = function (text, index) {
+      var newStructs = parseRuleStructs(text);
+      if (newStructs.length !== 1) { throw new globalThis.DOMException("Invalid rule", "SyntaxError"); }
+      if (index === undefined) { index = 0; }
+      index = index >>> 0;
+      if (index > structs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
+      structs.splice(index, 0, newStructs[0]);
+      rebuild(); markDirty(sheet);
+      return index;
+    };
+    list.__delete = function (index) {
+      index = index >>> 0;
+      if (index >= structs.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
+      structs.splice(index, 1);
+      rebuild(); markDirty(sheet);
+    };
+    try { if (globalThis.CSSRuleList && globalThis.CSSRuleList.prototype) { Object.setPrototypeOf(list, globalThis.CSSRuleList.prototype); } } catch (e) {}
+    return list;
+  }
+
+  // Mark a sheet dirty (re-render its <style> ownerNode so the cascade picks up CSSOM edits).
+  function markDirty(sheet) {
+    if (!sheet || sheet.__rendering) { return; }
+    if (sheet.__ownerNode && typeof sheet.__renderToOwner === "function") {
+      try { sheet.__rendering = true; sheet.__renderToOwner(); } finally { sheet.__rendering = false; }
+    }
+  }
+
+  // --- CSSStyleSheet --------------------------------------------------------------------------
+  function makeStyleSheetCore(structs, ownerNode) {
+    var ss = {};
+    var mediaHolder = { text: "" };
+    var mediaList = makeMediaList(mediaHolder, null);
+    ss.__structs = structs;
+    ss.__ownerNode = ownerNode || null;
+    var ruleList = makeRuleList(structs, ss, null);
+    // __sync re-reads the owner node's text when it changed underneath us (e.g. a page sets
+    // `styleEl.firstChild.data` directly). Replaced by makeStyleSheet for live <style>/<link>.
+    ss.__sync = function () {};
+    ss.type = "text/css";
+    ss.disabled = false;
+    Object.defineProperty(ss, "ownerNode", { get: function () { return ownerNode || null; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "ownerRule", { get: function () { return ss.__ownerRule || null; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "parentStyleSheet", { get: function () { return null; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "href", { get: function () { return ss.__href != null ? ss.__href : null; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "title", { get: function () { return (ownerNode && ownerNode.getAttribute && ownerNode.getAttribute("title")) || null; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "media", { get: function () { return ss.__media || mediaList; }, set: function (v) { (ss.__media || mediaList).mediaText = v; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "cssRules", { get: function () { ss.__sync(); return ruleList; }, enumerable: true, configurable: true });
+    Object.defineProperty(ss, "rules", { get: function () { ss.__sync(); return ruleList; }, enumerable: false, configurable: true });
+    ss.insertRule = function (text, index) {
+      if (arguments.length < 1) { throw new TypeError("insertRule requires at least 1 argument"); }
+      ss.__sync();
+      return ruleList.__insert(String(text), index);
+    };
+    ss.deleteRule = function (index) {
+      if (arguments.length < 1) { throw new TypeError("deleteRule requires 1 argument"); }
+      return ruleList.__delete(index);
+    };
+    // Legacy CSSOM members.
+    ss.removeRule = function (index) { if (index === undefined) { index = 0; } return ruleList.__delete(index); };
+    ss.addRule = function (selector, block, index) {
+      selector = selector === undefined ? "undefined" : String(selector);
+      block = block === undefined ? "undefined" : String(block);
+      if (index === undefined) { index = ruleList.length; }
+      index = index >>> 0;
+      // IndexSizeError propagates; SyntaxError/HierarchyRequestError are swallowed (legacy behavior).
+      if (index > ruleList.length) { throw new globalThis.DOMException("Index out of bounds", "IndexSizeError"); }
+      var text = selector + " { " + block + " }";
+      try { ruleList.__insert(text, index); } catch (e) { if (e && e.name === "IndexSizeError") { throw e; } }
+      return -1;
+    };
+    Object.defineProperty(ss, "cssText", { get: function () {
+      var s = ""; for (var i = 0; i < ruleList.length; i++) { s += (s ? "\n" : "") + ruleList[i].cssText; } return s;
+    }, enumerable: false, configurable: true });
+    try { if (globalThis.CSSStyleSheet && globalThis.CSSStyleSheet.prototype) { Object.setPrototypeOf(ss, globalThis.CSSStyleSheet.prototype); } } catch (e) {}
+    return ss;
+  }
+  // A constructed (or @import-target) sheet with no owner node; supports replace/replaceSync.
+  function makeConstructedSheet(cssText) {
+    var ss = makeStyleSheetCore(parseRuleStructs(cssText), null);
+    ss.__constructed = true;
+    ss.replaceSync = function (text) {
+      var ns = parseRuleStructs(String(text));
+      ss.__structs.length = 0; for (var i = 0; i < ns.length; i++) { ss.__structs.push(ns[i]); }
+      ss.cssRules.__rebuild();
+    };
+    ss.replace = function (text) { try { ss.replaceSync(text); return Promise.resolve(ss); } catch (e) { return Promise.reject(e); } };
+    return ss;
+  }
+  // The live sheet for a <style>/<link> element. Parses textContent; re-renders on CSSOM edits, and
+  // re-parses if the page mutates the element's text out-of-band (e.g. `styleEl.firstChild.data`).
+  function makeStyleSheet(styleEl) {
+    var initial = styleEl.textContent || "";
+    var ss = makeStyleSheetCore(parseRuleStructs(initial), styleEl);
+    ss.__lastText = initial;
+    ss.__sync = function () {
+      if (ss.__rendering) { return; }
+      var cur = styleEl.textContent || "";
+      if (cur === ss.__lastText) { return; }
+      ss.__lastText = cur;
+      var ns = parseRuleStructs(cur);
+      ss.__structs.length = 0; for (var i = 0; i < ns.length; i++) { ss.__structs.push(ns[i]); }
+      ss.cssRules.__rebuild();
+    };
+    ss.__renderToOwner = function () {
+      var s = ""; var rl = ss.cssRules;
+      for (var i = 0; i < rl.length; i++) { s += (s ? "\n" : "") + rl[i].cssText; }
+      try { styleEl.textContent = s; ss.__lastText = styleEl.textContent || ""; } catch (e) {}
+    };
     return ss;
   }
 
@@ -7001,9 +7618,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   defClass("AbstractRange"); defClass("Range", globalThis.AbstractRange); defClass("StaticRange", globalThis.AbstractRange);
   var domIfaces = [
     "HTMLCollection", "NodeList", "DOMTokenList", "NamedNodeMap", "DOMStringMap", "DOMRectList",
-    "CSSStyleDeclaration", "StyleSheet", "CSSStyleSheet", "StyleSheetList", "MediaList",
-    "CSSRule", "CSSStyleRule", "CSSMediaRule", "CSSKeyframesRule", "CSSKeyframeRule",
-    "CSSImportRule", "CSSFontFaceRule", "CSSSupportsRule", "CSSGroupingRule",
+    "CSSStyleDeclaration", "StyleSheetList", "MediaList", "CSSRuleList",
     "DOMRect", "DOMRectReadOnly", "DOMPoint", "DOMPointReadOnly", "DOMMatrix", "DOMMatrixReadOnly",
     "DOMQuad", "DOMException", "DOMParser", "XMLSerializer", "XPathResult", "XPathEvaluator",
     "MutationRecord", "AnimationEffect", "KeyframeEffect", "Animation", "AnimationTimeline",
@@ -7011,6 +7626,49 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     "TimeRanges", "ValidityState", "HTMLFormControlsCollection", "RadioNodeList",
   ];
   for (var di = 0; di < domIfaces.length; di++) { defClass(domIfaces[di]); }
+
+  // --- CSSOM interface hierarchy + CSSRule type constants ------------------------------------
+  // StyleSheet <- CSSStyleSheet; CSSRule <- {CSSStyleRule, CSSGroupingRule <- {CSSMediaRule,
+  // CSSSupportsRule}, CSSImportRule, CSSFontFaceRule, CSSKeyframesRule, CSSKeyframeRule,
+  // CSSNamespaceRule, CSSPageRule, CSSFontFeatureValuesRule}. instanceof + .type must hold.
+  var StyleSheetCtor = defClass("StyleSheet");
+  defClass("CSSStyleSheet", StyleSheetCtor);
+  var CSSRuleCtor = defClass("CSSRule");
+  (function (ctor) {
+    var consts = { STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5,
+      PAGE_RULE: 6, KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, MARGIN_RULE: 9, NAMESPACE_RULE: 10,
+      COUNTER_STYLE_RULE: 11, SUPPORTS_RULE: 12, FONT_FEATURE_VALUES_RULE: 14, VIEWPORT_RULE: 15 };
+    for (var k in consts) { ctor[k] = consts[k]; try { def(ctor.prototype, k, consts[k]); } catch (e) {} }
+  })(CSSRuleCtor);
+  defClass("CSSStyleRule", CSSRuleCtor);
+  var CSSGroupingCtor = defClass("CSSGroupingRule", CSSRuleCtor);
+  defClass("CSSConditionRule", CSSGroupingCtor);
+  defClass("CSSMediaRule", globalThis.CSSConditionRule);
+  defClass("CSSSupportsRule", globalThis.CSSConditionRule);
+  defClass("CSSImportRule", CSSRuleCtor);
+  defClass("CSSFontFaceRule", CSSRuleCtor);
+  defClass("CSSPageRule", CSSGroupingCtor);
+  defClass("CSSKeyframesRule", CSSRuleCtor);
+  defClass("CSSKeyframeRule", CSSRuleCtor);
+  defClass("CSSNamespaceRule", CSSRuleCtor);
+  defClass("CSSFontFeatureValuesRule", CSSRuleCtor);
+
+  // The CSSStyleSheet constructor produces a constructable sheet (no owner node).
+  (function () {
+    var ctor = globalThis.CSSStyleSheet;
+    if (typeof ctor === "function") {
+      var Real = function (options) {
+        var sheet = makeConstructedSheet("");
+        options = options || {};
+        if (options.media != null) { sheet.media.mediaText = String(options.media); }
+        if (options.disabled) { sheet.disabled = true; }
+        if (options.baseURL != null) { sheet.__href = String(options.baseURL); }
+        return sheet;
+      };
+      Real.prototype = ctor.prototype;
+      def(globalThis, "CSSStyleSheet", Real);
+    }
+  })();
 
   // --- Image / Audio / media element constructors ------------------------------------------
   if (typeof globalThis.Image !== "function") {
@@ -12759,6 +13417,8 @@ mod tests {
     #[test]
     fn style_element_exposes_sheet_with_css_rules() {
         // Feature-detection libs (e.g. browserscore) read `styleEl.sheet.cssRules[0].cssText`.
+        // cssText is serialized per the CSSOM "serialize a CSS rule" algorithm (declarations end
+        // with a trailing `;`, single space inside the braces).
         let out = env_eval(
             "https://example.com/",
             "var s = document.createElement('style'); \
@@ -12767,7 +13427,64 @@ mod tests {
              [typeof s.sheet, s.sheet.cssRules.length, s.sheet.cssRules[0].cssText].join('|')",
         );
         assert_eq!(out.error, None, "{out:?}");
-        assert_eq!(out.value.as_deref(), Some("object|1|a { color: red }"));
+        assert_eq!(out.value.as_deref(), Some("object|1|a { color: red; }"));
+    }
+
+    #[test]
+    fn cssom_style_rule_selector_and_css_text() {
+        // A <style> rule is a CSSStyleRule with the right selectorText/style/cssText, and
+        // document.styleSheets[0] is the same CSSStyleSheet as the element's .sheet.
+        let out = env_eval(
+            "https://example.com/",
+            "var s = document.createElement('style'); \
+             document.documentElement.appendChild(s); \
+             s.textContent = 'div { margin: 10px; padding: 0px; }'; \
+             var r = document.styleSheets[0].cssRules[0]; \
+             [r instanceof CSSStyleRule, r instanceof CSSRule, r.type, r.selectorText, \
+              r.style.margin, r.cssText, document.styleSheets[0] === s.sheet].join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("true|true|1|div|10px|div { margin: 10px; padding: 0px; }|true")
+        );
+    }
+
+    #[test]
+    fn cssom_insert_and_delete_rule_preserve_same_object() {
+        // insertRule/deleteRule update cssRules; existing wrappers keep their identity ([SameObject]).
+        let out = env_eval(
+            "https://example.com/",
+            "var s = document.createElement('style'); \
+             document.documentElement.appendChild(s); \
+             s.textContent = 'body { width: 50%; }\\n#foo { height: 100px; }'; \
+             var ss = s.sheet; ss.cssRules[0].mark = 1; ss.cssRules[1].mark = 2; \
+             ss.insertRule('#bar { margin: 10px; }', 1); \
+             var a = [ss.cssRules.length, ss.cssRules[1].cssText, ss.cssRules[0].mark, ss.cssRules[2].mark]; \
+             ss.deleteRule(1); \
+             a.push(ss.cssRules.length, ss.cssRules[0].mark, ss.cssRules[1].mark); a.join('|')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(out.value.as_deref(), Some("3|#bar { margin: 10px; }|1|2|2|1|2"));
+    }
+
+    #[test]
+    fn cssom_media_and_import_rules() {
+        // @media serializes per CSSOM; @import exposes href/media.
+        let out = env_eval(
+            "https://example.com/",
+            "var s = document.createElement('style'); \
+             document.documentElement.appendChild(s); \
+             s.textContent = '@import url(\"a.css\") screen;\\n@media all and (color) {}'; \
+             var imp = s.sheet.cssRules[0]; var med = s.sheet.cssRules[1]; \
+             [imp instanceof CSSImportRule, imp.type, imp.href, imp.media.mediaText, imp.cssText, \
+              med instanceof CSSMediaRule, med.type, med.cssText].join('~')",
+        );
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(
+            out.value.as_deref(),
+            Some("true~3~a.css~screen~@import url(\"a.css\") screen;~true~4~@media (color) {\n}")
+        );
     }
 
     #[test]
