@@ -793,6 +793,8 @@ impl Engine {
                             page_max_y, images, &self.canvas_bitmaps, &self.svg_bitmaps,
                             &self.mask_bitmaps, &sel_ranges, &mut run_idx,
                         );
+                        // Overlay scrollbar on the right edge when the page overflows the viewport.
+                        paint_scrollbar(&mut fb, header_h, viewport_height, cache.content_h, scroll_y, self.scale);
                     } else if doc.is_none() {
                         draw_text(
                             &mut fb, font, &format!("(non-HTML content: {})", url),
@@ -1839,6 +1841,26 @@ fn page_background(root: &layout::LayoutBox, root_scheme_dark: bool) -> Color {
     } else {
         Color::WHITE
     }
+}
+
+/// Draw a macOS-style overlay scrollbar (a semi-transparent rounded thumb on the right edge) when
+/// the document is taller than the viewport. `top` is the content area's top (device px), `viewport_h`
+/// its height, `content_h` the full document height, `scroll_y` the current offset — all device px.
+fn paint_scrollbar(fb: &mut Framebuffer, top: f32, viewport_h: f32, content_h: f32, scroll_y: f32, scale: f32) {
+    if content_h <= viewport_h + 1.0 || viewport_h <= 1.0 {
+        return; // nothing to scroll
+    }
+    let w = (7.0 * scale).round().max(4.0);
+    let margin = 2.0 * scale;
+    let x = (fb.width as f32 - w - margin).round() as i32;
+    let min_thumb = 28.0 * scale;
+    let thumb_h = ((viewport_h / content_h) * viewport_h).clamp(min_thumb, viewport_h);
+    let max_off = (viewport_h - thumb_h).max(0.0);
+    let frac = (scroll_y / (content_h - viewport_h)).clamp(0.0, 1.0);
+    let y = (top + frac * max_off).round() as i32;
+    // Semi-transparent neutral grey reads on both light and dark pages.
+    let thumb = Color { r: 128, g: 128, b: 128, a: 150 };
+    fb.fill_round_rect(Rect { x, y, w: w.round() as i32, h: thumb_h.round() as i32 }, w / 2.0, thumb);
 }
 
 fn paint_gradient(fb: &mut Framebuffer) {
