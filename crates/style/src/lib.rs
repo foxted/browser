@@ -69,6 +69,54 @@ pub enum Position {
     Sticky,
 }
 
+/// The *specified* value of an inset longhand (`top`/`right`/`bottom`/`left`), retained so the
+/// CSSOM "resolved value" algorithm can be applied at `getComputedStyle` time. Absolute lengths
+/// (incl. `em`/`rem`) are absolutized to px during the cascade; percentages and `calc()` mixing a
+/// percentage are kept symbolic because their basis (the containing block) isn't known until then.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InsetValue {
+    /// `auto` (or unset).
+    Auto,
+    /// An absolute length, already resolved to CSS px.
+    Length(f32),
+    /// A percentage, stored as the raw number (e.g. `10%` → `10.0`).
+    Percent(f32),
+    /// `calc()` mixing a percentage and a length: `pct`% of the basis plus `px` px.
+    Calc { pct: f32, px: f32 },
+}
+
+impl InsetValue {
+    /// Serialize the *specified* value as CSSOM would for a box-less / percentage-preserving case.
+    pub fn serialize_specified(&self) -> String {
+        match self {
+            InsetValue::Auto => "auto".to_string(),
+            InsetValue::Length(v) => px(*v),
+            InsetValue::Percent(p) => format!("{}%", num(*p)),
+            // calc() with a percentage serializes in canonical form.
+            InsetValue::Calc { pct, px: l } => {
+                if *l == 0.0 {
+                    format!("calc({}%)", num(*pct))
+                } else if *l > 0.0 {
+                    format!("calc({}% + {}px)", num(*pct), num(*l))
+                } else {
+                    format!("calc({}% - {}px)", num(*pct), num(-*l))
+                }
+            }
+        }
+    }
+
+    /// Resolve to a used px length given the percentage `basis` (the containing-block extent on the
+    /// relevant axis). `Auto` yields `None`.
+    pub fn resolve_px(&self, basis: f32) -> Option<f32> {
+        match self {
+            InsetValue::Auto => None,
+            InsetValue::Length(v) => Some(*v),
+            InsetValue::Percent(p) => Some(p / 100.0 * basis),
+            InsetValue::Calc { pct, px: l } => Some(pct / 100.0 * basis + l),
+        }
+    }
+}
+
 /// Flex container main-axis direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlexDirection {
@@ -179,6 +227,12 @@ pub struct ComputedStyle {
     pub right: Option<f32>,
     pub bottom: Option<f32>,
     pub left: Option<f32>,
+    /// *Specified* inset values (px-absolutized lengths, plus symbolic percentages/`calc()` and
+    /// `auto`), retained for the CSSOM resolved-value algorithm. Mirror the order above.
+    pub top_spec: InsetValue,
+    pub right_spec: InsetValue,
+    pub bottom_spec: InsetValue,
+    pub left_spec: InsetValue,
     /// Stacking `z-index` (`None` = auto). Parsed but not yet used for paint ordering.
     pub z_index: Option<i32>,
     /// Explicit content `width` in px (`None` = auto). Percentages are ignored (None).
@@ -553,6 +607,10 @@ impl Default for ComputedStyle {
             right: None,
             bottom: None,
             left: None,
+            top_spec: InsetValue::Auto,
+            right_spec: InsetValue::Auto,
+            bottom_spec: InsetValue::Auto,
+            left_spec: InsetValue::Auto,
             z_index: None,
             width: None,
             height: None,
@@ -876,6 +934,70 @@ impl ComputedStyle {
             // Anything else this struct does not model: report empty so feature detection sees
             // "unsupported/untracked" (which is the correct, honest answer for those callers).
             _ => String::new(),
+        }
+    }
+
+    /// The CSSOM ["resolved value"](https://drafts.csswg.org/cssom/#resolved-value) of an inset
+    /// longhand (`side` ∈ {top,right,bottom,left}), per the *property-like* `top`/`right`/`bottom`/
+    /// `left` special-case.
+    ///
+    /// - `box_less` (display:none / no rendered box) or `position: static` → the **computed** value:
+    ///   lengths absolutized to px, percentages preserved, `auto` preserved.
+    /// - `position: sticky` → like static but percentages resolve against the containing block
+    ///   (`basis`); `auto` is preserved.
+    /// - `position: relative` → a used px length: a set side resolves against `basis`; an `auto`
+    ///   side mirrors the negated opposite (or `0` when both are `auto`).
+    /// - `position: absolute`/`fixed` → the used px value. Set sides and the over-constrained
+    ///   "auto vs set" pairing (`basis − opposite`) are resolved here; the all-`auto` static-position
+    ///   case needs layout we don't have synchronously, so it falls back to `0` (documented gap).
+    ///
+    /// `basis` is the containing-block extent on this side's axis (height for top/bottom, width for
+    /// left/right); pass `f32::NAN` when unknown (box-less / static, where it's unused).
+    pub fn resolved_inset(&self, side: EdgeSide, box_less: bool, basis: f32) -> String {
+        let (spec, opposite) = match side {
+            EdgeSide::Top => (self.top_spec, self.bottom_spec),
+            EdgeSide::Bottom => (self.bottom_spec, self.top_spec),
+            EdgeSide::Left => (self.left_spec, self.right_spec),
+            EdgeSide::Right => (self.right_spec, self.left_spec),
+            EdgeSide::All => return String::new(),
+        };
+
+        // No box, or insets that don't apply (static): the computed (specified) value.
+        if box_less || self.position == Position::Static {
+            return spec.serialize_specified();
+        }
+
+        match self.position {
+            // Sticky preserves `auto`; otherwise resolve (percentages against the cb).
+            Position::Sticky => match spec {
+                InsetValue::Auto => "auto".to_string(),
+                _ => px(spec.resolve_px(basis).unwrap_or(0.0)),
+            },
+            // Relative: opposite-pair auto rules, everything used-px.
+            Position::Relative => {
+                let used = match spec {
+                    InsetValue::Auto => match opposite.resolve_px(basis) {
+                        Some(o) => -o, // start auto, end set → mirror the negated opposite
+                        None => 0.0,   // both auto → 0
+                    },
+                    _ => spec.resolve_px(basis).unwrap_or(0.0),
+                };
+                px(used)
+            }
+            // Absolute / fixed: resolve what we can without layout.
+            Position::Absolute | Position::Fixed => {
+                let used = match spec {
+                    InsetValue::Auto => match opposite.resolve_px(basis) {
+                        // Over-constrained "auto vs set": stretch to fill (basis − opposite).
+                        Some(o) => basis - o,
+                        // Both auto → static position; needs layout we lack. Approximate as 0.
+                        None => 0.0,
+                    },
+                    _ => spec.resolve_px(basis).unwrap_or(0.0),
+                };
+                px(used)
+            }
+            Position::Static => unreachable!(),
         }
     }
 
@@ -1435,6 +1557,10 @@ fn compute_element_style<'a>(
         right: None,
         bottom: None,
         left: None,
+        top_spec: InsetValue::Auto,
+        right_spec: InsetValue::Auto,
+        bottom_spec: InsetValue::Auto,
+        left_spec: InsetValue::Auto,
         z_index: None,
         // Box properties are not inherited: each element starts from initial values.
         width: None,
@@ -1630,10 +1756,44 @@ fn compute_element_style<'a>(
     // Now apply the regular declarations, resolving any `var(...)` references against `vars`
     // and supplying the current/inherited color for `currentColor`/`inherit`.
     let inherited_color = parent.color;
+    // `font-size` must be resolved before any other declaration, because `em`-based values
+    // (insets, line-height, edges…) compute against *this element's* font size regardless of
+    // declaration order. Apply the winning `font-size` first, then everything else.
+    for m in &matches {
+        for (prop, val) in m.decls {
+            if prop.eq_ignore_ascii_case("font-size") {
+                let (val, _imp) = split_importance(val);
+                let resolved = resolve_vars(val, &vars);
+                let current_color = style.color;
+                apply_declaration(&mut style, prop, &resolved, parent, current_color, inherited_color, m.base);
+            }
+        }
+    }
+    // Normal (non-important) declarations, in ascending cascade order (later wins).
+    for m in &matches {
+        for (prop, val) in m.decls {
+            if prop.starts_with("--") || prop.eq_ignore_ascii_case("font-size") {
+                continue; // custom properties are environment; font-size already applied above
+            }
+            let (val, important) = split_importance(val);
+            if important {
+                continue; // important declarations are applied in the final pass below
+            }
+            let resolved = resolve_vars(val, &vars);
+            let current_color = style.color;
+            apply_declaration(&mut style, prop, &resolved, parent, current_color, inherited_color, m.base);
+        }
+    }
+    // `!important` declarations win over all normal ones: apply them last, still in ascending
+    // cascade order so the most-specific/last important declaration takes effect.
     for m in &matches {
         for (prop, val) in m.decls {
             if prop.starts_with("--") {
-                continue; // custom properties are environment, not applied directly
+                continue;
+            }
+            let (val, important) = split_importance(val);
+            if !important {
+                continue;
             }
             let resolved = resolve_vars(val, &vars);
             let current_color = style.color;
@@ -2555,10 +2715,22 @@ fn apply_declaration(
             "sticky" => style.position = Position::Sticky,
             _ => {}
         },
-        "top" => style.top = parse_length(val),
-        "right" => style.right = parse_length(val),
-        "bottom" => style.bottom = parse_length(val),
-        "left" => style.left = parse_length(val),
+        "top" => {
+            style.top = parse_length_fs(val, style.font_size);
+            style.top_spec = parse_inset_value(val, style.font_size);
+        }
+        "right" => {
+            style.right = parse_length_fs(val, style.font_size);
+            style.right_spec = parse_inset_value(val, style.font_size);
+        }
+        "bottom" => {
+            style.bottom = parse_length_fs(val, style.font_size);
+            style.bottom_spec = parse_inset_value(val, style.font_size);
+        }
+        "left" => {
+            style.left = parse_length_fs(val, style.font_size);
+            style.left_spec = parse_inset_value(val, style.font_size);
+        }
         "z-index" => {
             let v = val.trim().to_ascii_lowercase();
             if v == "auto" {
@@ -3645,7 +3817,7 @@ fn parse_transform_origin(val: &str) -> (f32, f32) {
 
 /// Which side(s) of a box a value targets.
 #[derive(Clone, Copy)]
-enum EdgeSide {
+pub enum EdgeSide {
     Top,
     Right,
     Bottom,
@@ -3930,6 +4102,97 @@ fn parse_length_fs(val: &str, font_size: f32) -> Option<f32> {
     } else {
         v.parse::<f32>().ok()
     }
+}
+
+/// Split a declaration value into `(value_without_importance, is_important)`. A trailing
+/// `!important` (case-insensitive, with optional whitespace around the `!`) sets the flag and is
+/// stripped so the remaining value parses cleanly.
+fn split_importance(val: &str) -> (&str, bool) {
+    let trimmed = val.trim_end();
+    // Find a trailing "important" keyword preceded (somewhere) by "!".
+    let lower = trimmed.to_ascii_lowercase();
+    if let Some(pos) = lower.rfind("important") {
+        if pos + "important".len() == lower.len() {
+            // Everything before "important" must end with optional ws then `!`.
+            let before = trimmed[..pos].trim_end();
+            if let Some(stripped) = before.strip_suffix('!') {
+                return (stripped.trim_end(), true);
+            }
+        }
+    }
+    (trimmed, false)
+}
+
+/// Parse the *specified* value of an inset longhand into an [`InsetValue`], retaining percentages
+/// and percentage-bearing `calc()` symbolically (their basis isn't known until layout). Absolute
+/// lengths (incl. `em`/`rem`) are absolutized to px via [`parse_length_fs`]. The `calc()` parsing
+/// handles the simple `<percentage> ± <length>` and bare `<percentage>` forms the inset WPT tests
+/// use (`calc(10% - 1px)`); richer calc still resolves its length part and any percentage.
+fn parse_inset_value(val: &str, font_size: f32) -> InsetValue {
+    let v = val.trim().to_ascii_lowercase();
+    if v.is_empty() || v == "auto" {
+        return InsetValue::Auto;
+    }
+    // Plain percentage: `10%`.
+    if let Some(p) = v.strip_suffix('%').and_then(|n| n.trim().parse::<f32>().ok()) {
+        return InsetValue::Percent(p);
+    }
+    // calc() / math functions that mention a percentage: split into percentage + length terms.
+    if has_math_func(&v) {
+        if v.contains('%') {
+            if let Some(iv) = parse_calc_percent(&v, font_size) {
+                return iv;
+            }
+        }
+        // No percentage (or unparseable): fall back to a fully-absolutized length.
+        if let Some(px) = eval_length(&v, font_size) {
+            return InsetValue::Length(px);
+        }
+        return InsetValue::Auto;
+    }
+    match parse_length_fs(&v, font_size) {
+        Some(px) => InsetValue::Length(px),
+        None => InsetValue::Auto,
+    }
+}
+
+/// Parse a `calc()` of the form `calc(<percentage> [+|-] <length>)` (or just `calc(<percentage>)`)
+/// into an [`InsetValue::Calc`]. The length part is absolutized to px. Terms may appear in either
+/// order. Returns `None` if the expression isn't this shape (caller falls back).
+fn parse_calc_percent(val: &str, font_size: f32) -> Option<InsetValue> {
+    // Strip the outer `calc(...)`.
+    let inner = val.trim().strip_prefix("calc(")?.strip_suffix(')')?.trim();
+    let mut pct = 0.0f32;
+    let mut px = 0.0f32;
+    let mut found_pct = false;
+    // Split into signed terms. We scan for top-level `+`/`-` operators (the WPT cases have no
+    // nesting). A leading sign is allowed; operators must be space-separated per CSS calc syntax.
+    let mut sign = 1.0f32;
+    for (i, tok) in inner.split_whitespace().enumerate() {
+        match tok {
+            "+" => sign = 1.0,
+            "-" => sign = -1.0,
+            _ => {
+                if i == 0 && tok == "-" {
+                    sign = -1.0;
+                    continue;
+                }
+                if let Some(p) = tok.strip_suffix('%').and_then(|n| n.parse::<f32>().ok()) {
+                    pct += sign * p;
+                    found_pct = true;
+                } else if let Some(l) = parse_length_fs(tok, font_size) {
+                    px += sign * l;
+                } else {
+                    return None;
+                }
+                sign = 1.0;
+            }
+        }
+    }
+    if !found_pct {
+        return None;
+    }
+    Some(InsetValue::Calc { pct, px })
 }
 
 /// Parse a length for an *edge* (margin/padding/border-width), resolving `em` against `font_size`.
@@ -7687,6 +7950,75 @@ mod tests {
             |e| e.tag == "td",
         );
         assert_eq!(cs.background_color, Some((0, 0, 255)), "author CSS should beat bgcolor attr");
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // CSSOM resolved insets / !important / value retention
+    // ------------------------------------------------------------------------------------------
+
+    #[test]
+    fn static_inset_resolves_to_computed_value() {
+        // `position: static`: the inset *resolved value* is the computed value — `auto` stays `auto`,
+        // percentages stay percentages, lengths absolutize to px.
+        let cs = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { position: static; top: auto; left: 10%; bottom: 1em; font-size: 10px }",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.resolved_inset(EdgeSide::Top, false, f32::NAN), "auto");
+        assert_eq!(cs.resolved_inset(EdgeSide::Left, false, f32::NAN), "10%");
+        assert_eq!(cs.resolved_inset(EdgeSide::Bottom, false, f32::NAN), "10px"); // 1em @ 10px
+    }
+
+    #[test]
+    fn relative_inset_resolves_percentage_and_auto_pair() {
+        let cs = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { position: relative; top: 10%; bottom: auto }",
+            |e| e.tag == "div",
+        );
+        // 10% of a 100px containing block → 10px; the auto bottom mirrors the negated top.
+        assert_eq!(cs.resolved_inset(EdgeSide::Top, false, 100.0), "10px");
+        assert_eq!(cs.resolved_inset(EdgeSide::Bottom, false, 100.0), "-10px");
+    }
+
+    #[test]
+    fn nobox_inset_preserves_computed_value() {
+        let cs = cs_of(
+            "<html><body><div></div></body></html>",
+            "div { position: absolute; left: 25% }",
+            |e| e.tag == "div",
+        );
+        // Box-less (display:none): even an absolutely-positioned element reports the computed value.
+        assert_eq!(cs.resolved_inset(EdgeSide::Left, true, 400.0), "25%");
+    }
+
+    #[test]
+    fn important_declaration_wins_over_higher_specificity() {
+        // `div` (low specificity) with `!important` beats `.x` (higher specificity) without it.
+        let cs = cs_of(
+            r#"<html><body><div class="x"></div></body></html>"#,
+            "div { color: blue !important } .x { color: red }",
+            |e| e.tag == "div",
+        );
+        assert_eq!(cs.color, (0, 0, 255), "!important should win the cascade");
+        // And the value parses despite the trailing `!important`.
+        assert_eq!(cs.get_property("color"), "rgb(0, 0, 255)");
+    }
+
+    #[test]
+    fn split_importance_strips_keyword() {
+        assert_eq!(split_importance("red !important"), ("red", true));
+        assert_eq!(split_importance("rgb(0, 0, 255)!important"), ("rgb(0, 0, 255)", true));
+        assert_eq!(split_importance("10px"), ("10px", false));
+    }
+
+    #[test]
+    fn parse_inset_value_retains_percent_and_calc() {
+        assert_eq!(parse_inset_value("auto", 16.0), InsetValue::Auto);
+        assert_eq!(parse_inset_value("10%", 16.0), InsetValue::Percent(10.0));
+        assert_eq!(parse_inset_value("1em", 10.0), InsetValue::Length(10.0));
+        assert_eq!(parse_inset_value("calc(10% - 1px)", 16.0), InsetValue::Calc { pct: 10.0, px: -1.0 });
     }
 }
 

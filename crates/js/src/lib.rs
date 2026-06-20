@@ -940,6 +940,160 @@ fn with_computed_style<R>(
     f(map.and_then(|m| m.get(&id)))
 }
 
+/// Like [`with_computed_style`] but exposes the whole cascade `map` plus the live `Document`, so a
+/// caller can read several elements at once (e.g. an element and its containing block, for the
+/// CSSOM resolved-value of insets). Recomputes the cascade if stale, same as `with_computed_style`.
+fn with_cascade_map<R>(
+    state: &HostState,
+    f: impl FnOnce(&dom::Document, &HashMap<dom::NodeId, style::ComputedStyle>) -> R,
+) -> R {
+    let version = state.dom_version.get();
+    {
+        let mut cache = state.computed_cache.borrow_mut();
+        let fresh = matches!(&*cache, Some((v, _)) if *v == version);
+        if !fresh {
+            let doc = state.doc.borrow();
+            let sheets = collect_author_sheets(&doc);
+            let map = style::cascade(&doc, &sheets);
+            *cache = Some((version, map));
+        }
+    }
+    let cache = state.computed_cache.borrow();
+    let map = cache.as_ref().map(|(_, m)| m).expect("cascade just populated");
+    let doc = state.doc.borrow();
+    f(&doc, map)
+}
+
+/// The content-box and padding-box extents (width, height) of an element's box, derived from its
+/// computed style. Standard box-sizing: `width`/`height` are the content box; the padding box adds
+/// the padding edges. Used as the percentage basis / containing-block extent when resolving insets.
+fn box_extents(cs: &style::ComputedStyle) -> ((f32, f32), (f32, f32)) {
+    let cw = cs.width.unwrap_or(0.0);
+    let ch = cs.height.unwrap_or(0.0);
+    let pw = cw + cs.padding.left + cs.padding.right;
+    let ph = ch + cs.padding.top + cs.padding.bottom;
+    ((cw, ch), (pw, ph))
+}
+
+/// Compute the CSSOM resolved value of inset `side` (top/right/bottom/left) for node `id`, given a
+/// freshly-cascaded `map`. Walks the DOM to find the element's containing block and computes the
+/// percentage basis from that block's specified geometry (no layout needed for the cases the WPT
+/// inset tests exercise — the containers have explicit px sizes). Returns `None` for non-elements.
+fn resolved_inset_value(
+    doc: &dom::Document,
+    map: &HashMap<dom::NodeId, style::ComputedStyle>,
+    id: dom::NodeId,
+    side: style::EdgeSide,
+) -> Option<String> {
+    let cs = map.get(&id)?;
+    // A box-less element (display:none, or an ancestor is) has no used value → computed value.
+    let box_less = cs.display == style::Display::None || ancestor_display_none(doc, map, id);
+    if box_less || cs.position == style::Position::Static {
+        return Some(cs.resolved_inset(side, true, f32::NAN));
+    }
+
+    // Find the containing block and the relevant axis extent (height for top/bottom, width for
+    // left/right). For in-flow / relative / sticky the cb is the parent's *content* box; for
+    // absolute the nearest positioned ancestor's *padding* box; for fixed the nearest transformed
+    // ancestor's padding box (the viewport otherwise — approximated by the document element).
+    let want_height = matches!(side, style::EdgeSide::Top | style::EdgeSide::Bottom);
+    let basis = match cs.position {
+        style::Position::Relative | style::Position::Sticky => {
+            containing_block_extent(doc, map, id, ContainingBlock::ParentContent, want_height)
+        }
+        style::Position::Absolute => {
+            containing_block_extent(doc, map, id, ContainingBlock::PositionedPadding, want_height)
+        }
+        style::Position::Fixed => {
+            containing_block_extent(doc, map, id, ContainingBlock::TransformedPadding, want_height)
+        }
+        style::Position::Static => f32::NAN,
+    };
+    Some(cs.resolved_inset(side, false, basis))
+}
+
+/// Which ancestor establishes the containing block, and which box of it forms the basis.
+enum ContainingBlock {
+    /// Parent element's content box (in-flow / relative / sticky).
+    ParentContent,
+    /// Nearest positioned ancestor's padding box (absolute).
+    PositionedPadding,
+    /// Nearest ancestor with a transform's padding box, else the document element (fixed).
+    TransformedPadding,
+}
+
+/// Walk up from `id` to find its containing block per `kind`, returning the requested axis extent
+/// (height when `want_height`, else width). Falls back to `0.0` if no suitable ancestor is found.
+fn containing_block_extent(
+    doc: &dom::Document,
+    map: &HashMap<dom::NodeId, style::ComputedStyle>,
+    id: dom::NodeId,
+    kind: ContainingBlock,
+    want_height: bool,
+) -> f32 {
+    let pick = |extents: ((f32, f32), (f32, f32)), padding: bool| {
+        let (content, pad) = extents;
+        let (w, h) = if padding { pad } else { content };
+        if want_height {
+            h
+        } else {
+            w
+        }
+    };
+    let mut cur = doc.get(id).parent;
+    match kind {
+        ContainingBlock::ParentContent => {
+            if let Some(p) = cur {
+                if let Some(pcs) = map.get(&p) {
+                    return pick(box_extents(pcs), false);
+                }
+            }
+            0.0
+        }
+        ContainingBlock::PositionedPadding => {
+            while let Some(a) = cur {
+                if let Some(acs) = map.get(&a) {
+                    if acs.position != style::Position::Static {
+                        return pick(box_extents(acs), true);
+                    }
+                }
+                cur = doc.get(a).parent;
+            }
+            0.0
+        }
+        ContainingBlock::TransformedPadding => {
+            while let Some(a) = cur {
+                if let Some(acs) = map.get(&a) {
+                    if acs.transform.is_some() {
+                        return pick(box_extents(acs), true);
+                    }
+                }
+                cur = doc.get(a).parent;
+            }
+            0.0
+        }
+    }
+}
+
+/// True if any ancestor of `id` has `display: none` (so `id` has no rendered box even if its own
+/// `display` is not `none`).
+fn ancestor_display_none(
+    doc: &dom::Document,
+    map: &HashMap<dom::NodeId, style::ComputedStyle>,
+    id: dom::NodeId,
+) -> bool {
+    let mut cur = doc.get(id).parent;
+    while let Some(a) = cur {
+        if let Some(acs) = map.get(&a) {
+            if acs.display == style::Display::None {
+                return true;
+            }
+        }
+        cur = doc.get(a).parent;
+    }
+    false
+}
+
 /// `__computedStyleProp(id, name) -> string` — the computed value of CSS property `name` (kebab,
 /// lowercased by JS) for node `id`, or "" if there's no computed style (non-element / unknown id) or
 /// the property isn't tracked.
@@ -951,11 +1105,23 @@ fn prim_computed_style_prop(
     let node = arg_node(scope, &args, 0);
     let name = arg_str(scope, &args, 1);
     let state = host_state(scope);
-    let value = match node {
-        Some(n) => with_computed_style(&state, n, |cs| {
+    // Inset longhands need the CSSOM resolved-value algorithm (position + containing block), which
+    // reads more than one element's style — handle them via the cascade map directly.
+    let inset_side = match name.as_str() {
+        "top" => Some(style::EdgeSide::Top),
+        "right" => Some(style::EdgeSide::Right),
+        "bottom" => Some(style::EdgeSide::Bottom),
+        "left" => Some(style::EdgeSide::Left),
+        _ => None,
+    };
+    let value = match (node, inset_side) {
+        (Some(n), Some(side)) => with_cascade_map(&state, |doc, map| {
+            resolved_inset_value(doc, map, n, side).unwrap_or_default()
+        }),
+        (Some(n), None) => with_computed_style(&state, n, |cs| {
             cs.map(|cs| cs.get_property(&name)).unwrap_or_default()
         }),
-        None => String::new(),
+        (None, _) => String::new(),
     };
     let s = js_str(scope, &value);
     rv.set(s);
@@ -1579,11 +1745,46 @@ fn prim_elem_metrics(
     let node = arg_node(scope, &args, 0);
     let state = host_state(scope);
     let rect = node.and_then(|n| state.layout_rects.borrow().get(&n.0).copied());
+    // Client box (padding box: content + padding, excluding borders) computed from the cascade.
+    // `clientWidth`/`clientHeight` exclude borders/scrollbars, so they cannot reuse the border-box
+    // `ow`/`oh`.
+    let client_box = node.and_then(|n| {
+        with_cascade_map(&state, |_doc, map| {
+            map.get(&n).map(|cs| {
+                let cw = cs.width.unwrap_or(0.0) + cs.padding.left + cs.padding.right;
+                let ch = cs.height.unwrap_or(0.0) + cs.padding.top + cs.padding.bottom;
+                (cw, ch)
+            })
+        })
+    });
     let (ax, ay, w, h) = match rect {
         Some(r) => r,
         None => {
-            rv.set_null();
-            return;
+            // No laid-out box yet (the engine hasn't re-laid-out since the style change). Synthesize
+            // a border box from the cascade so reads like `clientHeight` reflect explicit sizes.
+            match node.and_then(|n| {
+                with_cascade_map(&state, |_doc, map| {
+                    map.get(&n).map(|cs| {
+                        let bw = cs.width.unwrap_or(0.0)
+                            + cs.padding.left
+                            + cs.padding.right
+                            + cs.border.left
+                            + cs.border.right;
+                        let bh = cs.height.unwrap_or(0.0)
+                            + cs.padding.top
+                            + cs.padding.bottom
+                            + cs.border.top
+                            + cs.border.bottom;
+                        (bw, bh)
+                    })
+                })
+            }) {
+                Some((bw, bh)) if bw > 0.0 || bh > 0.0 => (0.0, 0.0, bw, bh),
+                _ => {
+                    rv.set_null();
+                    return;
+                }
+            }
         }
     };
     // Document-root special case: report the full page height as scrollHeight so sites that size
@@ -1612,8 +1813,11 @@ fn prim_elem_metrics(
         let val = v8::Number::new(scope, v as f64);
         obj.set(scope, key.into(), val.into());
     };
+    let (cw, ch) = client_box.unwrap_or((w, h));
     put("ow", w);
     put("oh", h);
+    put("cw", cw);
+    put("ch", ch);
     put("ot", ay);
     put("ol", ax);
     put("sw", sw);
@@ -3998,6 +4202,61 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // changes survive into the engine's re-cascade and actually re-render.
 
   // Parse `prop: value; ...` into an ordered list of [prop, value] pairs (lowercased props).
+  // Normalize a single numeric token to CSSOM canonical form: add a leading `0` before a bare
+  // decimal point (`.5` -> `0.5`), drop a redundant leading zero pair only where the spec keeps it
+  // (we keep `0.5`), strip trailing fractional zeros (`1.50` -> `1.5`, `2.0` -> `2`), and collapse
+  // negative zero (`-0`, `-0.0`) to `0`. `num` is the sign+digits+optional-fraction (no unit).
+  function normalizeNumberToken(num) {
+    var neg = num.charAt(0) === "-";
+    var sign = neg ? "-" : (num.charAt(0) === "+" ? "" : "");
+    var body = (num.charAt(0) === "-" || num.charAt(0) === "+") ? num.slice(1) : num;
+    if (body.charAt(0) === ".") { body = "0" + body; }
+    if (body.indexOf(".") >= 0) {
+      body = body.replace(/0+$/, "");      // trim trailing zeros
+      if (body.charAt(body.length - 1) === ".") { body = body.slice(0, -1); }
+    }
+    // Collapse negative zero.
+    if (sign === "-" && /^0(?:\.0*)?$/.test(body)) { sign = ""; }
+    return sign + body;
+  }
+  // Canonicalize the numeric tokens inside a CSS value string (leading zeros, negative zero,
+  // trailing fractional zeros), preserving units, identifiers, and `url(...)`/quoted segments.
+  function normalizeCssValue(val) {
+    val = String(val);
+    // Canonicalize `url(...)`: the argument is serialized as a double-quoted string. Matches
+    // `url( ... )` with an unquoted or single-quoted body and rewrites to `url("body")`.
+    val = val.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)/gi, function (_m, dq, sq, uq) {
+      var body = dq != null ? dq : (sq != null ? sq : (uq != null ? uq : ""));
+      return 'url("' + body + '")';
+    });
+    var out = "";
+    var i = 0, n = val.length;
+    while (i < n) {
+      var ch = val[i];
+      // Skip quoted strings verbatim.
+      if (ch === '"' || ch === "'") {
+        var q = ch; out += ch; i++;
+        while (i < n && val[i] !== q) { out += val[i]; i++; }
+        if (i < n) { out += val[i]; i++; }
+        continue;
+      }
+      // A number token: optional sign, digits with optional single decimal point.
+      var rest = val.slice(i);
+      var m = /^[-+]?(?:\d+\.?\d*|\.\d+)/.exec(rest);
+      if (m && m[0].length > 0) {
+        // Only treat as a number if not part of an identifier (preceding char isn't a letter/_/-).
+        var prev = out.length ? out[out.length - 1] : "";
+        var startsAlpha = /[A-Za-z_]/.test(prev);
+        if (!startsAlpha) {
+          out += normalizeNumberToken(m[0]);
+          i += m[0].length;
+          continue;
+        }
+      }
+      out += ch; i++;
+    }
+    return out;
+  }
   function parseStyleDecls(text) {
     var out = [];
     text = String(text || "");
@@ -4008,7 +4267,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (c < 0) { continue; }
       var name = seg.slice(0, c).trim().toLowerCase();
       var val = seg.slice(c + 1).trim();
-      if (name) { out.push([name, val]); }
+      if (name) { out.push([name, normalizeCssValue(val)]); }
     }
     return out;
   }
@@ -4040,7 +4299,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       if (val == null || val === "") {
         if (i >= 0) { d.splice(i, 1); }
       } else {
-        val = String(val);
+        val = normalizeCssValue(String(val));
         if (i >= 0) { d[i][1] = val; } else { d.push([name, val]); }
       }
       document.__setAttr(node, "style", serializeStyleDecls(d));
@@ -4265,15 +4524,269 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     t = t.replace(/\s*{\s*/g, " { ").replace(/\s*}\s*/g, " }").replace(/\s*;\s*/g, "; ").trim();
     return t;
   }
-  function makeRule(text) {
-    return { cssText: text, type: 1, selectorText: (String(text).split("{")[0] || "").trim(),
-             cssRules: [], parentRule: null, parentStyleSheet: null };
+  // Validate and serialize one *complex selector* (a single comma component) per the Selectors
+  // grammar the CSSOM `selectorText` setter needs. Returns the normalized string, or `null` if the
+  // selector is invalid (the setter then leaves the rule unchanged, per spec). Covers type/universal
+  // selectors (incl. namespace prefixes `ns|`, `*|`, `|`), `.class`, `#id`, `[attr...]`, the known
+  // pseudo-classes/elements, `:not(...)`, combinators, and unicode identifiers.
+  var __cssPseudoElements = { before: 1, after: 1, "first-line": 1, "first-letter": 1, "first-line ": 1,
+    selection: 1, placeholder: 1, marker: 1, backdrop: 1 };
+  var __cssPseudoClasses = { active: 1, hover: 1, focus: 1, "focus-within": 1, "focus-visible": 1,
+    visited: 1, link: 1, target: 1, root: 1, empty: 1, enabled: 1, disabled: 1, checked: 1, "first-child": 1,
+    "last-child": 1, "only-child": 1, "first-of-type": 1, "last-of-type": 1, "only-of-type": 1,
+    "nth-child": 1, "nth-last-child": 1, "nth-of-type": 1, "nth-last-of-type": 1, lang: 1, not: 1,
+    is: 1, where: 1, has: 1, "any-link": 1, default: 1, indeterminate: 1, "read-only": 1, "read-write": 1,
+    required: 1, optional: 1, "placeholder-shown": 1, valid: 1, invalid: 1, "in-range": 1, "out-of-range": 1 };
+  // An identifier per CSS: starts with a letter / `_` / `-` / non-ASCII / escape, then those or
+  // digits. We accept any non-ASCII codepoint (covers `ÇĞıİ`, `🤓`). A lone `-` is not an identifier.
+  function isIdentChar(c, first) {
+    if (c === "_" || c === "-") { return true; }
+    var code = c.charCodeAt(0);
+    if (code >= 128) { return true; }              // non-ASCII
+    if (c >= "a" && c <= "z" || c >= "A" && c <= "Z") { return true; }
+    if (!first && c >= "0" && c <= "9") { return true; }
+    return false;
+  }
+  function isIdent(s) {
+    if (!s) { return false; }
+    if (s === "-") { return false; }
+    var chars = Array.from(s);                       // codepoint-aware (handles surrogate pairs)
+    for (var i = 0; i < chars.length; i++) {
+      var c = chars[i];
+      var ok = isIdentChar(c, i === 0) || (i > 0 && c >= "0" && c <= "9");
+      // first char can't be a digit
+      if (i === 0 && c >= "0" && c <= "9") { return false; }
+      if (!ok && !(c >= "0" && c <= "9")) { return false; }
+    }
+    return true;
+  }
+  // Normalize the optional `ns|` namespace prefix on a type/universal selector. Returns the
+  // remainder (`local`) and the serialized prefix. `*|x` and an absent prefix both serialize with no
+  // prefix here (no namespaces declared); a bare leading `|` (default namespace) is invalid.
+  function normalizeTypePrefix(s) {
+    var bar = s.indexOf("|");
+    if (bar < 0) { return { prefix: "", rest: s }; }
+    var pre = s.slice(0, bar), rest = s.slice(bar + 1);
+    if (pre === "" ) { return null; }   // `|div` — default namespace, unsupported → invalid
+    if (pre === "*") { return { prefix: "", rest: rest }; } // any namespace → drop prefix
+    if (!isIdent(pre)) { return null; }
+    return { prefix: "", rest: rest };   // named namespace not declared → still serialize bare
+  }
+  var HASH = String.fromCharCode(35); // the id-prefix char, built via charcode to dodge Rust raw-string quoting.
+  function normalizeComplexSelector(sel) {
+    sel = sel.trim();
+    if (!sel) { return null; }
+    var chars = Array.from(sel);
+    var i = 0, n = chars.length, out = "", expectSimple = true, sawSimple = false;
+    function err() { return null; }
+    while (i < n) {
+      var c = chars[i];
+      if (c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f") {
+        // Whitespace: a descendant combinator unless followed by another combinator.
+        while (i < n && /\s/.test(chars[i])) { i++; }
+        if (i >= n) { break; }
+        var nx = chars[i];
+        if (nx === ">" || nx === "+" || nx === "~") { continue; } // handled below
+        out += " "; expectSimple = true; sawSimple = false; continue;
+      }
+      if (c === ">" || c === "+" || c === "~") {
+        if (!sawSimple && out.replace(/\s+$/,"") === "") { return err(); }
+        out = out.replace(/\s+$/, "") + " " + c + " ";
+        i++; while (i < n && /\s/.test(chars[i])) { i++; }
+        expectSimple = true; sawSimple = false; continue;
+      }
+      // Type / universal selector with an optional namespace prefix (`ns|`, `*|`, `|`). Reachable
+      // when the compound starts with `*`, `|`, or an identifier char.
+      if (c === "*" || c === "|" || isIdentChar(c, true)) {
+        // Read an optional prefix terminated by `|`.
+        var save = i, pre = null;
+        if (c === "*") { pre = "*"; i++; }
+        else if (c === "|") { pre = ""; }   // leading `|` → empty (default-namespace) prefix
+        else {
+          var pid = ""; while (i < n && isIdentChar(chars[i], pid === "")) { pid += chars[i]; i++; }
+          pre = pid;
+        }
+        var hasBar = (i < n && chars[i] === "|");
+        if (hasBar) {
+          // Consume `|` and the local part.
+          i++;
+          var local;
+          if (i < n && chars[i] === "*") { local = "*"; i++; }
+          else { var lid = ""; while (i < n && isIdentChar(chars[i], lid === "")) { lid += chars[i]; i++; } local = lid; }
+          // Validate the local part.
+          if (local !== "*" && !isIdent(local)) { return err(); }
+          // Serialize the prefix: `*|` → drop; `|` (empty default ns) → keep `|`; named → keep.
+          var serPre = "";
+          if (pre === "*" || pre === "") {
+            serPre = (pre === "") ? "|" : ""; // empty prefix means the default namespace, kept as `|`
+          } else if (isIdent(pre)) {
+            serPre = ""; // undeclared named namespace: serialize bare (no namespaces declared)
+          } else { return err(); }
+          out += serPre + local;
+        } else {
+          // No prefix: a bare universal or type selector.
+          if (pre === "*") { out += "*"; }
+          else if (pre !== null && isIdent(pre)) { out += pre; }
+          else { return err(); }
+        }
+        sawSimple = true; expectSimple = false; continue;
+      }
+      if (c === ".") {
+        i++; var cls = ""; while (i < n && isIdentChar(chars[i], cls === "")) { cls += chars[i]; i++; }
+        if (!isIdent(cls)) { return err(); }
+        out += "." + cls; sawSimple = true; expectSimple = false; continue;
+      }
+      if (c === HASH) {
+        i++; var id = ""; while (i < n && isIdentChar(chars[i], id === "")) { id += chars[i]; i++; }
+        if (!isIdent(id)) { return err(); }
+        out += HASH + id; sawSimple = true; expectSimple = false; continue;
+      }
+      if (c === "[") {
+        // Attribute selector: scan to matching `]`.
+        var depth = 1; i++; var attr = "";
+        while (i < n && depth > 0) { if (chars[i] === "[") { depth++; } else if (chars[i] === "]") { depth--; if (depth === 0) { break; } } attr += chars[i]; i++; }
+        if (depth !== 0) { return err(); }
+        i++; // consume ]
+        var na = normalizeAttr(attr);
+        if (na === null) { return err(); }
+        out += "[" + na + "]"; sawSimple = true; expectSimple = false; continue;
+      }
+      if (c === ":") {
+        var dbl = (chars[i + 1] === ":");
+        var start = i; i += dbl ? 2 : 1;
+        var nm = "";
+        while (i < n && isIdentChar(chars[i], nm === "")) { nm += chars[i]; i++; }
+        if (!isIdent(nm)) { return err(); }
+        var lower = nm.toLowerCase();
+        var arg = "";
+        if (i < n && chars[i] === "(") {
+          var d2 = 1; i++; while (i < n && d2 > 0) { if (chars[i] === "(") { d2++; } else if (chars[i] === ")") { d2--; if (d2 === 0) { break; } } arg += chars[i]; i++; }
+          if (d2 !== 0) { return err(); }
+          i++; // consume )
+        }
+        if (__cssPseudoElements[lower] && !arg) {
+          out += "::" + lower; sawSimple = true; expectSimple = false; continue;
+        }
+        if (!dbl && __cssPseudoClasses[lower]) {
+          if (lower === "not" || lower === "is" || lower === "where" || lower === "has") {
+            // Recursively validate the argument as a selector list.
+            var inner = arg.split(",").map(function (s) { return normalizeComplexSelector(s); });
+            if (inner.indexOf(null) >= 0 || inner.length === 0) { return err(); }
+            out += ":" + lower + "(" + inner.join(", ") + ")";
+          } else {
+            out += ":" + lower + (arg ? "(" + arg.trim() + ")" : "");
+          }
+          sawSimple = true; expectSimple = false; continue;
+        }
+        return err(); // unknown pseudo / `::pseudo-class`
+      }
+      return err(); // any other char (`!`, `$`, `(`, `{`, ...) is invalid
+    }
+    out = out.trim();
+    if (!out) { return null; }
+    // A trailing combinator is invalid.
+    if (/[>+~]\s*$/.test(out)) { return null; }
+    // A universal `*` is dropped when another simple selector follows it in the same compound
+    // (e.g. `*:not(:active)` serializes as `:not(:active)`, `*.x` as `.x`).
+    out = out.replace(/\*(?=[.#:\[])/g, "");
+    return out;
+  }
+  // Validate/normalize the inside of `[...]`. Accepts `attr`, `ns|attr`, `*|attr`, and
+  // `attr OP "value"` / `attr OP value` with OP in =, ~=, |=, ^=, $=, *=, plus an optional case
+  // flag. Returns the normalized inner text, or null if invalid.
+  function normalizeAttr(attr) {
+    attr = attr.trim();
+    if (!attr) { return null; }
+    // Optional namespace prefix (`ns|`, `*|`, `|`) then the attribute name, then operator + value.
+    var m = /^((?:[^|=~^$*\s]*|\*)\|)?([^|=~^$*\s]+)\s*([~|^$*]?=)?\s*([\s\S]*)$/.exec(attr);
+    if (!m) { return null; }
+    var rawPre = m[1], local = m[2], op = m[3] || "", val = (m[4] || "").trim();
+    var name;
+    if (rawPre != null) {
+      var pre = rawPre.slice(0, -1); // drop the trailing `|`
+      if (!isIdent(local)) { return null; }
+      if (pre === "*") { name = "*|" + local; }       // `[*|lang]` keeps the `*|`
+      else if (pre === "") { name = local; }           // `[|lang]` -> `[lang]`
+      else if (isIdent(pre)) { name = pre + "|" + local; }
+      else { return null; }
+    } else {
+      if (!isIdent(local)) { return null; }
+      name = local;
+    }
+    if (!op) { return name; }
+    // Value: quote if it's an unquoted identifier; keep quoted values, switching to double quotes.
+    var flag = "";
+    var fm = /\s+([iIsS])\s*$/.exec(val);
+    if (fm) { flag = " " + fm[1].toLowerCase(); val = val.slice(0, val.length - fm[0].length).trim(); }
+    var qv;
+    if ((val.charAt(0) === '"' && val.charAt(val.length - 1) === '"') ||
+        (val.charAt(0) === "'" && val.charAt(val.length - 1) === "'")) {
+      qv = '"' + val.slice(1, -1) + '"';
+    } else if (isIdent(val) || /^-?\d/.test(val)) {
+      qv = '"' + val + '"';
+    } else { return null; }
+    return name + op + qv + flag;
+  }
+  // The CSSOM "serialize a selector" / "parse a group of selectors": validate every comma
+  // component; if any is invalid the whole group is invalid (null). Otherwise join with ", ".
+  function normalizeSelectorList(sel) {
+    sel = String(sel == null ? "" : sel);
+    var parts = sel.split(",");
+    var outs = [];
+    for (var i = 0; i < parts.length; i++) {
+      var nrm = normalizeComplexSelector(parts[i]);
+      if (nrm === null) { return null; }
+      outs.push(nrm);
+    }
+    if (!outs.length) { return null; }
+    return outs.join(", ");
+  }
+  function makeRule(text, sheet, index) {
+    var rule = {
+      type: 1, cssRules: [], parentRule: null,
+      get parentStyleSheet() { return sheet || null; },
+      get cssText() { return sheet ? sheet.__ruleCssText(index) : text; }
+    };
+    Object.defineProperty(rule, "selectorText", {
+      get: function () {
+        var t = sheet ? sheet.__ruleCssText(index) : text;
+        var raw = (String(t).split("{")[0] || "").trim();
+        var nrm = normalizeSelectorList(raw);
+        return nrm == null ? raw : nrm;
+      },
+      set: function (v) {
+        var nrm = normalizeSelectorList(v);
+        if (nrm == null) { return; } // invalid selector: leave the rule unchanged (per spec)
+        if (sheet) { sheet.__setRuleSelector(index, nrm); }
+      },
+      enumerable: true, configurable: true
+    });
+    return rule;
   }
   function makeStyleSheet(styleEl) {
+    function rawRules() { return parseCssRules(styleEl.textContent); }
     var ss = {
       type: "text/css", disabled: false, href: null, title: null, media: { length: 0 },
       ownerNode: styleEl, parentStyleSheet: null,
-      get cssRules() { var rs = parseCssRules(styleEl.textContent).map(makeRule); rs.item = function (i) { return this[i] || null; }; return rs; },
+      // The cssText of rule `index` (re-read live so a selector edit is reflected).
+      __ruleCssText: function (index) { var rs = rawRules(); return rs[index] || ""; },
+      // Rewrite the selector of rule `index`, preserving its declaration block, and write the whole
+      // sheet back to the <style> element so the cascade (and getComputedStyle) re-applies.
+      __setRuleSelector: function (index, newSel) {
+        var rs = rawRules();
+        if (index < 0 || index >= rs.length) { return; }
+        var brace = rs[index].indexOf("{");
+        var block = brace >= 0 ? rs[index].slice(brace) : "{ }";
+        rs[index] = newSel + " " + block;
+        styleEl.textContent = rs.join("\n");
+      },
+      get cssRules() {
+        var raw = rawRules();
+        var rs = [];
+        for (var i = 0; i < raw.length; i++) { rs.push(makeRule(raw[i], ss, i)); }
+        rs.item = function (i) { return this[i] || null; };
+        return rs;
+      },
       insertRule: function (rule, index) {
         var t = styleEl.textContent || ""; styleEl.textContent = (index ? t : "") + String(rule) + (index ? "" : t); return index || 0;
       },
@@ -5253,7 +5766,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     if (typeof node === "number") {
       var __metricProps = {
         offsetWidth: "ow", offsetHeight: "oh", offsetTop: "ot", offsetLeft: "ol",
-        clientWidth: "ow", clientHeight: "oh", // ≈ border box: we don't subtract borders/scrollbars
+        clientWidth: "cw", clientHeight: "ch", // padding box: content + padding, no borders
         scrollWidth: "sw", scrollHeight: "sh"
       };
       for (var __mk in __metricProps) {
@@ -9238,6 +9751,7 @@ mod tests {
 
     /// Build `<html><head><title>..</title></head><body>..</body></html>` plus any extra
     /// body children, returning the doc and the body id.
+
     fn doc_with_body(title: &str) -> (dom::Document, dom::NodeId) {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -9883,6 +10397,76 @@ mod tests {
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
         assert_eq!(out[0].value.as_deref(), Some("flex"));
+    }
+
+    #[test]
+    fn inline_style_serializes_values_canonically() {
+        // The inline CSSStyleDeclaration normalizes numeric tokens (leading zero, negative zero) and
+        // `url()` quoting, per the CSSOM "serialize a value" rules.
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var el = document.querySelectorAll('div')[0];
+                el.style.top = ".5%";
+                el.style.left = "-.1em";
+                el.style.right = "-0px";
+                el.style.backgroundImage = "url(http://localhost/)";
+                [el.style.top, el.style.left, el.style.right, el.style.backgroundImage].join("|");
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some(r#"0.5%|-0.1em|0px|url("http://localhost/")"#));
+    }
+
+    #[test]
+    fn static_element_inset_resolves_to_auto() {
+        // getComputedStyle of a `position: static` element: insets resolve to the computed value;
+        // `auto` (the default) stays `auto`.
+        let (mut doc, body) = doc_with_body("");
+        doc.append_element(body, "div");
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var el = document.querySelectorAll('div')[0];
+                el.style.cssText = "position: static; top: 5px";
+                var cs = getComputedStyle(el);
+                [cs.top, cs.left].join("|");
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        // static keeps the computed value (top: 5px) and the unset left as auto.
+        assert_eq!(out[0].value.as_deref(), Some("5px|auto"));
+    }
+
+    #[test]
+    fn css_style_rule_selector_text_roundtrip() {
+        // `cssRules[0].selectorText` getter/setter: a valid selector is normalized and re-applied;
+        // an invalid one leaves the rule unchanged.
+        let (mut doc, body) = doc_with_body("");
+        let head = doc.get(doc.get(body).parent.unwrap()).children[0];
+        let style_el = doc.append_element(head, "style");
+        doc.append_child(style_el, dom::NodeData::Text(".a { color: red }".to_string()));
+        let (_doc, out) = run_with_dom(
+            doc,
+            vec![r#"
+                var rule = document.querySelectorAll('style')[0].sheet.cssRules[0];
+                var r = [rule.selectorText];
+                rule.selectorText = "  span  >  div  ";   // normalized
+                r.push(rule.selectorText);
+                rule.selectorText = "!!invalid";          // rejected, unchanged
+                r.push(rule.selectorText);
+                rule.selectorText = ":after";             // pseudo-class -> pseudo-element form
+                r.push(rule.selectorText);
+                r.join("|");
+            "#.to_string()],
+            "https://example.com/",
+        );
+        assert_eq!(out[0].error, None, "{:?}", out[0]);
+        assert_eq!(out[0].value.as_deref(), Some(".a|span > div|span > div|::after"));
     }
 
     #[test]
