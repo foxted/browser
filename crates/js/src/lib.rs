@@ -6958,6 +6958,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     var chars = Array.from(s);                       // codepoint-aware (handles surrogate pairs)
     for (var i = 0; i < chars.length; i++) {
       var c = chars[i];
+      // A `\` starts an escape — anything can follow (a hex code or a single literal char), so the
+      // identifier is valid regardless of the escaped character. Skip the rest of the escape.
+      if (c === "\\") {
+        i++;
+        if (i < chars.length && /[0-9a-fA-F]/.test(chars[i])) {
+          var hc = 1;
+          while (i + 1 < chars.length && hc < 6 && /[0-9a-fA-F]/.test(chars[i + 1])) { i++; hc++; }
+          if (i + 1 < chars.length && /\s/.test(chars[i + 1])) { i++; }
+        }
+        continue;
+      }
       var ok = isIdentChar(c, i === 0) || (i > 0 && c >= "0" && c <= "9");
       // first char can't be a digit
       if (i === 0 && c >= "0" && c <= "9") { return false; }
@@ -7054,7 +7065,24 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           i++;
           var local;
           if (i < n && chars[i] === "*") { local = "*"; i++; }
-          else { var lid = ""; while (i < n && isIdentChar(chars[i], lid === "")) { lid += chars[i]; i++; } local = lid; }
+          else {
+            var lid = "";
+            while (i < n) {
+              if (chars[i] === "\\") {
+                // Consume an escape (backslash + a hex code with optional trailing space, or a single char).
+                lid += chars[i]; i++;
+                if (i < n && /[0-9a-fA-F]/.test(chars[i])) {
+                  var hk = 0;
+                  while (i < n && hk < 6 && /[0-9a-fA-F]/.test(chars[i])) { lid += chars[i]; i++; hk++; }
+                  if (i < n && /\s/.test(chars[i])) { lid += chars[i]; i++; }
+                } else if (i < n) { lid += chars[i]; i++; }
+                continue;
+              }
+              if (!isIdentChar(chars[i], lid === "")) { break; }
+              lid += chars[i]; i++;
+            }
+            local = lid;
+          }
           // Validate the local part.
           if (local !== "*" && !isIdent(local)) { return err(); }
           // Serialize the prefix per CSSOM. `|local` (no namespace) → keep `|`. `*|local` (any
