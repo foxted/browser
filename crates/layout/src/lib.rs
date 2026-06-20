@@ -220,6 +220,9 @@ pub struct LayoutBox {
     /// is the offset from the containing block edge to the box's margin-box edge — including the
     /// static-position fallback when both opposite insets are `auto`.
     pub used_insets: Option<[f32; 4]>,
+    /// Used (resolved) margins `[top, right, bottom, left]` in px once `auto` is resolved, so
+    /// `getComputedStyle` can report the used value of a `margin: auto` block. `None` until laid out.
+    pub used_margins: Option<[f32; 4]>,
 }
 
 impl LayoutBox {
@@ -231,6 +234,7 @@ impl LayoutBox {
             style,
             children: Vec::new(),
             used_insets: None,
+            used_margins: None,
         }
     }
 }
@@ -1402,6 +1406,44 @@ fn place_marker(boxx: &mut LayoutBox, mut mb: Box<LayoutBox>, x: f32, y: f32, me
 /// Lay out a block box (or anonymous/root block) given its containing block's content rect.
 /// Fills `boxx.dimensions.content` (position + width + height) and recurses. Dispatches to the
 /// flex / grid algorithm when this box establishes such a formatting context.
+/// Resolve `auto` horizontal margins (CSS 2.2 §10.3.3) once the used width is known: with an explicit
+/// width the free space goes to the auto margin(s), split evenly to center when both are auto (the
+/// `margin: 0 auto` idiom). Persists the resolved margins (and `used_margins` for getComputedStyle).
+/// `#[inline(never)]` so it doesn't bloat the recursive `layout_block` frame.
+#[inline(never)]
+fn resolve_block_margins(
+    boxx: &mut LayoutBox,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    containing_width: f32,
+    content_width: f32,
+    has_explicit_width: bool,
+) {
+    let border = boxx.dimensions.border;
+    let padding = boxx.dimensions.padding;
+    let mut margin = boxx.dimensions.margin;
+    let margin_auto = style_of(boxx, styles).map(|cs| cs.margin_auto).unwrap_or([false; 4]);
+    if has_explicit_width {
+        let free = containing_width
+            - content_width
+            - border.left
+            - border.right
+            - padding.left
+            - padding.right;
+        match (margin_auto[3], margin_auto[1]) {
+            (true, true) => {
+                let half = (free * 0.5).max(0.0);
+                margin.left = half;
+                margin.right = (free - half).max(0.0);
+            }
+            (true, false) => margin.left = (free - margin.right).max(0.0),
+            (false, true) => margin.right = (free - margin.left).max(0.0),
+            (false, false) => {}
+        }
+        boxx.dimensions.margin = margin;
+    }
+    boxx.used_margins = Some([margin.top, margin.right, margin.bottom, margin.left]);
+}
+
 fn layout_block(
     boxx: &mut LayoutBox,
     containing: Rect,
@@ -1417,7 +1459,7 @@ fn layout_block(
         return;
     }
 
-    let margin = boxx.dimensions.margin;
+    let mut margin = boxx.dimensions.margin;
     let border = boxx.dimensions.border;
     let padding = boxx.dimensions.padding;
 
@@ -1435,6 +1477,11 @@ fn layout_block(
     };
     // Clamp the used width to min-width / max-width (resolved against the containing block).
     let content_width = clamp_width(boxx, content_width, containing.width, styles);
+
+    // Resolve `auto` horizontal margins now the used width is known (in a non-inlined helper so this
+    // recursive frame stays small). Re-read the (possibly centered) margin for positioning.
+    resolve_block_margins(boxx, styles, containing.width, content_width, explicit_w.is_some());
+    margin = boxx.dimensions.margin;
 
     // Position: content origin sits inside the containing block, offset by left edges.
     let x = containing.x + margin.left + border.left + padding.left;

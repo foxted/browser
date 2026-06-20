@@ -250,8 +250,11 @@ pub struct ComputedStyle {
     pub min_height: Option<SizeConstraint>,
     /// `max-height` constraint (`None`/`none` = no maximum).
     pub max_height: Option<SizeConstraint>,
-    /// Margin thicknesses (px). Not inherited.
+    /// Margin thicknesses (px). Not inherited. `auto` margins resolve to 0 here; see `margin_auto`.
     pub margin: Edges,
+    /// Which margins were specified as `auto` ([top, right, bottom, left]) — needed for the layout to
+    /// resolve them (centering / over-constrained boxes) and for `getComputedStyle`'s used value.
+    pub margin_auto: [bool; 4],
     /// Padding thicknesses (px). Not inherited.
     pub padding: Edges,
     /// Border *widths* (px). Not inherited.
@@ -632,6 +635,7 @@ impl Default for ComputedStyle {
             min_height: None,
             max_height: None,
             margin: Edges::default(),
+            margin_auto: [false; 4],
             padding: Edges::default(),
             border: Edges::default(),
             border_color: (0, 0, 0), // initial border-color is currentColor (black)
@@ -1858,6 +1862,7 @@ fn compute_element_style<'a>(
         min_height: None,
         max_height: None,
         margin: Edges::default(),
+            margin_auto: [false; 4],
         padding: Edges::default(),
         border: Edges::default(),
         border_color: parent.color, // initial border-color is currentColor
@@ -3413,14 +3418,14 @@ fn apply_declaration(
 
         // --- Box model: margin ---
         "margin" => {
-            if let Some(e) = parse_edges_shorthand(val, style.font_size) {
-                style.margin = e;
-            }
+            let (e, auto) = parse_margin_shorthand(val, style.font_size);
+            style.margin = e;
+            style.margin_auto = auto;
         }
-        "margin-top" => set_edge(&mut style.margin, EdgeSide::Top, val, style.font_size),
-        "margin-right" => set_edge(&mut style.margin, EdgeSide::Right, val, style.font_size),
-        "margin-bottom" => set_edge(&mut style.margin, EdgeSide::Bottom, val, style.font_size),
-        "margin-left" => set_edge(&mut style.margin, EdgeSide::Left, val, style.font_size),
+        "margin-top" => set_margin_side(style, EdgeSide::Top, 0, val),
+        "margin-right" => set_margin_side(style, EdgeSide::Right, 1, val),
+        "margin-bottom" => set_margin_side(style, EdgeSide::Bottom, 2, val),
+        "margin-left" => set_margin_side(style, EdgeSide::Left, 3, val),
 
         // --- Box model: padding ---
         "padding" => {
@@ -4773,6 +4778,41 @@ fn set_edge(edges: &mut Edges, side: EdgeSide, val: &str, font_size: f32) {
             EdgeSide::All => *edges = Edges::all(px),
         }
     }
+}
+
+/// Set one margin side, tracking `auto` (which resolves to 0 in the f32 — the layout resolves it).
+fn set_margin_side(style: &mut ComputedStyle, side: EdgeSide, idx: usize, val: &str) {
+    if val.trim().eq_ignore_ascii_case("auto") {
+        style.margin_auto[idx] = true;
+        set_edge(&mut style.margin, side, "0", style.font_size);
+    } else {
+        style.margin_auto[idx] = false;
+        set_edge(&mut style.margin, side, val, style.font_size);
+    }
+}
+
+/// Parse the `margin` shorthand (1–4 values), returning the px [`Edges`] (`auto` → 0) and a per-side
+/// `[top, right, bottom, left]` flag marking which were `auto`.
+fn parse_margin_shorthand(val: &str, font_size: f32) -> (Edges, [bool; 4]) {
+    let one = |t: &str| -> (f32, bool) {
+        if t.eq_ignore_ascii_case("auto") {
+            (0.0, true)
+        } else {
+            (parse_edge_length(t, font_size).unwrap_or(0.0), false)
+        }
+    };
+    let v: Vec<(f32, bool)> = val.split_whitespace().map(one).collect();
+    let (t, r, b, l) = match v.len() {
+        0 => return (Edges::default(), [false; 4]),
+        1 => (v[0], v[0], v[0], v[0]),
+        2 => (v[0], v[1], v[0], v[1]),
+        3 => (v[0], v[1], v[2], v[1]),
+        _ => (v[0], v[1], v[2], v[3]),
+    };
+    (
+        Edges { top: t.0, right: r.0, bottom: b.0, left: l.0 },
+        [t.1, r.1, b.1, l.1],
+    )
 }
 
 /// Parse a `margin`/`padding`/`border-width` shorthand of 1–4 values.
