@@ -110,14 +110,22 @@ fn serve(stream: &mut TcpStream, root: &Path, port: u16) {
     let path = path.split(['?', '#']).next().unwrap_or("/");
     let path = path.replace("%20", " ");
 
-    let (body, ctype, extra): (Vec<u8>, String, String) = if path == "/resources/testharnessreport.js" {
-        (REPORT_JS.as_bytes().to_vec(), "text/javascript; charset=utf-8".to_string(), String::new())
+    let (body, ctype, extra): (Vec<u8>, String, String) = if path
+        == "/resources/testharnessreport.js"
+    {
+        (
+            REPORT_JS.as_bytes().to_vec(),
+            "text/javascript; charset=utf-8".to_string(),
+            String::new(),
+        )
     } else {
         let rel = path.trim_start_matches('/');
         let full = root.join(rel);
         // Contain within root.
         if !full.starts_with(root) {
-            let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
             return;
         }
         match std::fs::read(&full) {
@@ -154,7 +162,9 @@ fn serve(stream: &mut TcpStream, root: &Path, port: u16) {
                 (body, ct, extra)
             }
             Err(_) => {
-                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
                 return;
             }
         }
@@ -178,16 +188,20 @@ fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = e.path();
         let name = e.file_name().to_string_lossy().to_string();
         if p.is_dir() {
-            if matches!(name.as_str(), "support" | "resources" | "tools" | "META.yml") {
+            // `tentative/` holds unstandardized proposals — not part of the conformance metric.
+            if matches!(
+                name.as_str(),
+                "support" | "resources" | "tools" | "META.yml" | "tentative"
+            ) {
                 continue;
             }
             collect_tests(&p, out);
         } else if name.ends_with(".html") || name.ends_with(".xht") || name.ends_with(".xhtml") {
-            // Skip reftest references, manual tests, and visual/non-harness helpers.
+            // Skip reftest references, manual tests, non-harness helpers, and `*.tentative.*` files.
             if name.contains("-ref.")
                 || name.ends_with("-ref.html")
                 || name.contains("-manual.")
-                || name.contains(".tentative.") && false
+                || name.contains(".tentative.")
             {
                 continue;
             }
@@ -205,7 +219,10 @@ fn main() {
     let root = std::fs::canonicalize(&args[1]).expect("wpt-root not found");
     let root = Arc::new(root);
     let subpath = &args[2];
-    let max: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max: usize = args
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     // Start the static server on an ephemeral port.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -213,11 +230,9 @@ fn main() {
     {
         let root = root.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if let Ok(mut s) = stream {
-                    let root = root.clone();
-                    std::thread::spawn(move || serve(&mut s, &root, port));
-                }
+            for mut s in listener.incoming().flatten() {
+                let root = root.clone();
+                std::thread::spawn(move || serve(&mut s, &root, port));
             }
         });
     }
@@ -228,7 +243,11 @@ fn main() {
     // Keep only testharness.js tests (skip reftests / visual tests, which have no JS result).
     let mut tests: Vec<PathBuf> = all
         .into_iter()
-        .filter(|p| std::fs::read_to_string(p).map(|s| s.contains("testharness.js")).unwrap_or(false))
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|s| s.contains("testharness.js"))
+                .unwrap_or(false)
+        })
         .collect();
     let total_found = tests.len();
     tests.truncate(max);
@@ -239,11 +258,16 @@ fn main() {
         port
     );
 
-    let (mut files_ok, mut sub_pass, mut sub_fail, mut harness_err, mut timeouts) = (0, 0u64, 0u64, 0u64, 0u64);
+    let (mut files_ok, mut sub_pass, mut sub_fail, mut harness_err, mut timeouts) =
+        (0, 0u64, 0u64, 0u64, 0u64);
     // (name, pass, fail, state, detail) for the HTML report. pass/fail = -1 for timeout/harness-err.
     let mut rows: Vec<(String, i64, i64, &'static str, String)> = Vec::new();
     for path in &tests {
-        let rel = path.strip_prefix(&*root).unwrap().to_string_lossy().replace(' ', "%20");
+        let rel = path
+            .strip_prefix(&*root)
+            .unwrap()
+            .to_string_lossy()
+            .replace(' ', "%20");
         let url = format!("http://127.0.0.1:{port}/{rel}");
         let mut e = engine::Engine::new();
         e.set_viewport(800, 600, 1.0);
@@ -263,7 +287,11 @@ fn main() {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let short = path.strip_prefix(&*root).unwrap().to_string_lossy().to_string();
+        let short = path
+            .strip_prefix(&*root)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
         if !done {
             timeouts += 1;
             println!("TIMEOUT  {short}");
@@ -284,7 +312,11 @@ fn main() {
         sub_fail += f;
         files_ok += 1;
         let mark = if f == 0 { "PASS" } else { "FAIL" };
-        let detail = if f == 0 { String::new() } else { e.console_eval("window.__wpt_firstfail") };
+        let detail = if f == 0 {
+            String::new()
+        } else {
+            e.console_eval("window.__wpt_firstfail")
+        };
         if f == 0 {
             println!("{mark} [{p}/{}]  {short}", p + f);
         } else {
@@ -293,27 +325,54 @@ fn main() {
                 println!("{}", e.console_eval("window.__wpt_allfails"));
             }
         }
-        rows.push((short, p as i64, f as i64, if f == 0 { "pass" } else { "fail" }, detail));
+        rows.push((
+            short,
+            p as i64,
+            f as i64,
+            if f == 0 { "pass" } else { "fail" },
+            detail,
+        ));
     }
 
     println!("\n==== WPT summary: {subpath} ====");
-    println!("files: {} ran, {} harness-errors, {} timeouts", files_ok, harness_err, timeouts);
+    println!(
+        "files: {} ran, {} harness-errors, {} timeouts",
+        files_ok, harness_err, timeouts
+    );
     let total = sub_pass + sub_fail;
-    let pct = if total > 0 { 100.0 * sub_pass as f64 / total as f64 } else { 0.0 };
+    let pct = if total > 0 {
+        100.0 * sub_pass as f64 / total as f64
+    } else {
+        0.0
+    };
     println!("subtests: {sub_pass}/{total} passed ({pct:.1}%)");
 
     // Emit an HTML report (viewable in our own browser). Path via WPT_REPORT or default.
     let report_path = std::env::var("WPT_REPORT").unwrap_or_else(|_| "/tmp/wpt-report.html".into());
-    let esc = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
     let mut body = String::new();
     for (name, p, f, state, detail) in &rows {
         let (badge, cells) = match *state {
-            "pass" => ("pass", format!("<td class=num>{p}</td><td class=num>0</td>")),
-            "fail" => ("fail", format!("<td class=num>{p}</td><td class=num bad>{f}</td>")),
+            "pass" => (
+                "pass",
+                format!("<td class=num>{p}</td><td class=num>0</td>"),
+            ),
+            "fail" => (
+                "fail",
+                format!("<td class=num>{p}</td><td class=num bad>{f}</td>"),
+            ),
             "timeout" => ("timeout", "<td class=num>–</td><td class=num>–</td>".into()),
             _ => ("error", "<td class=num>–</td><td class=num>–</td>".into()),
         };
-        let det = if detail.is_empty() { String::new() } else { format!("<div class=det>{}</div>", esc(detail)) };
+        let det = if detail.is_empty() {
+            String::new()
+        } else {
+            format!("<div class=det>{}</div>", esc(detail))
+        };
         body.push_str(&format!(
             "<tr class={badge}><td><span class='b {badge}'>{}</span></td><td class=name>{}{}</td>{cells}</tr>\n",
             badge.to_uppercase(), esc(name), det
