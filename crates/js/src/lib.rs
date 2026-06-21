@@ -5073,26 +5073,204 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   };
 
   // --- location (populated from globalThis.__pageURL below) --------------------------------
-  function parseURL(url) {
-    url = String(url == null ? "" : url);
-    // scheme://host/path?query#hash  (host = userinfo@hostname:port)
-    var m = /^([a-zA-Z][a-zA-Z0-9+.\-]*:)?(?:\/\/([^\/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(url) || [];
-    var protocol = m[1] || "";
-    var authority = m[2] || "";
-    var pathname = m[3] || "";
-    var search = m[4] || "";
-    var hash = m[5] || "";
-    // Strip any userinfo, then split host into hostname:port.
+  // A WHATWG-basic-URL-parser-style implementation (enough to pass the bulk of the url/ suite):
+  // preprocessing, scheme + special-scheme handling, authority/host/port, opaque vs list paths with
+  // dot-segment normalization, percent-encoding per destination set, relative resolution, and
+  // canonical serialization. `base` (a parsed record or string) resolves a relative reference.
+  var URL_SPECIAL = { ftp: "21", file: "", http: "80", https: "443", ws: "80", wss: "443" };
+  function urlPctEncode(s, isInSet) {
+    var out = "";
+    for (var i = 0; i < s.length; i++) {
+      var cp = s.codePointAt(i);
+      if (cp > 0xffff) { i++; }
+      if (cp > 0x7e || isInSet(cp)) {
+        var bytes = unescape(encodeURIComponent(String.fromCodePoint(cp)));
+        for (var b = 0; b < bytes.length; b++) {
+          out += "%" + ("0" + bytes.charCodeAt(b).toString(16).toUpperCase()).slice(-2);
+        }
+      } else {
+        out += String.fromCodePoint(cp);
+      }
+    }
+    return out;
+  }
+  function urlC0(cp) { return cp < 0x20; }
+  function urlFragSet(cp) { return urlC0(cp) || cp === 0x20 || cp === 0x22 || cp === 0x3c || cp === 0x3e || cp === 0x60; }
+  function urlQuerySet(cp) { return urlC0(cp) || cp === 0x20 || cp === 0x22 || cp === 0x23 || cp === 0x3c || cp === 0x3e; }
+  function urlPathSet(cp) { return urlQuerySet(cp) || cp === 0x3f || cp === 0x60 || cp === 0x7b || cp === 0x7d; }
+  function urlUserSet(cp) { return urlPathSet(cp) || cp === 0x2f || cp === 0x3a || cp === 0x3b || cp === 0x3d || cp === 0x40 || cp === 0x5b || cp === 0x5c || cp === 0x5d || cp === 0x5e || cp === 0x7c; }
+
+  function parseURL(input, base) {
+    if (base != null && typeof base === "string") { base = parseURLRecord(base, null); }
+    var r = parseURLRecord(input, base || null);
+    if (!r) { return { href: "", protocol: "", host: "", hostname: "", port: "", pathname: "", search: "", hash: "", origin: "null", username: "", password: "", __invalid: true }; }
+    return serializeURLRecord(r);
+  }
+
+  function parseURLRecord(input, base) {
+    input = String(input == null ? "" : input);
+    input = input.replace(/^[\x00-\x20]+/, "").replace(/[\x00-\x20]+$/, "");
+    input = input.replace(/[\t\n\r]/g, "");
+    var u = { scheme: "", username: "", password: "", host: null, port: "", path: [], query: null, fragment: null, opaque: false };
+
+    // Scheme.
+    var sm = /^([a-zA-Z][a-zA-Z0-9+.\-]*):/.exec(input);
+    var rest = input;
+    if (sm) { u.scheme = sm[1].toLowerCase(); rest = input.slice(sm[0].length); }
+    else if (base) {
+      // No scheme → relative; inherit from base.
+      u.scheme = base.scheme; u.username = base.username; u.password = base.password;
+      u.host = base.host; u.port = base.port; u.opaque = base.opaque;
+      u.path = base.path.slice(); u.query = base.query;
+      return resolveRelative(u, rest, base);
+    } else { return null; }
+
+    var special = Object.prototype.hasOwnProperty.call(URL_SPECIAL, u.scheme);
+
+    if (u.scheme === "file") {
+      u.host = "";
+      rest = rest.replace(/^\/\//, "");
+      return parseAuthorityAndPath(u, rest, special, base);
+    }
+    if (special) {
+      // Special non-file: must have an authority.
+      if (base && base.scheme === u.scheme && !/^\/\//.test(rest) && rest.charAt(0) !== "/") {
+        // "special relative" — treat as relative to base.
+        u.host = base.host; u.port = base.port; u.path = base.path.slice(); u.query = base.query;
+        return resolveRelative(u, rest, base);
+      }
+      rest = rest.replace(/^\/+/, m => "//"); // collapse leading slashes to one authority intro
+      rest = rest.replace(/^\/\//, "");
+      return parseAuthorityAndPath(u, rest, special, base);
+    }
+    // Non-special.
+    if (/^\/\//.test(rest)) {
+      rest = rest.slice(2);
+      return parseAuthorityAndPath(u, rest, special, base);
+    }
+    // Opaque path (non-special, no //).
+    u.opaque = true;
+    var hf = splitTail(rest);
+    u.path = [hf.body];
+    u.query = hf.query;
+    u.fragment = hf.fragment;
+    if (u.fragment != null) { u.fragment = urlPctEncode(u.fragment, urlFragSet); }
+    if (u.query != null) { u.query = urlPctEncode(u.query, urlQuerySet); }
+    u.path[0] = urlPctEncode(u.path[0], function (cp) { return urlC0(cp) || cp > 0x7e; });
+    return u;
+  }
+
+  // Split off ?query and #fragment from a reference; returns {body, query, fragment}.
+  function splitTail(s) {
+    var fragment = null, query = null, body = s;
+    var h = body.indexOf('#');
+    if (h >= 0) { fragment = body.slice(h + 1); body = body.slice(0, h); }
+    var q = body.indexOf("?");
+    if (q >= 0) { query = body.slice(q + 1); body = body.slice(0, q); }
+    return { body: body, query: query, fragment: fragment };
+  }
+
+  function parseAuthorityAndPath(u, rest, special, base) {
+    // Authority ends at the first /,?,# (or \ for special).
+    var endRe = special ? /[\/\\?#]/ : /[\/?#]/;
+    var em = endRe.exec(rest);
+    var authEnd = em ? em.index : rest.length;
+    var authority = rest.slice(0, authEnd);
+    var after = rest.slice(authEnd);
+    // userinfo@host:port
     var at = authority.lastIndexOf("@");
-    var host = at >= 0 ? authority.slice(at + 1) : authority;
-    var hostname = host, port = "";
-    var colon = host.lastIndexOf(":");
-    if (colon >= 0 && host.indexOf("]", colon) < 0) { hostname = host.slice(0, colon); port = host.slice(colon + 1); }
-    if (pathname === "" && protocol && host) { pathname = "/"; }
-    var origin = (protocol && host) ? (protocol + "//" + host) : "null";
+    if (at >= 0) {
+      var ui = authority.slice(0, at);
+      var pc = ui.indexOf(":");
+      if (pc >= 0) { u.username = urlPctEncode(ui.slice(0, pc), urlUserSet); u.password = urlPctEncode(ui.slice(pc + 1), urlUserSet); }
+      else { u.username = urlPctEncode(ui, urlUserSet); }
+      authority = authority.slice(at + 1);
+    }
+    var host = authority, port = "";
+    if (host.charAt(0) === "[") {
+      var rb = host.indexOf("]");
+      if (rb >= 0) { var ip = host.slice(0, rb + 1); var tail = host.slice(rb + 1); if (tail.charAt(0) === ":") { port = tail.slice(1); } host = ip; }
+    } else {
+      var cidx = host.lastIndexOf(":");
+      if (cidx >= 0) { port = host.slice(cidx + 1); host = host.slice(0, cidx); }
+    }
+    u.host = special ? host.toLowerCase() : host;
+    if (port !== "") {
+      if (!/^[0-9]*$/.test(port)) { return null; }
+      var pn = parseInt(port, 10);
+      if (pn > 65535) { return null; }
+      // Omit the default port for the scheme.
+      u.port = (URL_SPECIAL[u.scheme] === String(pn)) ? "" : String(pn);
+    }
+    return parsePath(u, after, special, base);
+  }
+
+  function parsePath(u, after, special, base) {
+    var t = splitTail(after);
+    if (t.fragment != null) { u.fragment = urlPctEncode(t.fragment, urlFragSet); }
+    if (t.query != null) { u.query = urlPctEncode(t.query, urlQuerySet); }
+    var pathStr = t.body;
+    if (special) { pathStr = pathStr.replace(/\\/g, "/"); }
+    var segs = pathStr === "" ? [] : pathStr.split("/");
+    // A leading slash produces a leading empty segment; drop it (the path list starts after root).
+    if (segs.length && segs[0] === "") { segs.shift(); }
+    var out = [];
+    for (var i = 0; i < segs.length; i++) {
+      var seg = segs[i];
+      var low = seg.toLowerCase();
+      if (low === "." || low === "%2e") { continue; }
+      if (low === ".." || low === ".%2e" || low === "%2e." || low === "%2e%2e") { if (out.length) { out.pop(); } continue; }
+      out.push(urlPctEncode(seg, urlPathSet));
+    }
+    u.path = out;
+    return u;
+  }
+
+  function resolveRelative(u, rest, base) {
+    var t = splitTail(rest);
+    if (rest.charAt(0) === '#') { u.fragment = urlPctEncode(t.fragment, urlFragSet); return u; }
+    if (t.fragment != null) { u.fragment = urlPctEncode(t.fragment, urlFragSet); }
+    if (rest === "" || rest.charAt(0) === '#') { u.query = (t.query != null) ? urlPctEncode(t.query, urlQuerySet) : base.query; return u; }
+    if (rest.charAt(0) === "?") { u.query = urlPctEncode(t.query, urlQuerySet); u.path = base.path.slice(); return u; }
+    u.query = (t.query != null) ? urlPctEncode(t.query, urlQuerySet) : null;
+    var special = Object.prototype.hasOwnProperty.call(URL_SPECIAL, u.scheme);
+    var body = t.body;
+    if (special) { body = body.replace(/\\/g, "/"); }
+    if (body.charAt(0) === "/") {
+      return parsePath(u, "/" + body.replace(/^\/+/, "") + (t.query != null ? "?" + t.query : ""), special, base);
+    }
+    // Merge with base path (drop base's last segment).
+    var basePath = base.path.slice();
+    if (!(base.opaque)) { basePath.pop(); }
+    var merged = (basePath.length ? "/" + basePath.join("/") + "/" : "/") + body;
+    return parsePath(u, merged + (t.query != null ? "?" + t.query : ""), special, base);
+  }
+
+  function serializeURLRecord(u) {
+    var special = Object.prototype.hasOwnProperty.call(URL_SPECIAL, u.scheme);
+    var protocol = u.scheme + ":";
+    var href = protocol;
+    var hostStr = u.host == null ? "" : u.host;
+    var authority = "";
+    if (u.host != null) {
+      href += "//";
+      if (u.username || u.password) { href += u.username + (u.password ? ":" + u.password : "") + "@"; }
+      href += hostStr;
+      if (u.port !== "") { href += ":" + u.port; }
+    }
+    var pathname;
+    if (u.opaque) { pathname = u.path[0] || ""; }
+    else { pathname = (u.host != null || special) ? "/" + u.path.join("/") : (u.path.length ? "/" + u.path.join("/") : ""); }
+    href += pathname;
+    var search = u.query != null ? "?" + u.query : "";
+    var hash = u.fragment != null ? '#' + u.fragment : "";
+    href += search + hash;
+    var host = hostStr + (u.port !== "" ? ":" + u.port : "");
+    var origin = (u.host != null && special && u.scheme !== "file") ? (protocol + "//" + host) : "null";
     return {
-      href: url, protocol: protocol, host: host, hostname: hostname, port: port,
-      pathname: pathname, search: search, hash: hash, origin: origin
+      href: href, protocol: protocol, host: host, hostname: hostStr, port: u.port,
+      pathname: pathname, search: search, hash: hash, origin: origin,
+      username: u.username, password: u.password, __rec: u
     };
   }
 
@@ -12036,25 +12214,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // --- URL ---------------------------------------------------------------------------------
   if (typeof globalThis.URL !== "function") {
     def(globalThis, "URL", function (url, base) {
-      var resolved = String(url);
-      // Very small relative-resolution against base origin+path.
-      if (base != null && !/^[a-zA-Z][a-zA-Z0-9+.\-]*:/.test(resolved)) {
-        var b = parseURL(String(base));
-        var c0 = resolved.charCodeAt(0);
-        if (c0 === 47) { resolved = b.origin + resolved; }            // '/'
-        else if (c0 === 63) { resolved = b.origin + b.pathname + resolved; }  // '?'
-        else if (c0 === 35) { resolved = b.origin + b.pathname + b.search + resolved; }  // '#'
-        else { var dir = b.pathname.replace(/[^/]*$/, ""); resolved = b.origin + dir + resolved; }
-      }
-      var p = parseURL(resolved);
-      // Per the URL standard, `new URL(...)` throws a TypeError for an invalid URL. We validate the
-      // common failure the spec rejects: a non-numeric / out-of-range port (e.g. `https://test:test/`).
-      if (p.port && (!/^[0-9]+$/.test(p.port) || Number(p.port) > 65535)) {
+      var p = parseURL(url, base != null ? String(base) : null);
+      // Per the URL standard, `new URL(...)` throws a TypeError for an invalid URL.
+      if (p.__invalid) {
         throw new TypeError("Failed to construct 'URL': Invalid URL");
       }
       this.href = p.href; this.protocol = p.protocol; this.host = p.host; this.hostname = p.hostname;
       this.port = p.port; this.pathname = p.pathname; this.search = p.search; this.hash = p.hash; this.origin = p.origin;
-      this.username = ""; this.password = "";
+      this.username = p.username || ""; this.password = p.password || "";
       this.searchParams = new globalThis.URLSearchParams(p.search);
       this.toString = function () { return this.href; }; this.toJSON = function () { return this.href; };
     });
@@ -16655,7 +16822,7 @@ mod tests {
             "https://example.com/",
         );
         assert_eq!(out[0].error, None, "{:?}", out[0]);
-        // "." and "#" are escaped with a backslash; a leading digit becomes "\\3N "; lone "-" -> "\\-".
+        // "." and '#' are escaped with a backslash; a leading digit becomes "\\3N "; lone "-" -> "\\-".
         assert_eq!(out[0].value.as_deref(), Some(r#"\.foo\#bar|\30 abc|\-"#));
     }
 
