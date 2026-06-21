@@ -9044,6 +9044,102 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   }
   def(globalThis, "__applyReflection", applyReflection);
 
+  // Minimal Streams (WritableStream / ReadableStream / TransformStream / TextDecoderStream) — enough
+  // for the streaming partial-update methods (streamHTML etc.) and piping a Response body through.
+  if (typeof globalThis.WritableStream !== "function") {
+    var WritableStream = function (sink) {
+      this._sink = sink || {};
+      this._writer = null;
+      var s = this;
+      this._ready = Promise.resolve().then(function () { return s._sink.start ? s._sink.start({ error: function () {} }) : undefined; });
+    };
+    WritableStream.prototype.getWriter = function () {
+      if (this._writer) { throw new TypeError("WritableStream is locked to a writer"); }
+      this._writer = new WritableStreamDefaultWriter(this);
+      return this._writer;
+    };
+    Object.defineProperty(WritableStream.prototype, "locked", { get: function () { return !!this._writer; } });
+    WritableStream.prototype.abort = function (reason) { var s = this; return Promise.resolve(s._sink.abort ? s._sink.abort(reason) : undefined); };
+    WritableStream.prototype.close = function () { return this.getWriter().close(); };
+    globalThis.WritableStream = WritableStream;
+    var WritableStreamDefaultWriter = function (stream) {
+      this._stream = stream; var self = this;
+      this._closedP = new Promise(function (res, rej) { self._closedRes = res; self._closedRej = rej; });
+    };
+    WritableStreamDefaultWriter.prototype.write = function (chunk) { var st = this._stream; return st._ready.then(function () { return st._sink.write ? st._sink.write(chunk, { error: function () {} }) : undefined; }); };
+    WritableStreamDefaultWriter.prototype.close = function () { var st = this._stream, self = this; return st._ready.then(function () { return st._sink.close ? st._sink.close() : undefined; }).then(function () { self._closedRes(); }); };
+    WritableStreamDefaultWriter.prototype.abort = function (reason) { return this._stream.abort(reason); };
+    WritableStreamDefaultWriter.prototype.releaseLock = function () { this._stream._writer = null; };
+    Object.defineProperty(WritableStreamDefaultWriter.prototype, "ready", { get: function () { return Promise.resolve(); } });
+    Object.defineProperty(WritableStreamDefaultWriter.prototype, "closed", { get: function () { return this._closedP; } });
+    Object.defineProperty(WritableStreamDefaultWriter.prototype, "desiredSize", { get: function () { return 1; } });
+    globalThis.WritableStreamDefaultWriter = WritableStreamDefaultWriter;
+
+    var ReadableStream = function (source) {
+      this._source = source || {};
+      this._reader = null; this._queue = []; this._closed = false; this._err = null; this._waiters = [];
+      var s = this;
+      this._controller = {
+        enqueue: function (c) { s._queue.push(c); s._wake(); },
+        close: function () { s._closed = true; s._wake(); },
+        error: function (e) { s._err = e; s._wake(); },
+        get desiredSize() { return 1; }
+      };
+      this._started = Promise.resolve().then(function () { return s._source.start ? s._source.start(s._controller) : undefined; });
+    };
+    ReadableStream.prototype._wake = function () { var w = this._waiters; this._waiters = []; for (var i = 0; i < w.length; i++) { w[i](); } };
+    ReadableStream.prototype._pull = function () {
+      var s = this;
+      return s._started.then(function step() {
+        if (s._queue.length) { return { value: s._queue.shift(), done: false }; }
+        if (s._err) { throw s._err; }
+        if (s._closed) { return { value: undefined, done: true }; }
+        return Promise.resolve(s._source.pull ? s._source.pull(s._controller) : undefined).then(function () {
+          if (s._queue.length) { return { value: s._queue.shift(), done: false }; }
+          if (s._closed) { return { value: undefined, done: true }; }
+          return new Promise(function (res) { s._waiters.push(res); }).then(step);
+        });
+      });
+    };
+    ReadableStream.prototype.getReader = function () {
+      if (this._reader) { throw new TypeError("locked"); }
+      var s = this;
+      this._reader = { read: function () { return s._pull(); }, releaseLock: function () { s._reader = null; }, cancel: function () { s._closed = true; return Promise.resolve(); }, closed: Promise.resolve() };
+      return this._reader;
+    };
+    Object.defineProperty(ReadableStream.prototype, "locked", { get: function () { return !!this._reader; } });
+    ReadableStream.prototype.pipeTo = function (dest) {
+      var reader = this.getReader(), writer = dest.getWriter();
+      return (function pump() { return reader.read().then(function (r) { if (r.done) { return writer.close(); } return Promise.resolve(writer.write(r.value)).then(pump); }); })();
+    };
+    ReadableStream.prototype.pipeThrough = function (tr) { this.pipeTo(tr.writable); return tr.readable; };
+    ReadableStream.prototype.cancel = function () { this._closed = true; return Promise.resolve(); };
+    globalThis.ReadableStream = ReadableStream;
+
+    var TransformStream = function (transformer) {
+      transformer = transformer || {};
+      this.readable = new ReadableStream({});
+      var rc = this.readable._controller;
+      this.writable = new WritableStream({
+        write: function (chunk) { return Promise.resolve(transformer.transform ? transformer.transform(chunk, rc) : rc.enqueue(chunk)); },
+        close: function () { if (transformer.flush) { transformer.flush(rc); } rc.close(); },
+        abort: function (e) { rc.error(e); }
+      });
+    };
+    globalThis.TransformStream = TransformStream;
+    globalThis.TextDecoderStream = function (label, options) {
+      var dec = new globalThis.TextDecoder(label || "utf-8", options || {});
+      var rc; var self = this;
+      this.readable = new ReadableStream({});
+      rc = this.readable._controller;
+      this.writable = new WritableStream({
+        write: function (chunk) { rc.enqueue(dec.decode(chunk, { stream: true })); },
+        close: function () { var tail = dec.decode(); if (tail) { rc.enqueue(tail); } rc.close(); }
+      });
+      Object.defineProperty(this, "encoding", { value: dec.encoding || "utf-8" });
+    };
+  }
+
   // Parse an HTML string into a DocumentFragment for the partial-update methods (appendHTML etc.).
   // `safe` strips <script>s (the safe, sanitizing variants); a `sanitizer.removeElements` option
   // drops those elements too. Scripts are never executed here (the fragment isn't connected).
@@ -9088,6 +9184,40 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         });
       })(defs[pi][0], defs[pi][1]);
     }
+    // Streaming variants: stream{,Append,Prepend,Before,After,ReplaceWith}HTML[Unsafe]. Each returns
+    // a WritableStream; written chunks are parsed and inserted at the position immediately (not
+    // buffered until close). The insertion point is fixed at call time so chunks land in order.
+    var streamDefs = [
+      ["streamHTML", "replace", 1], ["streamHTMLUnsafe", "replace", 0],
+      ["streamAppendHTML", "append", 1], ["streamAppendHTMLUnsafe", "append", 0],
+      ["streamPrependHTML", "prepend", 1], ["streamPrependHTMLUnsafe", "prepend", 0],
+      ["streamBeforeHTML", "before", 1], ["streamBeforeHTMLUnsafe", "before", 0],
+      ["streamAfterHTML", "after", 1], ["streamAfterHTMLUnsafe", "after", 0],
+      ["streamReplaceWithHTML", "replaceWith", 1], ["streamReplaceWithHTMLUnsafe", "replaceWith", 0]
+    ];
+    streamDefs.forEach(function (d) {
+      var nm = d[0], pos = d[1], safe = !!d[2];
+      if (typeof el[nm] === "function") { return; }
+      Object.defineProperty(el, nm, { configurable: true, writable: true, enumerable: false, value: function (opts) {
+        var node = this, insert;
+        if (pos === "replace" || pos === "append" || pos === "prepend") {
+          var dest = node.content || node;
+          if (pos === "replace") { while (dest.firstChild) { dest.removeChild(dest.firstChild); } }
+          if (pos === "prepend") { var pref = dest.firstChild; insert = function (f) { dest.insertBefore(f, pref); }; }
+          else { insert = function (f) { dest.appendChild(f); }; }
+        } else {
+          var p = node.parentNode, sref;
+          if (pos === "before") { sref = node; }
+          else if (pos === "after") { sref = node.nextSibling; }
+          else { sref = node.nextSibling; if (p) { p.removeChild(node); } }
+          insert = function (f) { if (p) { p.insertBefore(f, sref); } };
+        }
+        return new globalThis.WritableStream({
+          write: function (chunk) { insert(globalThis.__htmlPartialFragment(chunk == null ? "" : String(chunk), safe, opts)); },
+          close: function () {}
+        });
+      } });
+    });
   };
 
   // Deep structural node equality (DOM `isEqualNode`): same type and type-specific data, equal
@@ -11836,6 +11966,17 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     ResponseCtor.prototype.arrayBuffer = function () { return Promise.resolve(new ArrayBuffer(0)); };
     ResponseCtor.prototype.blob = function () { return Promise.resolve({ size: this.__body.length, type: (this.headers.get && this.headers.get("content-type")) || "" }); };
     ResponseCtor.prototype.formData = function () { return Promise.reject(new TypeError("formData not supported")); };
+    // body: a ReadableStream of the response's bytes (UTF-8). Reading it marks the body used.
+    Object.defineProperty(ResponseCtor.prototype, "body", {
+      get: function () {
+        if (this.__bodyStream) { return this.__bodyStream; }
+        var self = this;
+        var src = String(this.__body == null ? "" : this.__body);
+        var bytes = (typeof globalThis.TextEncoder === "function") ? new globalThis.TextEncoder().encode(src) : (function () { var a = []; for (var i = 0; i < src.length; i++) { a.push(src.charCodeAt(i) & 0xff); } return new Uint8Array(a); })();
+        this.__bodyStream = new globalThis.ReadableStream({ start: function (c) { self.bodyUsed = true; c.enqueue(bytes); c.close(); } });
+        return this.__bodyStream;
+      }, configurable: true, enumerable: true
+    });
     ResponseCtor.prototype.clone = function () { return new globalThis.Response(this.__body, { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url, type: this.type, redirected: this.redirected }); };
     ResponseCtor.json = function (data, init) { init = init || {}; var h = new globalThis.Headers(init.headers || {}); if (!h.has("content-type")) { h.set("content-type", "application/json"); } return new globalThis.Response(JSON.stringify(data), { status: init.status, statusText: init.statusText, headers: h }); };
     ResponseCtor.error = function () { var r = new globalThis.Response("", { status: 0 }); r.type = "error"; return r; };
