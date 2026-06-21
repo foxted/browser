@@ -1,8 +1,19 @@
 name: WPT
 
-# Every PR runs the web-platform-tests conformance suite and posts a report comment.
+# Every PR runs the web-platform-tests conformance suite and posts a report comment — except PRs
+# that can't affect engine conformance (docs, CI config, the macOS shell, packaging, build scripts).
+# Anything under crates/ or the workspace manifests still triggers it.
 on:
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - '.github/**'
+      - 'swift/**'
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'include/**'
+      - 'LICENSE'
+      - '.gitignore'
 
 concurrency:
   group: wpt-${{ github.ref }}
