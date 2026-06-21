@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a PR cancels the previous run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Enforce Conventional Commits. PRs are squash-merged, so the PR title becomes the commit —
+  # lint it (feat/fix/docs/…). This also drives automatic versioning via release-plz.
+  conventional-commit:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+
+  # Fast lint pass (one OS): formatting + clippy. Fails the PR on warnings.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The whole point of cross-platform dev: the Rust engine + all unit tests build and pass on
+  # macOS, Linux, and Windows. (The Swift/AppKit shell is macOS-only and built separately.)
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Caches ~/.cargo and target/, including the prebuilt V8 static lib — without this every
+      # run re-downloads/links ~hundreds of MB of V8.
+      - uses: Swatinem/rust-cache@v2
+      # Engine font tests need a system TTF; Linux runners ship none by default.
+      - name: Install fonts (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
+      - run: cargo build --workspace --release
+      - run: cargo test --workspace --release

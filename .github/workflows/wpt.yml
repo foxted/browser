@@ -1,0 +1,77 @@
+name: WPT
+
+# Every PR runs the web-platform-tests conformance suite and posts a report comment.
+on:
+  pull_request:
+
+concurrency:
+  group: wpt-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write   # to post/update the report comment
+
+jobs:
+  wpt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install fonts
+        run: sudo apt-get update && sudo apt-get install -y fonts-dejavu-core fonts-liberation
+
+      # Sparse, blobless checkout of just the directories we run (the full repo is ~160k files).
+      - name: Checkout web-platform-tests
+        run: |
+          git clone --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git "$RUNNER_TEMP/wpt"
+          cd "$RUNNER_TEMP/wpt"
+          git sparse-checkout set css/cssom dom domparsing html/dom resources
+
+      - name: Build runner
+        run: cargo build --release -p wpt-runner
+
+      - name: Run WPT + build report
+        id: wpt
+        run: |
+          WPT="$RUNNER_TEMP/wpt"
+          mkdir -p reports
+          rows=""; tp=0; tt=0
+          # css/cssom, dom, domparsing are quick; html/dom is large — include it for completeness.
+          for dir in css/cssom dom domparsing html/dom; do
+            line=$(WPT_REPORT="reports/${dir//\//-}.html" \
+              cargo run --release -p wpt-runner -- "$WPT" "$dir" 200000 2>/dev/null \
+              | grep -E "^subtests:" | tail -1)
+            p=$(echo "$line" | sed -E 's#subtests: ([0-9]+)/.*#\1#')
+            t=$(echo "$line" | sed -E 's#subtests: [0-9]+/([0-9]+).*#\1#')
+            pct=$(echo "$line" | sed -E 's#.*\(([0-9.]+%)\).*#\1#')
+            rows="${rows}| \`${dir}\` | ${p} / ${t} | ${pct} |\n"
+            tp=$((tp + p)); tt=$((tt + t))
+          done
+          total_pct=$(awk "BEGIN{printf \"%.1f%%\", ${tt}?100*${tp}/${tt}:0}")
+          {
+            echo "report<<REPORT_EOF"
+            echo "| Area | Subtests | Pass rate |"
+            echo "|------|----------|-----------|"
+            printf "%b" "$rows"
+            echo "| **Total** | **${tp} / ${tt}** | **${total_pct}** |"
+            echo "REPORT_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload HTML reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: wpt-reports
+          path: reports/
+
+      - name: Comment report on PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: wpt-report
+          message: |
+            ## 🧪 WPT conformance
+
+            ${{ steps.wpt.outputs.report }}
+
+            <sub>web-platform-tests via `crates/wpt-runner`. Full HTML reports are attached as the `wpt-reports` artifact on this run.</sub>

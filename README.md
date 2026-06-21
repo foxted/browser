@@ -1,10 +1,13 @@
 # browser
 
-A web browser written from scratch. macOS-only for now.
+A web browser written from scratch.
 
-- **Swift** is the app shell: window, URL bar, navigation chrome, event loop.
 - **Rust** is "the inners": the actual engine — networking, parsing, DOM, style,
-  layout, and paint.
+  layout, and paint. The engine is **platform-agnostic** and produces an RGBA framebuffer.
+- The **app shell** (window, URL bar, tabs, event loop) is a thin **native** layer per OS:
+  - **macOS** — Swift / AppKit *(current)*
+  - **Linux** — GTK4 *(planned)*
+  - **Windows** — Win32 *(planned)*
 
 ## Guiding constraint
 
@@ -16,7 +19,7 @@ it for a hand-written implementation later is a localized change, not a refactor
 |---|---|---|
 | `ureq` (HTTP/TLS) | `net::fetch` → `net::Response` | hand-written HTTP/1.1 (TLS likely stays reused — DIY TLS is unsafe) |
 | `fontdue` (glyph raster) | `paint::GlyphRasterizer` trait | hand-written rasterizer |
-| `boa_engine` (JS VM) | `js::Runtime` / `js::eval` | hand-written JS engine |
+| `v8` (JS VM) | `js::Runtime` / `js::eval` | hand-written JS engine |
 | `cbindgen` (header gen) | build script only | n/a (build tooling) |
 
 Everything else — HTML tokenizer/tree-builder, CSS parser, DOM, cascade, layout, the
@@ -41,7 +44,7 @@ GPU surface, can replace it later without touching the engine.)
 - `html` — hand-written HTML tokenizer + tree builder → DOM
 - `css` — CSS tokenizer + parser *(stub; Phase 3)*
 - `dom` — arena-based node tree
-- `js` — JS runtime + DOM/`window`/`self` bindings; runs page scripts *(reuses `boa_engine`)*
+- `js` — JS runtime + DOM/`window`/`self` bindings; runs page scripts *(reuses `v8`)*
 - `css` — hand-written CSS parser (`<style>` blocks + inline `style=""`)
 - `style` — cascade (UA + author + inline) → computed styles, box + flex/grid/position props
 - `layout` — block/inline/inline-block, **flexbox**, basic **grid**, and **positioning**
@@ -59,18 +62,40 @@ GPU surface, can replace it later without touching the engine.)
 Tabs are **not** capped at 4 GiB. Unlike Chrome — which isolates each tab in its own
 renderer process and runs V8 with pointer compression that effectively caps a tab's JS heap
 near 4 GiB — every tab here is just heap inside our single **64-bit** process, and the JS
-engine (Boa) uses no pointer compression. A tab is therefore limited only by the machine's
+engine (V8) uses no pointer compression. A tab is therefore limited only by the machine's
 RAM + swap. We set no `rlimit`, and size types on the hot paths are 64-bit (`net`'s body
 backstop sits at 16 GiB, the DOM arena indexes with `usize`).
 
 ## Build & run
 
+The engine is plain Rust and builds on **macOS, Linux, and Windows**. The macOS app shell is
+built via `scripts/build.sh`:
+
 ```sh
-bash scripts/build.sh           # builds Rust static lib + header, then the Swift app
-./swift/.build/debug/Browser    # launches the window
+bash scripts/build.sh              # debug: Rust lib + the Swift app
+./swift/.build/debug/Browser       # launch
+
+bash scripts/build.sh release      # optimized, bare executable
+bash scripts/build.sh release-app  # optimized + packaged + signed dist/Browser.app
 ```
 
-Tests: `cargo test`
+Tests run on every platform: `cargo test --workspace`. (Only the *shell* is per-OS; the engine
+and all unit tests are cross-platform — CI runs them on macOS / Linux / Windows.)
+
+## Contributing
+
+This project is built **LLM-first**. We strongly prefer changes authored by a capable coding
+model — **Claude 4.8** or **GPT-5.5** — over hand-written code. The engine is large and intricate,
+and the agents are faster and more thorough here. Drive a model, review its work, and ship that.
+Note the model/tooling on your PR.
+
+- **PRs only.** `main` is protected; every change lands through a pull request.
+- **Conventional Commits.** The PR title must be `feat(...)`, `fix(...)`, `ci: …`, etc. CI enforces
+  it, and `release-plz` uses it to bump versions and write CHANGELOGs.
+- **CI on every PR:** `cargo test` on macOS / Linux / Windows, `fmt` + `clippy`, and the **WPT
+  conformance suite** — it posts a pass-rate report comment on the PR.
+- **Releases:** merging the release-plz version PR tags `vX.Y.Z`, which builds + signs + notarizes
+  the macOS app and publishes it as a GitHub release.
 
 ## Status
 
