@@ -291,6 +291,7 @@ fn text_content(doc: &dom::Document, id: dom::NodeId) -> String {
     match &doc.get(id).data {
         dom::NodeData::Text(t) => return t.clone(),
         dom::NodeData::Comment(c) => return c.clone(),
+        dom::NodeData::Cdata(c) => return c.clone(),
         dom::NodeData::ProcessingInstruction(p) => return p.data.clone(),
         _ => {}
     }
@@ -298,6 +299,7 @@ fn text_content(doc: &dom::Document, id: dom::NodeId) -> String {
     fn walk(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
         match &doc.get(id).data {
             dom::NodeData::Text(t) => out.push_str(t),
+            dom::NodeData::Cdata(t) => out.push_str(t),
             _ => {
                 for &child in &doc.get(id).children {
                     walk(doc, child, out);
@@ -341,6 +343,11 @@ fn inner_html(doc: &dom::Document, id: dom::NodeId) -> String {
     fn serialize_node(doc: &dom::Document, id: dom::NodeId, out: &mut String) {
         match &doc.get(id).data {
             dom::NodeData::Text(t) => out.push_str(&escape_text(t)),
+            dom::NodeData::Cdata(c) => {
+                out.push_str("<![CDATA[");
+                out.push_str(c);
+                out.push_str("]]>");
+            }
             dom::NodeData::Comment(c) => {
                 out.push_str("<!--");
                 out.push_str(c);
@@ -402,6 +409,10 @@ fn set_text_content(doc: &mut dom::Document, id: dom::NodeId, text: &str) {
             return;
         }
         dom::NodeData::Comment(c) => {
+            *c = text.to_string();
+            return;
+        }
+        dom::NodeData::Cdata(c) => {
             *c = text.to_string();
             return;
         }
@@ -1180,6 +1191,34 @@ fn prim_create_comment(
         .doc
         .borrow_mut()
         .alloc(dom::NodeData::Comment(text), None);
+    rv.set_double(id.0 as f64);
+}
+
+/// `__createCData(text) -> id` — a parentless CDATASection node.
+fn prim_create_cdata(
+    scope: &mut v8::PinScope,
+    args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let text = arg_str(scope, &args, 0);
+    let state = host_state(scope);
+    let id = state
+        .doc
+        .borrow_mut()
+        .alloc(dom::NodeData::Cdata(text), None);
+    rv.set_double(id.0 as f64);
+}
+
+/// `__createDocumentNode() -> id` — a fresh, detached `Document` arena node (nodeType 9). Backs the
+/// off-document documents produced by `new Document()` / `DOMImplementation.create{HTML,}Document`,
+/// so they have a real tree (appendChild / childNodes / traversal all work).
+fn prim_create_document_node(
+    scope: &mut v8::PinScope,
+    _args: v8::FunctionCallbackArguments,
+    mut rv: v8::ReturnValue<v8::Value>,
+) {
+    let state = host_state(scope);
+    let id = state.doc.borrow_mut().alloc(dom::NodeData::Document, None);
     rv.set_double(id.0 as f64);
 }
 
@@ -2794,6 +2833,7 @@ fn prim_node_type(
         .map(|n| match &state.doc.borrow().get(n).data {
             dom::NodeData::Element(_) => 1,
             dom::NodeData::Text(_) => 3,
+            dom::NodeData::Cdata(_) => 4,
             dom::NodeData::Comment(_) => 8,
             dom::NodeData::Document => 9,
             dom::NodeData::DocumentFragment => 11,
@@ -3664,6 +3704,13 @@ fn install_dom_primitives(scope: &mut v8::PinScope, global: v8::Local<v8::Object
     set_fn(scope, global, "__createElement", prim_create_element);
     set_fn(scope, global, "__createText", prim_create_text);
     set_fn(scope, global, "__createComment", prim_create_comment);
+    set_fn(scope, global, "__createCData", prim_create_cdata);
+    set_fn(
+        scope,
+        global,
+        "__createDocumentNode",
+        prim_create_document_node,
+    );
     set_fn(
         scope,
         global,
@@ -4371,14 +4418,57 @@ const DOCUMENT_BOOTSTRAP: &str = r##"
     // element nodes `data` is a reflected content attribute (e.g. <object>.data is a URL), so leave
     // it free for the reflection layer.
     if (__nodeType(id) !== 1) {
+      // `data` is a [LegacyNullToEmptyString] DOMString: only `null` becomes "" (undefined -> the
+      // string "undefined", 0 -> "0", etc.).
       Object.defineProperty(el, "data", {
         get: function () { return __textContent(id); },
-        set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
+        set: function (v) { __setTextContent(id, v === null ? "" : String(v)); },
         enumerable: true, configurable: true
+      });
+      // CharacterData.length: the number of UTF-16 code units in `data`.
+      Object.defineProperty(el, "length", {
+        get: function () { return __textContent(id).length; },
+        enumerable: true, configurable: true
+      });
+      // The CharacterData mutation methods all reduce to "replace data": offset/count are WebIDL
+      // `unsigned long` (ToUint32, i.e. `>>> 0`), an out-of-range offset throws IndexSizeError, and a
+      // count running past the end is clamped. Operations are in UTF-16 code units (JS string units).
+      var __cdReplace = function (offset, count, insert) {
+        var d = __textContent(id);
+        var len = d.length;
+        if (offset > len) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
+        if (offset + count > len) { count = len - offset; }
+        __setTextContent(id, d.slice(0, offset) + insert + d.slice(offset + count));
+      };
+      def(el, "substringData", function (offset, count) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'substringData': 2 arguments required."); }
+        var d = __textContent(id), len = d.length;
+        offset = offset >>> 0; count = count >>> 0;
+        if (offset > len) { throw new globalThis.DOMException("The index is not in the allowed range.", "IndexSizeError"); }
+        var end = offset + count; if (end > len) { end = len; }
+        return d.slice(offset, end);
+      });
+      def(el, "appendData", function (data) {
+        if (arguments.length < 1) { throw new TypeError("Failed to execute 'appendData': 1 argument required."); }
+        __setTextContent(id, __textContent(id) + String(data));
+      });
+      def(el, "insertData", function (offset, data) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'insertData': 2 arguments required."); }
+        __cdReplace(offset >>> 0, 0, String(data));
+      });
+      def(el, "deleteData", function (offset, count) {
+        if (arguments.length < 2) { throw new TypeError("Failed to execute 'deleteData': 2 arguments required."); }
+        __cdReplace(offset >>> 0, count >>> 0, "");
+      });
+      def(el, "replaceData", function (offset, count, data) {
+        if (arguments.length < 3) { throw new TypeError("Failed to execute 'replaceData': 3 arguments required."); }
+        __cdReplace(offset >>> 0, count >>> 0, String(data));
       });
     }
     Object.defineProperty(el, "nodeValue", {
-      get: function () { var t = __nodeType(id); return (t === 3 || t === 8) ? __textContent(id) : null; },
+      // nodeValue is the data for the CharacterData kinds (Text=3, CDATASection=4, PI=7, Comment=8);
+      // null for everything else.
+      get: function () { var t = __nodeType(id); return (t === 3 || t === 4 || t === 7 || t === 8) ? __textContent(id) : null; },
       set: function (v) { __setTextContent(id, v == null ? "" : String(v)); },
       enumerable: true, configurable: true
     });
@@ -10364,6 +10454,12 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       return canon(__wrapNode(__createComment(String(data == null ? "" : data))));
     });
   }
+  // createCDATASection is only valid on XML documents; the live page document is HTML, so it throws.
+  if (typeof document.createCDATASection !== "function") {
+    def(document, "createCDATASection", function () {
+      throw new globalThis.DOMException("This DOM method is only valid on XML documents.", "NotSupportedError");
+    });
+  }
   if (typeof document.createDocumentFragment !== "function") {
     def(document, "createDocumentFragment", function () {
       // Real arena-backed DocumentFragment (nodeType 11): its children move on insertion, and it
@@ -10391,6 +10487,48 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var dt = globalThis.__createDocumentTypeNode(String(name), pub == null ? "" : String(pub), sys == null ? "" : String(sys));
       try { Object.defineProperty(dt, "ownerDocument", { value: ownerDoc, configurable: true, enumerable: true }); } catch (e) {}
       return dt;
+    }
+    // Back an off-document facade with a real (detached) arena Document node, so the Node mutation
+    // methods + live child accessors work against the arena (appendChild/insertBefore/removeChild/
+    // replaceChild, childNodes/firstChild/lastChild). `initialChildIds` are appended in order.
+    function backDocWithArena(doc, initialChildIds) {
+      var docId = globalThis.__createDocumentNode();
+      try { Object.defineProperty(doc, "__node", { value: docId, configurable: true }); } catch (e) {}
+      for (var i = 0; i < initialChildIds.length; i++) {
+        var cid = initialChildIds[i];
+        if (typeof cid === "number" && cid >= 0) { globalThis.__insertNode(docId, cid, -1); }
+      }
+      function reqNode(x, m) {
+        var n = (x && typeof x.__node === "number") ? x.__node : -1;
+        if (n < 0) { throw new TypeError("Failed to execute '" + m + "' on 'Node': parameter is not of type 'Node'."); }
+        return n;
+      }
+      function nf(msg) { throw new (globalThis.DOMException)(msg, "NotFoundError"); }
+      def(doc, "appendChild", function (child) { var c = reqNode(child, "appendChild"); globalThis.__insertNode(docId, c, -1); return child; });
+      def(doc, "insertBefore", function (newNode, refNode) {
+        var c = reqNode(newNode, "insertBefore");
+        var r = (refNode == null) ? -1 : ((refNode && typeof refNode.__node === "number") ? refNode.__node : -1);
+        if (refNode != null && r < 0) { nf("The reference child is not a child of this node."); }
+        globalThis.__insertNode(docId, c, r); return newNode;
+      });
+      def(doc, "removeChild", function (child) {
+        var c = reqNode(child, "removeChild");
+        if (globalThis.__parent(c) !== docId) { nf("The node to be removed is not a child of this node."); }
+        globalThis.__removeChild(docId, c); return child;
+      });
+      def(doc, "replaceChild", function (newNode, oldNode) {
+        var n = reqNode(newNode, "replaceChild"), o = reqNode(oldNode, "replaceChild");
+        if (globalThis.__parent(o) !== docId) { nf("The node to be replaced is not a child of this node."); }
+        var sibs = globalThis.__children(docId); var idx = sibs.indexOf(o);
+        var ref = (idx >= 0 && idx + 1 < sibs.length) ? sibs[idx + 1] : -1;
+        if (ref === n) { var ni = sibs.indexOf(n); ref = (ni >= 0 && ni + 1 < sibs.length) ? sibs[ni + 1] : -1; }
+        globalThis.__removeChild(docId, o); globalThis.__insertNode(docId, n, ref); return oldNode;
+      });
+      function kids() { return globalThis.__children(docId); }
+      Object.defineProperty(doc, "childNodes", { get: function () { var ids = kids(), a = []; for (var i = 0; i < ids.length; i++) { a.push(globalThis.__nodeFor(ids[i])); } return a; }, configurable: true, enumerable: true });
+      Object.defineProperty(doc, "firstChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[0]) : null; }, configurable: true, enumerable: true });
+      Object.defineProperty(doc, "lastChild", { get: function () { var ids = kids(); return ids.length ? globalThis.__nodeFor(ids[ids.length - 1]) : null; }, configurable: true, enumerable: true });
+      return doc;
     }
     def(document, "implementation", {
       hasFeature: function () { return true; },
@@ -10439,6 +10577,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
           },
           createTextNode: function (s) { return document.createTextNode(s); },
           createComment: function (s) { return document.createComment(s); },
+          // An HTML document refuses createCDATASection (the XML createDocument path overrides this).
+          createCDATASection: function () { throw new globalThis.DOMException("This DOM method is only valid on XML documents.", "NotSupportedError"); },
           createDocumentFragment: function () { return document.createDocumentFragment(); },
           createProcessingInstruction: function (target, data) { return document.createProcessingInstruction(target, data); },
           importNode: function (n) { return n; }, adoptNode: function (n) { return n; },
@@ -10450,6 +10590,9 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         // A Document's textContent / nodeValue are null; setting them is a no-op.
         Object.defineProperty(doc, "textContent", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
         Object.defineProperty(doc, "nodeValue", { get: function () { return null; }, set: function () {}, enumerable: true, configurable: true });
+        // Back the facade with a real arena Document node holding <html> as its element child, so
+        // appendChild / childNodes / traversal work on the off-document tree.
+        backDocWithArena(doc, [htmlEl && typeof htmlEl.__node === "number" ? htmlEl.__node : -1]);
         return doc;
       },
       createDocument: function (namespace) {
@@ -10460,6 +10603,8 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
         var docNs = (namespace === undefined || namespace === null || namespace === "") ? null : String(namespace);
         var elNs = docNs === "http://www.w3.org/1999/xhtml" ? docNs : null;
         d.createElement = function (name) { return globalThis.__createElementWithNs(elNs, name); };
+        // An XML document supports createCDATASection (overriding createHTMLDocument's HTML refusal).
+        d.createCDATASection = function (data) { return globalThis.__canonNode(globalThis.__wrapNode(globalThis.__createCData(String(data == null ? "" : data)))); };
         d.createAttribute = function (name) {
           var nm = String(name);
           if (nm.length === 0) { globalThis.__invalidCharacterError(); }
@@ -11445,6 +11590,14 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       def(DocumentCtor.prototype, "lookupNamespaceURI", function () { return null; });
       def(DocumentCtor.prototype, "lookupPrefix", function () { return null; });
       def(DocumentCtor.prototype, "isDefaultNamespace", function (ns) { return ns == null || ns === ""; });
+      // A bare `new Document()` is an XML document, so it supports the CharacterData factories
+      // (including createCDATASection, which an HTML document refuses). Nodes are real arena nodes so
+      // they can be inserted into a live tree and traversed.
+      var __mkNode = function (mkId) { return globalThis.__canonNode(globalThis.__wrapNode(mkId)); };
+      def(DocumentCtor.prototype, "createTextNode", function (data) { return __mkNode(globalThis.__createText(String(data == null ? "" : data))); });
+      def(DocumentCtor.prototype, "createComment", function (data) { return __mkNode(globalThis.__createComment(String(data == null ? "" : data))); });
+      def(DocumentCtor.prototype, "createCDATASection", function (data) { return __mkNode(globalThis.__createCData(String(data == null ? "" : data))); });
+      def(DocumentCtor.prototype, "createDocumentFragment", function () { return __mkNode(globalThis.__createDocumentFragment()); });
     }
   } catch (e) {}
   defClass("Window", globalThis.EventTarget);
