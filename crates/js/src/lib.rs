@@ -5260,7 +5260,7 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
     }
     var pathname;
     if (u.opaque) { pathname = u.path[0] || ""; }
-    else { pathname = (u.host != null || special) ? "/" + u.path.join("/") : (u.path.length ? "/" + u.path.join("/") : ""); }
+    else { pathname = u.path.length ? "/" + u.path.join("/") : (special ? "/" : ""); }
     href += pathname;
     var search = u.query != null ? "?" + u.query : "";
     var hash = u.fragment != null ? '#' + u.fragment : "";
