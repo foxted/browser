@@ -200,6 +200,45 @@ impl<'a> Parser<'a> {
         *self.open.last().unwrap_or(&self.doc.root())
     }
 
+    /// The lowercased tag name of an open element (empty for non-elements).
+    fn tag_of(&self, id: NodeId) -> String {
+        match &self.doc.get(id).data {
+            NodeData::Element(e) => e.tag.to_ascii_lowercase(),
+            _ => String::new(),
+        }
+    }
+
+    /// Close an open `<p>` (pop the stack down to and including it) if one is in button scope.
+    fn close_p_in_button_scope(&mut self) {
+        const STOP: &[&str] = &[
+            "button", "applet", "object", "marquee", "td", "th", "caption", "html", "table", "template",
+        ];
+        for i in (0..self.open.len()).rev() {
+            let name = self.tag_of(self.open[i]);
+            if name == "p" {
+                self.open.truncate(i);
+                return;
+            }
+            if STOP.contains(&name.as_str()) {
+                return;
+            }
+        }
+    }
+
+    /// Pop the open stack down to and including the nearest of `targets`, stopping at a `stops` boundary.
+    fn close_to(&mut self, targets: &[&str], stops: &[&str]) {
+        for i in (0..self.open.len()).rev() {
+            let name = self.tag_of(self.open[i]);
+            if targets.contains(&name.as_str()) {
+                self.open.truncate(i);
+                return;
+            }
+            if stops.contains(&name.as_str()) {
+                return;
+            }
+        }
+    }
+
     // ---- implied skeleton (html > head, body) ----
 
     /// Ensure an `<html>` element exists under the document root and is on the open stack.
@@ -630,6 +669,44 @@ impl<'a> Parser<'a> {
                 // Metadata stays in head (current parent is head).
             }
             InsertMode::InBody => {}
+        }
+
+        // "In body" auto-closing: certain start tags implicitly close an open `<p>`, list item, or
+        // heading before being inserted (so e.g. `<p>a<p>b` and `<li>a<li>b` become siblings).
+        let lt = tag.to_ascii_lowercase();
+        match lt.as_str() {
+            "address" | "article" | "aside" | "blockquote" | "center" | "details" | "dialog"
+            | "dir" | "div" | "dl" | "fieldset" | "figcaption" | "figure" | "footer" | "header"
+            | "hgroup" | "main" | "menu" | "nav" | "ol" | "p" | "section" | "summary" | "ul"
+            | "pre" | "listing" | "hr" | "table" | "xmp"
+            | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                self.close_p_in_button_scope();
+                if matches!(lt.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+                    && matches!(self.open.last().map(|&n| self.tag_of(n)).as_deref(),
+                        Some("h1") | Some("h2") | Some("h3") | Some("h4") | Some("h5") | Some("h6"))
+                {
+                    self.open.pop();
+                }
+            }
+            "li" => {
+                self.close_to(&["li"], &["ul", "ol", "menu", "dir", "table", "template", "html", "body", "caption", "td", "th"]);
+                self.close_p_in_button_scope();
+            }
+            "dd" | "dt" => {
+                self.close_to(&["dd", "dt"], &["dl", "template", "html", "body", "caption", "td", "th"]);
+                self.close_p_in_button_scope();
+            }
+            "option" | "optgroup" => {
+                if self.open.last().map(|&n| self.tag_of(n)).as_deref() == Some("option") {
+                    self.open.pop();
+                }
+                if lt == "optgroup"
+                    && self.open.last().map(|&n| self.tag_of(n)).as_deref() == Some("optgroup")
+                {
+                    self.open.pop();
+                }
+            }
+            _ => {}
         }
 
         let parent = self.current_parent();
