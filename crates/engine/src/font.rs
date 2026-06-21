@@ -6,10 +6,12 @@
 
 use paint::{GlyphBitmap, GlyphRasterizer};
 
-/// Candidate single-file TTFs shipped with macOS, tried in order. Prefer modern fonts with a
-/// proper UNICODE cmap: legacy Mac fonts like Monaco/Geneva carry a Mac-Roman cmap where byte
-/// 0xB7 is `∑`, so `·` (U+00B7) and most non-ASCII glyphs (é, α, →, €…) map to the WRONG glyph.
-/// SF Mono keeps a monospace look; San Francisco / Arial Unicode are broad-coverage fallbacks.
+/// Candidate single-file TTFs, tried in order, per OS. Prefer modern fonts with a proper UNICODE
+/// cmap: legacy fonts (e.g. macOS Monaco/Geneva) carry a Mac-Roman cmap where byte 0xB7 is `∑`, so
+/// `·` (U+00B7) and most non-ASCII glyphs (é, α, →, €…) map to the WRONG glyph. Monospace first to
+/// keep the look, then broad-coverage fallbacks. (A future upgrade is `font-kit` for true system
+/// font enumeration; this fixed list is dependency-free and covers the common installs.)
+#[cfg(target_os = "macos")]
 const FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/SFNSMono.ttf",
     "/System/Library/Fonts/SFNS.ttf",
@@ -21,6 +23,33 @@ const FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/NewYork.ttf",
 ];
 
+#[cfg(target_os = "linux")]
+const FONT_CANDIDATES: &[&str] = &[
+    // Debian/Ubuntu layout, then Fedora/Arch (/usr/share/fonts/{TTF,...}).
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+];
+
+#[cfg(target_os = "windows")]
+const FONT_CANDIDATES: &[&str] = &[
+    r"C:\Windows\Fonts\consola.ttf", // Consolas (monospace)
+    r"C:\Windows\Fonts\lucon.ttf",   // Lucida Console
+    r"C:\Windows\Fonts\segoeui.ttf", // Segoe UI
+    r"C:\Windows\Fonts\arial.ttf",
+    r"C:\Windows\Fonts\arialuni.ttf", // Arial Unicode MS (broad coverage, if installed)
+    r"C:\Windows\Fonts\tahoma.ttf",
+];
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+const FONT_CANDIDATES: &[&str] = &[];
+
 pub struct SystemFont {
     font: fontdue::Font,
 }
@@ -29,7 +58,9 @@ impl SystemFont {
     /// Load the first available system font. Returns `None` if none could be read/parsed.
     pub fn load() -> Option<Self> {
         for path in FONT_CANDIDATES {
-            let Ok(bytes) = std::fs::read(path) else { continue };
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
             if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
                 return Some(Self { font });
             }
