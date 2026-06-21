@@ -56,7 +56,45 @@ fn content_type(path: &str) -> &'static str {
 /// Minimal blocking static file server. One request per connection (`Connection: close`). The
 /// `/resources/testharnessreport.js` path is overridden with [`REPORT_JS`]; everything else is read
 /// from `root`.
-fn serve(stream: &mut TcpStream, root: &Path) {
+/// Substitute WPT server-variable templates (`{{host}}`, `{{domains[...]}}`, `{{ports[...][...]}}`,
+/// `{{location[...]}}`) used in `.sub.*` files. We serve a single origin, so every host/domain maps
+/// to 127.0.0.1 and every port to our ephemeral port. Unknown templates are passed through.
+fn wpt_subst(s: &str, port: u16) -> String {
+    let host = "127.0.0.1";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        match after.find("}}") {
+            Some(end) => {
+                let var = after[..end].trim();
+                if var == "host" || var == "domains" || var.starts_with("domains[") {
+                    out.push_str(host);
+                } else if var.starts_with("ports[") {
+                    out.push_str(&port.to_string());
+                } else if var.starts_with("location[") {
+                    out.push_str(host);
+                    out.push(':');
+                    out.push_str(&port.to_string());
+                } else {
+                    out.push_str("{{");
+                    out.push_str(&after[..end]);
+                    out.push_str("}}");
+                }
+                rest = &after[end + 2..];
+            }
+            None => {
+                out.push_str("{{");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn serve(stream: &mut TcpStream, root: &Path, port: u16) {
     let mut buf = [0u8; 8192];
     let n = match stream.read(&mut buf) {
         Ok(n) if n > 0 => n,
@@ -72,8 +110,8 @@ fn serve(stream: &mut TcpStream, root: &Path) {
     let path = path.split(['?', '#']).next().unwrap_or("/");
     let path = path.replace("%20", " ");
 
-    let (body, ctype): (Vec<u8>, &str) = if path == "/resources/testharnessreport.js" {
-        (REPORT_JS.as_bytes().to_vec(), "text/javascript; charset=utf-8")
+    let (body, ctype, extra): (Vec<u8>, String, String) = if path == "/resources/testharnessreport.js" {
+        (REPORT_JS.as_bytes().to_vec(), "text/javascript; charset=utf-8".to_string(), String::new())
     } else {
         let rel = path.trim_start_matches('/');
         let full = root.join(rel);
@@ -83,7 +121,38 @@ fn serve(stream: &mut TcpStream, root: &Path) {
             return;
         }
         match std::fs::read(&full) {
-            Ok(b) => (b, content_type(&path)),
+            Ok(b) => {
+                // `.sub.*` files carry WPT server-variable templates that must be substituted.
+                let body = if path.contains(".sub.") {
+                    wpt_subst(&String::from_utf8_lossy(&b), port).into_bytes()
+                } else {
+                    b
+                };
+                // A WPT `.headers` sidecar (`<file>.headers`) overrides the Content-Type and adds
+                // response headers (e.g. `X-Content-Type-Options: nosniff`).
+                let mut ct = content_type(&path).to_string();
+                let mut extra = String::new();
+                if let Ok(htext) = std::fs::read_to_string(format!("{}.headers", full.display())) {
+                    for line in htext.lines() {
+                        let line = line.trim();
+                        if line.is_empty() || line.starts_with('#') {
+                            continue;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            let (k, v) = (k.trim(), v.trim());
+                            if k.eq_ignore_ascii_case("content-type") {
+                                ct = v.to_string();
+                            } else {
+                                extra.push_str(k);
+                                extra.push_str(": ");
+                                extra.push_str(v);
+                                extra.push_str("\r\n");
+                            }
+                        }
+                    }
+                }
+                (body, ct, extra)
+            }
             Err(_) => {
                 let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                 return;
@@ -91,7 +160,7 @@ fn serve(stream: &mut TcpStream, root: &Path) {
         }
     };
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -147,7 +216,7 @@ fn main() {
             for stream in listener.incoming() {
                 if let Ok(mut s) = stream {
                     let root = root.clone();
-                    std::thread::spawn(move || serve(&mut s, &root));
+                    std::thread::spawn(move || serve(&mut s, &root, port));
                 }
             }
         });

@@ -784,11 +784,17 @@ fn skip_balanced(bytes: &[char], mut pos: usize, end: usize, open: char, close: 
 fn skip_string(bytes: &[char], pos: usize, end: usize, quote: char) -> usize {
     let mut i = pos + 1;
     while i < end {
-        if bytes[i] == '\\' {
+        let c = bytes[i];
+        // An unescaped newline terminates a CSS string (a bad-string token), letting error recovery
+        // resume at the next rule instead of swallowing the rest of the stylesheet.
+        if c == '\n' || c == '\r' || c == '\u{0c}' {
+            return i;
+        }
+        if c == '\\' {
             i += 2;
             continue;
         }
-        if bytes[i] == quote {
+        if c == quote {
             return i + 1;
         }
         i += 1;
