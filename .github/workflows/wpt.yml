@@ -27,7 +27,7 @@ jobs:
         run: |
           git clone --filter=blob:none --sparse https://github.com/web-platform-tests/wpt.git "$RUNNER_TEMP/wpt"
           cd "$RUNNER_TEMP/wpt"
-          git sparse-checkout set css/cssom dom domparsing html/dom resources
+          git sparse-checkout set css/cssom dom domparsing html/dom url fetch resources
 
       - name: Build runner
         run: cargo build --release -p wpt-runner
@@ -38,8 +38,9 @@ jobs:
           WPT="$RUNNER_TEMP/wpt"
           mkdir -p reports
           rows=""; tp=0; tt=0
-          # css/cssom, dom, domparsing are quick; html/dom is large — include it for completeness.
-          for dir in css/cssom dom domparsing html/dom; do
+          # css/cssom, dom, domparsing, url are quick; html/dom is large; fetch is mostly network-
+          # dependent (low but non-zero). All exclude tentative tests (skipped by the runner).
+          for dir in css/cssom dom domparsing html/dom url fetch; do
             line=$(WPT_REPORT="reports/${dir//\//-}.html" \
               cargo run --release -p wpt-runner -- "$WPT" "$dir" 200000 2>/dev/null \
               | grep -E "^subtests:" | tail -1)
