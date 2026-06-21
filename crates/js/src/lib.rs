@@ -8676,9 +8676,24 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
   // protocol + "//" + host + pathname + search + hash (returning the raw input if that yields "//").
   // This mirrors the harness' own resolveUrl() so `url`-type reflected attributes compare equal,
   // and works around our URL parser dropping the trailing path segment for empty relative refs.
+  // The document's effective base URL: the first <base href> (resolved against the page URL) if any,
+  // otherwise the page URL itself. Honoured by URL-reflecting attributes (a.href, img.src, …).
+  function __effectiveBaseURL() {
+    try {
+      var b = document.querySelector("base[href]");
+      if (b) {
+        var bh = b.getAttribute("href");
+        if (bh != null && bh !== "") {
+          var rb = parseURL(bh, globalThis.__pageURL);
+          if (!rb.__invalid && rb.href) { return rb.href; }
+        }
+      }
+    } catch (e) {}
+    return globalThis.__pageURL;
+  }
   function __reflResolveURL(v) {
     v = String(v);
-    var base = globalThis.__pageURL;
+    var base = __effectiveBaseURL();
     var resolved;
     try {
       if (v === "") {
