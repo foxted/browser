@@ -12441,6 +12441,11 @@ const BROWSER_ENV_BOOTSTRAP: &str = r#"
       var url;
       try { url = (input && input.url) ? String(input.url) : String(input); }
       catch (e) { url = String(input); }
+      // Dangling-markup mitigation: a request URL containing both "<" and a newline/CR/tab is a
+      // network error (blocks data exfiltration via unclosed markup in resource URLs).
+      if (url.indexOf("<") >= 0 && /[\n\r\t]/.test(url)) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
       var method = String(init.method || "GET").toUpperCase();
 
       // Honor an AbortSignal: a fetch on an already-aborted signal rejects with AbortError. (Our
