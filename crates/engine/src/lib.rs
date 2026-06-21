@@ -4871,8 +4871,8 @@ pub fn run_modules(doc: dom::Document, page_url: &str) -> (dom::Document, Vec<St
     }
     // On-demand fetcher for dynamic imports of modules not in the pre-fetched static graph.
     // Called only on the JS isolate's own worker thread, so blocking `net::fetch` is fine here.
-    let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
-        net::fetch(u).ok().map(|r| String::from_utf8_lossy(&r.body).into_owned())
+    let fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send> = Box::new(|u: &str| {
+        net::fetch(u).ok().map(|r| (String::from_utf8_lossy(&r.body).into_owned(), r.content_type))
     });
     let request_fetcher = build_request_fetcher();
     let (doc, results) = js::run_modules(doc, page_url, entries, sources, fetcher, request_fetcher);
@@ -5033,8 +5033,8 @@ fn start_session(
     // scriptable document, so we now start a session even with zero author scripts — the cost is one
     // idle isolate, and it makes `Engine::console_eval` work on every loaded HTML page.
 
-    let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
-        net::fetch(u).ok().map(|r| String::from_utf8_lossy(&r.body).into_owned())
+    let fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send> = Box::new(|u: &str| {
+        net::fetch(u).ok().map(|r| (String::from_utf8_lossy(&r.body).into_owned(), r.content_type))
     });
     let request_fetcher = build_request_fetcher();
     let ws_connector = build_ws_connector();

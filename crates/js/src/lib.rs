@@ -114,7 +114,7 @@ struct HostState {
     /// Blocking inside it is fine (single-threaded worker, synchronous drain model). The no-DOM
     /// paths install a no-op fetcher that always returns `None`. Held as an `Rc` so the module
     /// registry on the `run_modules` path can share the very same fetcher.
-    fetcher: Rc<dyn Fn(&str) -> Option<String>>,
+    fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>>,
     /// Host network capability for arbitrary-method requests (method, url, body, headers-JSON),
     /// backing the `__request` native primitive that powers JS `fetch()` with method/headers/body.
     /// Returns a JSON response *envelope* (see `engine`'s builder) or `None` on transport error.
@@ -223,7 +223,7 @@ impl HostState {
     #[allow(clippy::too_many_arguments)]
     fn with_fetcher(
         doc: SharedDoc,
-        fetcher: Rc<dyn Fn(&str) -> Option<String>>,
+        fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>>,
         request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
         fetch_tx: Sender<FetchCompletion>,
         ws_connector: WsConnector,
@@ -1328,7 +1328,7 @@ fn document_base_url(doc: &dom::Document, page_url: &str) -> String {
 
 fn collect_author_sheets(
     doc: &dom::Document,
-    fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+    fetcher: &Rc<dyn Fn(&str) -> Option<(String, String)>>,
     page_url: &str,
 ) -> Vec<css::Stylesheet> {
     // Resolve the document base URL (honoring `<base href>`) and publish it so the cascade resolves
@@ -1350,7 +1350,7 @@ fn collect_author_sheets(
         doc: &dom::Document,
         id: dom::NodeId,
         out: &mut Vec<SheetEntry>,
-        fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+        fetcher: &Rc<dyn Fn(&str) -> Option<(String, String)>>,
         doc_base: &str,
     ) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
@@ -1442,7 +1442,7 @@ fn collect_author_sheets(
 
 /// Fetch the CSS text behind a stylesheet `<link href>`. `data:` URLs are decoded directly (the
 /// `text/css` body after the comma, percent-decoded); anything else goes through the host GET fetcher.
-fn fetch_link_css(href: &str, fetcher: &Rc<dyn Fn(&str) -> Option<String>>) -> Option<String> {
+fn fetch_link_css(href: &str, fetcher: &Rc<dyn Fn(&str) -> Option<(String, String)>>) -> Option<String> {
     if let Some(rest) = href.strip_prefix("data:") {
         let comma = rest.find(',')?;
         let (meta, data) = (&rest[..comma], &rest[comma + 1..]);
@@ -1451,7 +1451,15 @@ fn fetch_link_css(href: &str, fetcher: &Rc<dyn Fn(&str) -> Option<String>>) -> O
         }
         return Some(percent_decode_str(data));
     }
-    fetcher(href)
+    let (body, ctype) = fetcher(href)?;
+    // A linked stylesheet whose response declares a non-`text/css` type isn't a CSS resource and
+    // must not be applied (HTML "obtain a CSS style sheet" / CORB). An absent type stays lenient.
+    let essence = ctype.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if essence.is_empty() || essence == "text/css" {
+        Some(body)
+    } else {
+        None
+    }
 }
 
 /// Minimal percent-decoding for `data:` URL bodies (`%XX` → byte; other chars pass through).
@@ -1626,13 +1634,13 @@ fn resolve_facade_widths(
 fn collect_facade_sheets(
     doc: &dom::Document,
     root: dom::NodeId,
-    fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+    fetcher: &Rc<dyn Fn(&str) -> Option<(String, String)>>,
 ) -> Vec<css::Stylesheet> {
     fn walk(
         doc: &dom::Document,
         id: dom::NodeId,
         out: &mut String,
-        fetcher: &Rc<dyn Fn(&str) -> Option<String>>,
+        fetcher: &Rc<dyn Fn(&str) -> Option<(String, String)>>,
     ) {
         if let dom::NodeData::Element(e) = &doc.get(id).data {
             if e.tag.eq_ignore_ascii_case("style") {
@@ -3178,7 +3186,7 @@ fn prim_fetch(
             _ => raw.clone(),
         }
     };
-    let body = (host_state(scope).fetcher)(&resolved);
+    let body = (host_state(scope).fetcher)(&resolved).map(|(b, _)| b);
     match body {
         Some(s) => {
             let v = js_str(scope, &s);
@@ -14020,7 +14028,7 @@ struct ModuleRegistry {
     /// On-demand fetcher for modules absent from `sources` (dynamic imports of non-pre-fetched
     /// URLs). Called only on the isolate's own worker thread, so blocking inside it is fine.
     /// Shared (via `Rc`) with [`HostState`] so the JS `fetch()` primitive uses the same fetcher.
-    fetcher: Rc<dyn Fn(&str) -> Option<String>>,
+    fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>>,
     /// Page/entry URL, used as the base for resolving specifiers when a referrer's own URL is
     /// unknown (e.g. dynamic `import()` from a non-module classic context).
     base_url: String,
@@ -14050,7 +14058,7 @@ impl ModuleRegistry {
         if self.sources.borrow().len() >= MODULE_CAP {
             return None;
         }
-        let fetched = (self.fetcher)(url)?;
+        let fetched = (self.fetcher)(url)?.0;
         self.sources.borrow_mut().insert(url.to_string(), fetched.clone());
         Some(fetched)
     }
@@ -14342,7 +14350,7 @@ pub fn run_modules(
     url: &str,
     entries: Vec<String>,
     modules: HashMap<String, String>,
-    fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+    fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send>,
     request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
 ) -> (dom::Document, Vec<EvalOutput>) {
     let url = url.to_string();
@@ -14370,7 +14378,7 @@ pub fn run_modules(
                 let context = v8::Context::new(handle_scope, Default::default());
                 let scope = &mut v8::ContextScope::new(handle_scope, context);
                 // Share one fetcher between the module loader and the JS `fetch()` primitive.
-                let fetcher: Rc<dyn Fn(&str) -> Option<String>> =
+                let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> =
                     Rc::new(move |u: &str| fetcher(u));
                 // The module path is run-once with no live event loop, so no real WebSocket support:
                 // a connector that always errs and a dead-end event channel.
@@ -14628,7 +14636,7 @@ impl Session {
         entries: Vec<String>,
         modules: HashMap<String, String>,
         url: &str,
-        fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+        fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send>,
         request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
         ws_connector: WsConnector,
         // Layout rects to seed into HostState BEFORE the page's scripts run, so synchronous
@@ -14950,7 +14958,7 @@ fn session_thread_main(
     entries: Vec<String>,
     modules: HashMap<String, String>,
     url: String,
-    fetcher: Box<dyn Fn(&str) -> Option<String> + Send>,
+    fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send>,
     request_fetcher: Arc<dyn Fn(&str, &str, &str, &str) -> Option<String> + Send + Sync>,
     ws_connector: WsConnector,
     init_tx: std::sync::mpsc::Sender<(dom::Document, Vec<EvalOutput>)>,
@@ -14987,7 +14995,7 @@ fn session_thread_main(
         let scope = &mut v8::ContextScope::new(handle_scope, context);
 
         // Share one fetcher between the module loader and the JS `fetch()` primitive (as run_modules).
-        let fetcher: Rc<dyn Fn(&str) -> Option<String>> = Rc::new(move |u: &str| fetcher(u));
+        let fetcher: Rc<dyn Fn(&str) -> Option<(String, String)>> = Rc::new(move |u: &str| fetcher(u));
         let state = HostState::with_fetcher(
             Rc::clone(&shared),
             Rc::clone(&fetcher),
@@ -17564,7 +17572,7 @@ mod tests {
     }
 
     /// A fetcher that never serves anything (the static `modules` map is the only source).
-    fn no_fetch() -> Box<dyn Fn(&str) -> Option<String> + Send> {
+    fn no_fetch() -> Box<dyn Fn(&str) -> Option<(String, String)> + Send> {
         Box::new(|_u: &str| None)
     }
 
@@ -18081,9 +18089,9 @@ mod tests {
                 .to_string(),
         );
 
-        let fetcher: Box<dyn Fn(&str) -> Option<String> + Send> = Box::new(|u: &str| {
+        let fetcher: Box<dyn Fn(&str) -> Option<(String, String)> + Send> = Box::new(|u: &str| {
             if u == "https://x/b.js" {
-                Some("export const answer = 99;".to_string())
+                Some(("export const answer = 99;".to_string(), "text/javascript".to_string()))
             } else {
                 None
             }
