@@ -428,7 +428,10 @@ pub(crate) fn intrinsic_cross_height(
     let fs = boxx.style.font_size;
     let has_text = has_any_text(boxx);
     if has_text {
-        measurer.line_height(if fs > 0.0 { fs } else { 16.0 })
+        measurer.line_height(
+            if fs > 0.0 { fs } else { 16.0 },
+            boxx.style.font_family.as_deref(),
+        )
     } else {
         0.0
     }
@@ -478,7 +481,8 @@ pub(crate) fn layout_flex_item_contents(
                 layout_block_children(boxx, child_ctx, styles, measurer)
             } else if !boxx.children.is_empty() {
                 let align = text_align_of(boxx.node, styles);
-                layout_inline_children(boxx, align, child_ctx, styles, measurer)
+                let indent = text_indent_of(boxx.node, styles);
+                layout_inline_children(boxx, align, indent, child_ctx, styles, measurer)
             } else {
                 0.0
             }
