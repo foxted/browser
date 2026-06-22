@@ -10,6 +10,7 @@ use std::collections::HashMap;
 mod block;
 mod build;
 mod flex;
+mod float;
 mod grid;
 mod inline;
 mod intrinsic;
@@ -19,6 +20,7 @@ mod types;
 
 pub(crate) use block::*;
 pub(crate) use build::*;
+pub(crate) use float::*;
 
 /// Run `f` with a guarantee of at least ~1 MiB of stack headroom, allocating a fresh stack segment
 /// if the current one is nearly exhausted. Wrap the per-level recursive call in the two layout
@@ -549,6 +551,129 @@ mod tests {
         let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
         let abox = find_box(&root_box, &|x| x.node == Some(a)).unwrap();
         assert_eq!(abox.dimensions.content.width, 200.0);
+    }
+
+    #[test]
+    fn floats_pack_left_to_right_then_wrap() {
+        // Three float:left divs of width 300 in an 800px body: two fit on the first row, the third
+        // wraps below. The container grows to contain them. (wikipedia.org footer project grid.)
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let a = doc.append_element(wrap, "div");
+        let b = doc.append_element(wrap, "div");
+        let c = doc.append_element(wrap, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(wrap, block_style(true));
+        let fl = |w: f32| style::ComputedStyle {
+            display: style::Display::Block,
+            display_block: true,
+            float: style::Float::Left,
+            width: Some(w),
+            height: Some(50.0),
+            ..Default::default()
+        };
+        styles.insert(a, fl(300.0));
+        styles.insert(b, fl(300.0));
+        styles.insert(c, fl(300.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ab = find_box(&root_box, &|x| x.node == Some(a))
+            .unwrap()
+            .dimensions
+            .content;
+        let bb = find_box(&root_box, &|x| x.node == Some(b))
+            .unwrap()
+            .dimensions
+            .content;
+        let cb = find_box(&root_box, &|x| x.node == Some(c))
+            .unwrap()
+            .dimensions
+            .content;
+        let wb = find_box(&root_box, &|x| x.node == Some(wrap))
+            .unwrap()
+            .dimensions
+            .content;
+
+        // a and b share the first row, packed left to right.
+        assert!((ab.y - bb.y).abs() < 0.01, "a.y={} b.y={}", ab.y, bb.y);
+        assert!(
+            bb.x > ab.x + 0.01,
+            "b should sit right of a: a.x={} b.x={}",
+            ab.x,
+            bb.x
+        );
+        // c doesn't fit (900 > 800) so it wraps to the next row, back at the left.
+        assert!(
+            cb.y > ab.y + 0.01,
+            "c should wrap below: a.y={} c.y={}",
+            ab.y,
+            cb.y
+        );
+        assert!(
+            (cb.x - ab.x).abs() < 0.01,
+            "c should align under a: a.x={} c.x={}",
+            ab.x,
+            cb.x
+        );
+        // The wrapper grew to contain both float rows (2 × 50).
+        assert!(wb.height >= 100.0 - 0.01, "wrapper height = {}", wb.height);
+    }
+
+    #[test]
+    fn clear_drops_block_below_floats() {
+        // A float:left followed by a clear:left block: the cleared block starts below the float.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let wrap = doc.append_element(body, "div");
+        let f = doc.append_element(wrap, "div");
+        let cleared = doc.append_element(wrap, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(wrap, block_style(true));
+        styles.insert(
+            f,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                float: style::Float::Left,
+                width: Some(100.0),
+                height: Some(80.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            cleared,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                clear: style::Clear::Left,
+                height: Some(20.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let fb = find_box(&root_box, &|x| x.node == Some(f))
+            .unwrap()
+            .dimensions
+            .content;
+        let cb = find_box(&root_box, &|x| x.node == Some(cleared))
+            .unwrap()
+            .dimensions
+            .content;
+        // The cleared block sits at or below the float's bottom edge.
+        assert!(
+            cb.y >= fb.y + fb.height - 0.01,
+            "cleared.y={} float.bottom={}",
+            cb.y,
+            fb.y + fb.height
+        );
     }
 
     #[test]
@@ -1135,6 +1260,109 @@ mod tests {
     }
 
     #[test]
+    fn absolute_percentage_insets_resolve_against_containing_block() {
+        // Regression (wikipedia.org central language ring): an absolutely-positioned child with
+        // percentage `top`/`left` must anchor at that fraction of the positioned ancestor's
+        // padding box — not collapse to its top-left because the percentage was dropped.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let cb = doc.append_element(body, "div");
+        let item = doc.append_element(cb, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            cb,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Relative,
+                width: Some(400.0),
+                height: Some(200.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            item,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Absolute,
+                width: Some(50.0),
+                top_spec: style::InsetValue::Percent(20.0),
+                left_spec: style::InsetValue::Percent(75.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(cb)).unwrap();
+        let ibox = find_box(&root_box, &|x| x.node == Some(item)).unwrap();
+        let pad = pbox.dimensions.padding_box();
+        let c = ibox.dimensions.content;
+
+        // top: 20% of 200 = 40px below the padding-box top.
+        assert!(
+            (c.y - (pad.y + 40.0)).abs() < 0.01,
+            "c.y={} pad.y={}",
+            c.y,
+            pad.y
+        );
+        // left: 75% of 400 = 300px right of the padding-box left.
+        assert!(
+            (c.x - (pad.x + 300.0)).abs() < 0.01,
+            "c.x={} pad.x={}",
+            c.x,
+            pad.x
+        );
+    }
+
+    #[test]
+    fn relative_percentage_offset_resolves_against_containing_block() {
+        // `position: relative` with a percentage offset shifts by that fraction of the containing
+        // block (width for left, height for top).
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let outer = doc.append_element(body, "div");
+        let inner = doc.append_element(outer, "div");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            outer,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                width: Some(200.0),
+                height: Some(100.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            inner,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Relative,
+                height: Some(10.0),
+                left_spec: style::InsetValue::Percent(10.0),
+                ..Default::default()
+            },
+        );
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &HashMap::new(), None);
+        let ibox = find_box(&root_box, &|x| x.node == Some(inner)).unwrap();
+        // left: 10% of the 200px-wide containing block = 20px to the right of the normal-flow x.
+        assert!(
+            (ibox.dimensions.content.x - 20.0).abs() < 0.01,
+            "x={}",
+            ibox.dimensions.content.x
+        );
+    }
+
+    #[test]
     fn absolute_bottom_anchors_near_parent_bottom() {
         let mut doc = dom::Document::new();
         let root = doc.root();
@@ -1391,6 +1619,69 @@ mod tests {
         assert_eq!(ibox.dimensions.content.width, 100.0);
         assert_eq!(ibox.dimensions.content.height, 50.0);
         assert_eq!(ibox.node, Some(img));
+    }
+
+    #[test]
+    fn absolutely_positioned_image_keeps_intrinsic_size() {
+        // Regression (wikipedia.org globe logo): an `position: absolute` <img> must keep its
+        // build-time intrinsic size. The out-of-flow path used to size it like a container —
+        // width from `intrinsic_width` (0, no children) and height from children (0) — so the
+        // logo collapsed to 0×0 and never painted.
+        let mut doc = dom::Document::new();
+        let root = doc.root();
+        let body = doc.append_element(root, "body");
+        let cb = doc.append_element(body, "div");
+        let img = doc.append_element(cb, "img");
+
+        let mut styles = HashMap::new();
+        styles.insert(body, block_style(true));
+        styles.insert(
+            cb,
+            style::ComputedStyle {
+                display: style::Display::Block,
+                display_block: true,
+                position: style::Position::Relative,
+                width: Some(400.0),
+                height: Some(300.0),
+                ..Default::default()
+            },
+        );
+        styles.insert(
+            img,
+            style::ComputedStyle {
+                position: style::Position::Absolute,
+                top: Some(10.0),
+                left: Some(20.0),
+                ..Default::default()
+            },
+        );
+
+        let mut intrinsic = HashMap::new();
+        intrinsic.insert(img, (200.0, 183.0));
+
+        let root_box = layout_document(&doc, &styles, 800.0, 600.0, &Stub, &intrinsic, None);
+        let pbox = find_box(&root_box, &|x| x.node == Some(cb)).unwrap();
+        let ibox = find_box(&root_box, &|x| matches!(x.content, BoxContent::Image(_))).unwrap();
+        let pad = pbox.dimensions.padding_box();
+        let c = ibox.dimensions.content;
+        assert_eq!(
+            (c.width, c.height),
+            (200.0, 183.0),
+            "image must keep intrinsic size"
+        );
+        // Anchored at top:10 / left:20 from the positioned ancestor's padding box.
+        assert!(
+            (c.x - (pad.x + 20.0)).abs() < 0.01,
+            "c.x={} pad.x={}",
+            c.x,
+            pad.x
+        );
+        assert!(
+            (c.y - (pad.y + 10.0)).abs() < 0.01,
+            "c.y={} pad.y={}",
+            c.y,
+            pad.y
+        );
     }
 
     #[test]

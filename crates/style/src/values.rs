@@ -1,5 +1,17 @@
 use crate::*;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+thread_local! {
+    static EMPTY_VARS: Arc<HashMap<String, String>> = Arc::new(HashMap::new());
+}
+
+/// A shared, empty custom-property environment. Returns a cheap `Arc` clone of a per-thread
+/// singleton so constructing a default [`ComputedStyle`] (or a node that inherits no vars) doesn't
+/// allocate a fresh map.
+pub(crate) fn empty_vars() -> Arc<HashMap<String, String>> {
+    EMPTY_VARS.with(Arc::clone)
+}
 
 /// The four sides of a box (margin / border / padding thicknesses, or content insets), in px.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -72,6 +84,25 @@ pub enum Position {
     Absolute,
     Fixed,
     Sticky,
+}
+
+/// CSS `float`. `none` = in normal flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Float {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+/// CSS `clear`: which side(s) a block moves below earlier floats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Clear {
+    #[default]
+    None,
+    Left,
+    Right,
+    Both,
 }
 
 /// The *specified* value of an inset longhand (`top`/`right`/`bottom`/`left`), retained so the
@@ -275,6 +306,10 @@ pub struct ComputedStyle {
     pub visibility: Visibility,
     /// CSS `position`. Not inherited.
     pub position: Position,
+    /// CSS `float`. Not inherited.
+    pub float: Float,
+    /// CSS `clear`. Not inherited.
+    pub clear: Clear,
     /// Inset `top` in px (`None` = auto). Percentages unsupported (stored as None).
     pub top: Option<f32>,
     pub right: Option<f32>,
@@ -427,7 +462,12 @@ pub struct ComputedStyle {
     /// This element's resolved custom properties (`--name` -> value), case-sensitive. Populated
     /// from the cascade's `var` environment so `getComputedStyle(el).getPropertyValue("--x")`
     /// can read them. Not enumerated by [`property_names`](Self::property_names).
-    pub custom_props: HashMap<String, String>,
+    ///
+    /// Stored behind an [`Arc`] so the (often large — hundreds of entries on token-heavy sites
+    /// like wikipedia.org) inherited environment is shared, not deep-cloned, across the ~99% of
+    /// elements that declare no custom property of their own. The cascade only allocates a new map
+    /// when an element actually changes the environment (copy-on-write).
+    pub custom_props: Arc<HashMap<String, String>>,
 }
 
 /// Parsed CSS `color-scheme` value. The property lists the schemes a page supports; the browser

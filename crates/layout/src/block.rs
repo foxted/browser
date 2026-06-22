@@ -232,7 +232,7 @@ pub(crate) fn layout_block(
     resolve_out_of_flow(boxx, resolve_ctx, styles, measurer);
 
     // Apply a `position: relative` offset (after normal flow, without affecting siblings).
-    apply_relative_offset(boxx, styles);
+    apply_relative_offset(boxx, containing, styles);
 }
 
 /// Lay out a block's block-level children top-to-bottom. Returns the total content height
@@ -247,10 +247,45 @@ pub(crate) fn layout_block_children(
     let content = boxx.dimensions.content;
     let parent_align = text_align_of(boxx.node, styles);
     let mut cursor_y = content.y;
+    // Floats placed by this container (its own block formatting context). Empty for the common
+    // float-free page, in which case every helper below is a cheap no-op and the flow is unchanged.
+    let mut floats = FloatCtx::new(content.x, content.x + content.width);
     for child in &mut boxx.children {
         if is_out_of_flow(child, styles) {
             continue; // resolved separately; takes no space in flow
         }
+
+        let float = float_of(child, styles);
+        let clear = clear_of(child, styles);
+        // `clear` drops a box below the relevant earlier floats before it's placed.
+        let start_y = if floats.is_empty() {
+            cursor_y
+        } else {
+            floats.clear_to(clear, cursor_y)
+        };
+
+        if float != style::Float::None {
+            layout_float_child(
+                child,
+                content,
+                start_y,
+                float,
+                &mut floats,
+                ctx,
+                styles,
+                measurer,
+            );
+            // A float doesn't advance normal flow, but a `clear` on it still moves the pen down so
+            // following in-flow content starts below the cleared floats.
+            cursor_y = cursor_y.max(start_y);
+            continue;
+        }
+
+        // In-flow block: it stacks below previous siblings at the container's full content width.
+        // (Per CSS a block box keeps its full width beside floats — only its *line boxes* shorten,
+        // which inline layout handles separately; narrowing the box here would wrongly re-resolve a
+        // percentage `width` against the reduced band.)
+        cursor_y = start_y;
         // Each child's containing block is this box's content rect, but positioned so the
         // child stacks below previous siblings. We thread the running y via the containing
         // rect's y, and the child adds its own top margin/border/padding inside layout_block.
@@ -275,7 +310,56 @@ pub(crate) fn layout_block_children(
         }
         cursor_y += child.dimensions.margin_box().height;
     }
-    cursor_y - content.y
+    // The container must be tall enough to contain its floats (it owns their formatting context).
+    floats.max_bottom(cursor_y) - content.y
+}
+
+/// Lay out and place one floated child within `content` (the container's content rect), no higher
+/// than `start_y`. Sizes the float (explicit/percentage `width`, else shrink-to-fit), lays out its
+/// subtree, then positions its margin box via the [`FloatCtx`] (packing beside earlier floats and
+/// wrapping down when a row is full).
+#[allow(clippy::too_many_arguments)]
+fn layout_float_child(
+    child: &mut LayoutBox,
+    content: Rect,
+    start_y: f32,
+    side: style::Float,
+    floats: &mut FloatCtx,
+    ctx: Ctx,
+    styles: &HashMap<dom::NodeId, style::ComputedStyle>,
+    measurer: &dyn TextMeasurer,
+) {
+    // Hand `layout_block` a containing rect whose width makes it resolve the float's used width
+    // correctly, then reposition the result.
+    //   * explicit / percentage `width`: pass the container's FULL content width so `layout_block`'s
+    //     own `width` resolution matches (a percentage resolves against the containing block, not
+    //     the reduced float band — passing a narrowed width would apply the percentage twice).
+    //   * `auto` width: floats shrink-to-fit, which `layout_block` doesn't do, so pass a containing
+    //     width equal to the shrink-to-fit margin-box width and let it fill that.
+    let size_width = match resolved_width(child, styles, content.width) {
+        Some(_) => content.width,
+        None => {
+            let b = child.dimensions.border;
+            let p = child.dimensions.padding;
+            let m = child.dimensions.margin;
+            let own_edges = p.left + p.right + b.left + b.right;
+            let h_edges = own_edges + m.left + m.right;
+            let intrinsic = (intrinsic_width(child, styles, measurer) - own_edges).max(0.0);
+            let avail = (content.width - h_edges).max(0.0);
+            intrinsic.min(avail) + h_edges
+        }
+    };
+    let size_rc = Rect {
+        x: content.x,
+        y: start_y,
+        width: size_width,
+        height: 0.0,
+    };
+    grow_stack(|| layout_block(child, size_rc, ctx, styles, measurer));
+    let mb = child.dimensions.margin_box();
+    // Place the margin box and slide the whole subtree from its tentative origin to the slot.
+    let (fx, fy) = floats.place(mb.width, mb.height, start_y, side);
+    shift_subtree(child, fx - mb.x, fy - mb.y);
 }
 
 /// Position a replaced (image) box within `containing`. The content size was pre-computed at
@@ -338,15 +422,39 @@ pub(crate) fn layout_out_of_flow(
     let horizontal =
         margin.left + margin.right + border.left + border.right + padding.left + padding.right;
 
+    // Replaced content (<img>/<canvas>/<svg>/form widget) has an intrinsic size already resolved
+    // at build time (CSS width/height + intrinsic dims + aspect ratio, via `image_content_size`).
+    // Out-of-flow layout must preserve those dimensions: treating the box as a container would
+    // size width from `intrinsic_width` (0 for a childless box) and height from children (also 0),
+    // leaving the element invisible — this is why absolutely-positioned images didn't render.
+    let replaced = matches!(boxx.content, BoxContent::Image(_) | BoxContent::Widget(_));
+    let (replaced_w, replaced_h) = (
+        boxx.dimensions.content.width,
+        boxx.dimensions.content.height,
+    );
+
+    // Resolve insets against the containing block. Percentage (and percentage-bearing `calc()`)
+    // insets can't be resolved at cascade time because their basis — the containing block's
+    // extent on the relevant axis — isn't known until now, so they're carried symbolically in
+    // `*_spec` and resolved here: left/right against `cb.width`, top/bottom against `cb.height`.
+    // Fall back to the pre-resolved px field for any path that set only it (e.g. the `inset`
+    // shorthand, which stores absolute lengths directly without a spec).
+    let inset_left = cs.left_spec.resolve_px(cb.width).or(cs.left);
+    let inset_right = cs.right_spec.resolve_px(cb.width).or(cs.right);
+    let inset_top = cs.top_spec.resolve_px(cb.height).or(cs.top);
+    let inset_bottom = cs.bottom_spec.resolve_px(cb.height).or(cs.bottom);
+
     // Content width:
     //   * explicit `width` wins;
     //   * `left` AND `right` both set with no width => stretch to fill between them;
     //   * otherwise shrink-to-fit to the box's intrinsic (max-content) width, exactly like the
     //     inline-block path. `intrinsic_width` returns the border-box width (content + padding +
     //     border), so we strip the box's own horizontal padding/border back off to get content.
-    let content_width = if let Some(w) = cs.width {
+    let content_width = if replaced {
+        replaced_w
+    } else if let Some(w) = cs.width {
         w
-    } else if let (Some(l), Some(r)) = (cs.left, cs.right) {
+    } else if let (Some(l), Some(r)) = (inset_left, inset_right) {
         (cb.width - l - r - horizontal).max(0.0)
     } else {
         let intrinsic = intrinsic_width(boxx, styles, measurer);
@@ -361,7 +469,7 @@ pub(crate) fn layout_out_of_flow(
     // Over-constrained box (left, right AND width all set) with auto margin(s): the leftover inline
     // space goes to the auto margin(s) (CSS 2.2 §10.3.7) — centering when both are auto. Otherwise
     // auto margins stay 0 (the style crate already resolved them so).
-    if let (Some(l), Some(r)) = (cs.left, cs.right) {
+    if let (Some(l), Some(r)) = (inset_left, inset_right) {
         if cs.width.is_some() && (cs.margin_auto[1] || cs.margin_auto[3]) {
             let free = cb.width
                 - l
@@ -379,16 +487,16 @@ pub(crate) fn layout_out_of_flow(
 
     // Tentative content origin: relative to the containing block's top-left, offset by insets.
     // The insets address the box's *margin* box edge; we then add the box's own left/top edges.
-    let border_left_x = if let Some(l) = cs.left {
+    let border_left_x = if let Some(l) = inset_left {
         cb.x + l + margin.left
-    } else if let Some(r) = cs.right {
+    } else if let Some(r) = inset_right {
         cb.x + cb.width - r - (content_width + horizontal) + margin.left
     } else {
         cb.x
     };
-    let border_top_y = if let Some(t) = cs.top {
+    let border_top_y = if let Some(t) = inset_top {
         cb.y + t
-    } else if let Some(b) = cs.bottom {
+    } else if let Some(b) = inset_bottom {
         cb.y + cb.height - b // adjusted after height is known below
     } else {
         cb.y
@@ -410,36 +518,47 @@ pub(crate) fn layout_out_of_flow(
     };
 
     let display = display_of(boxx, styles);
-    let content_height = match display {
-        style::Display::Flex | style::Display::InlineFlex => {
-            layout_flex(boxx, child_ctx, styles, measurer)
-        }
-        style::Display::Grid | style::Display::InlineGrid => {
-            layout_grid(boxx, child_ctx, styles, measurer)
-        }
-        _ => {
-            let any_block = boxx.children.iter().any(|c| {
-                matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
-                    || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
-                        && image_is_block(c, styles))
-            });
-            if any_block {
-                layout_block_children(boxx, child_ctx, styles, measurer)
-            } else if !boxx.children.is_empty() {
-                let align = text_align_of(boxx.node, styles);
-                layout_inline_children(boxx, align, child_ctx, styles, measurer)
-            } else {
-                0.0
+    let content_height = if replaced {
+        // Replaced box: its height is the build-time intrinsic height, not derived from children.
+        replaced_h
+    } else {
+        match display {
+            style::Display::Flex | style::Display::InlineFlex => {
+                layout_flex(boxx, child_ctx, styles, measurer)
+            }
+            style::Display::Grid | style::Display::InlineGrid => {
+                layout_grid(boxx, child_ctx, styles, measurer)
+            }
+            _ => {
+                let any_block = boxx.children.iter().any(|c| {
+                    matches!(c.content, BoxContent::Block | BoxContent::Anonymous)
+                        || (matches!(c.content, BoxContent::Image(_) | BoxContent::Widget(_))
+                            && image_is_block(c, styles))
+                });
+                if any_block {
+                    layout_block_children(boxx, child_ctx, styles, measurer)
+                } else if !boxx.children.is_empty() {
+                    let align = text_align_of(boxx.node, styles);
+                    layout_inline_children(boxx, align, child_ctx, styles, measurer)
+                } else {
+                    0.0
+                }
             }
         }
     };
-    let final_height = cs.height.unwrap_or(content_height);
+    // For replaced content the build-time height already honors CSS `height`; otherwise CSS
+    // `height` overrides the content-derived height.
+    let final_height = if replaced {
+        content_height
+    } else {
+        cs.height.unwrap_or(content_height)
+    };
     let final_height = clamp_height(boxx, final_height, cb.height, styles);
     boxx.dimensions.content.height = final_height;
 
     // If positioned by `bottom` (no `top`), re-anchor now that height is known.
-    if cs.top.is_none() {
-        if let Some(b) = cs.bottom {
+    if inset_top.is_none() {
+        if let Some(b) = inset_bottom {
             let new_border_top = cb.y + cb.height
                 - b
                 - (final_height
@@ -461,8 +580,8 @@ pub(crate) fn layout_out_of_flow(
     // (the parent's content-box top-left) instead of the laid-out (cb-origin) position.
     let mb = boxx.dimensions.margin_box();
     let (vert_auto, horiz_auto) = (
-        (cs.top.is_none() && cs.bottom.is_none()),
-        (cs.left.is_none() && cs.right.is_none()),
+        (inset_top.is_none() && inset_bottom.is_none()),
+        (inset_left.is_none() && inset_right.is_none()),
     );
     // Vertical: margin-box top relative to cb top (or static origin when both auto).
     let mb_top = if vert_auto { parent_content.y } else { mb.y };
@@ -486,6 +605,7 @@ pub(crate) fn layout_out_of_flow(
 /// (left/right, top/bottom) insets, without affecting siblings.
 pub(crate) fn apply_relative_offset(
     boxx: &mut LayoutBox,
+    containing: Rect,
     styles: &HashMap<dom::NodeId, style::ComputedStyle>,
 ) {
     let cs = match style_of(boxx, styles) {
@@ -495,16 +615,19 @@ pub(crate) fn apply_relative_offset(
     if cs.position != style::Position::Relative {
         return;
     }
-    let dx = if let Some(l) = cs.left {
+    // Percentage insets resolve against the containing block (width for left/right, height for
+    // top/bottom); `*_spec` carries them symbolically until now. Fall back to the pre-resolved px
+    // field for any path that set only it (e.g. the `inset` shorthand).
+    let dx = if let Some(l) = cs.left_spec.resolve_px(containing.width).or(cs.left) {
         l
-    } else if let Some(r) = cs.right {
+    } else if let Some(r) = cs.right_spec.resolve_px(containing.width).or(cs.right) {
         -r
     } else {
         0.0
     };
-    let dy = if let Some(t) = cs.top {
+    let dy = if let Some(t) = cs.top_spec.resolve_px(containing.height).or(cs.top) {
         t
-    } else if let Some(b) = cs.bottom {
+    } else if let Some(b) = cs.bottom_spec.resolve_px(containing.height).or(cs.bottom) {
         -b
     } else {
         0.0
