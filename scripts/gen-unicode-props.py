@@ -87,9 +87,21 @@ def main():
     scripts = parse_ranges(fetch("Scripts.txt"))
     scx = parse_ranges(fetch("ScriptExtensions.txt"))
     binprops = {}
-    for f in ("PropList.txt", "DerivedCoreProperties.txt", "emoji/emoji-data.txt"):
+    for f in ("PropList.txt", "DerivedCoreProperties.txt", "emoji/emoji-data.txt",
+              "extracted/DerivedBinaryProperties.txt"):
         for k, v in parse_ranges(fetch(f)).items():
             binprops.setdefault(k, []).extend(v)
+    # DerivedNormalizationProps lists some binary properties (single value field) alongside
+    # multi-valued ones (`NFD_QC ; N`); keep only the binary `range ; Name` rows.
+    for line in fetch("DerivedNormalizationProps.txt").splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(";")]
+        if len(parts) == 2:
+            rng = parts[0]
+            lo, hi = (rng.split("..") + [rng])[:2] if ".." in rng else (rng, rng)
+            binprops.setdefault(parts[1], []).append((int(lo, 16), int(hi, 16)))
 
     # Property + property-value aliases (short/long/extra spellings).
     # Map EVERY spelling (short, long, extras) to the full list, so a lookup by any name works.
@@ -154,6 +166,12 @@ def main():
     bind(["Assigned"], complement(gc.get("Cn", [])))
 
     # --- Script (Script=value only) ---
+    # The `Unknown` (Zzzz) script covers every code point in no explicit script.
+    all_script_ranges = []
+    for ranges in scripts.values():
+        all_script_ranges += ranges
+    scripts = dict(scripts)
+    scripts["Unknown"] = complement(all_script_ranges)
     for val, ranges in scripts.items():
         keys = []
         for pn in aliases_for_prop("sc"):
