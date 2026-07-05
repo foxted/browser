@@ -86,7 +86,8 @@ GPU surface, can replace it later without touching the engine.)
 - `js` — JS runtime + DOM/`window`/`self` bindings; runs page scripts. Compile-time backend
   switch: `backend-v8` (default, *reuses `v8`*) or `backend-lumen` (the from-scratch engine)
 - `lumen` — **hand-written JS engine** (std-only, no deps): lexer/parser/tree-walking interpreter
-  with generators & async via stackful coroutines, RegExp, and a `Temporal` subset
+  with generators & async via stackful coroutines, RegExp, and a `Temporal` subset —
+  **passes 100% of test262** (53,376/53,376)
 - `test262-runner` — runs `lumen` against [tc39/test262](https://github.com/tc39/test262) for a
   trackable conformance score
 - `css` — hand-written CSS parser (`<style>` blocks + inline `style=""`)
@@ -184,13 +185,15 @@ Long pages **scroll** (mouse-wheel, per-tab, clamped to document height), and `<
 **images** are fetched, decoded, and blitted (sized by CSS dims or decoded intrinsic size).
 
 Toward replacing `v8`, the **`lumen`** crate is a from-scratch JS engine (std-only) behind the
-`backend-lumen` feature, grown against **tc39/test262**. It covers the language core plus most
-built-ins — closures, classes, generators & `async`/`await` (real suspension via stackful
-coroutines), `Proxy`/`Reflect`, `RegExp` (incl. `\p{…}` and inline modifiers), typed arrays,
-`Promise`, and a `Temporal` subset. Run the conformance suite with `scripts/run-test262.sh`.
+`backend-lumen` feature, grown against **tc39/test262** — it **passes the full suite:
+53,376/53,376 (100%)**, including annexB, intl402, and staging. That covers the language core
+plus the built-ins — closures, classes, generators & `async`/`await` (real suspension via
+stackful coroutines), ES modules (top-level await, `import defer`, source phase),
+`Proxy`/`Reflect`, `RegExp` (incl. `\p{…}` and inline modifiers), typed arrays, `Promise`,
+`Intl`, and `Temporal`. Run the conformance suite with `scripts/run-test262.sh`.
 
 Done: networking + external CSS/JS · HTML→DOM · tabs · JS (DOM bindings + timers + browser
-env) · from-scratch JS engine (`lumen`, test262-driven) · CSS cascade · box-model +
+env) · from-scratch JS engine (`lumen`, 100% test262) · CSS cascade · box-model +
 flexbox/grid/positioning layout + paint · scrolling · images.
 Roadmap: z-index paint order · floats · margin collapsing · fuller grid · `data:`/SVG images ·
 DOM events on input · `fetch`/XHR · concurrent fetch · GPU rendering.
