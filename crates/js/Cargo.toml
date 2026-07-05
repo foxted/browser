@@ -20,7 +20,7 @@ backend-lumen = ["dep:lumen"]
 # ES modules and dynamic import. Optional: only linked under the `backend-v8` feature.
 v8 = { version = "150", optional = true }
 # Our from-scratch JS engine — the eventual replacement for V8. Only linked under `backend-lumen`.
-lumen = { path = "../lumen", optional = true }
+lumen = { git = "https://github.com/lucid-softworks/lumen", optional = true }
 # The real DOM, so page scripts can read and mutate the live document tree.
 dom = { path = "../dom" }
 # The cascade + CSS parser, so `getComputedStyle` can compute real values in-Session (the JS runs

@@ -1405,6 +1405,7 @@ dependencies = [
 [[package]]
 name = "lumen"
 version = "0.1.0"
+source = "git+https://github.com/lucid-softworks/lumen#27a2d73658712a80aa45d87b2be0985266cae07c"
 
 [[package]]
 name = "maybe-rayon"
@@ -2212,13 +2213,6 @@ dependencies = [
  "timezone_provider",
  "tinystr",
  "writeable",
-]
-
-[[package]]
-name = "test262-runner"
-version = "0.1.0"
-dependencies = [
- "lumen",
 ]
 
 [[package]]

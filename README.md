@@ -85,11 +85,6 @@ GPU surface, can replace it later without touching the engine.)
 - `dom` — arena-based node tree
 - `js` — JS runtime + DOM/`window`/`self` bindings; runs page scripts. Compile-time backend
   switch: `backend-v8` (default, *reuses `v8`*) or `backend-lumen` (the from-scratch engine)
-- `lumen` — **hand-written JS engine** (std-only, no deps): lexer/parser/tree-walking interpreter
-  with generators & async via stackful coroutines, RegExp, and a `Temporal` subset —
-  **passes 100% of test262** (53,376/53,376)
-- `test262-runner` — runs `lumen` against [tc39/test262](https://github.com/tc39/test262) for a
-  trackable conformance score
 - `css` — hand-written CSS parser (`<style>` blocks + inline `style=""`)
 - `style` — cascade (UA + author + inline) → computed styles, box + flex/grid/position props
 - `layout` — block/inline/inline-block, **flexbox**, basic **grid**, and **positioning**
@@ -184,13 +179,14 @@ runs) remain out of reach without a near-complete JS/web-platform implementation
 Long pages **scroll** (mouse-wheel, per-tab, clamped to document height), and `<img>`
 **images** are fetched, decoded, and blitted (sized by CSS dims or decoded intrinsic size).
 
-Toward replacing `v8`, the **`lumen`** crate is a from-scratch JS engine (std-only) behind the
-`backend-lumen` feature, grown against **tc39/test262** — it **passes the full suite:
-53,376/53,376 (100%)**, including annexB, intl402, and staging. That covers the language core
-plus the built-ins — closures, classes, generators & `async`/`await` (real suspension via
-stackful coroutines), ES modules (top-level await, `import defer`, source phase),
-`Proxy`/`Reflect`, `RegExp` (incl. `\p{…}` and inline modifiers), typed arrays, `Promise`,
-`Intl`, and `Temporal`. Run the conformance suite with `scripts/run-test262.sh`.
+Toward replacing `v8`, [**`lumen`**](https://github.com/lucid-softworks/lumen) is a from-scratch
+JS engine (std-only) behind the `backend-lumen` feature, grown against **tc39/test262** — it
+**passes the full suite: 53,376/53,376 (100%)**, including annexB, intl402, and staging. That
+covers the language core plus the built-ins — closures, classes, generators & `async`/`await`
+(real suspension via stackful coroutines), ES modules (top-level await, `import defer`, source
+phase), `Proxy`/`Reflect`, `RegExp` (incl. `\p{…}` and inline modifiers), typed arrays,
+`Promise`, `Intl`, and `Temporal`. It now lives in its own repo (extracted with full history,
+along with its test262 runner and benchmark tooling) and is consumed here as a git dependency.
 
 Done: networking + external CSS/JS · HTML→DOM · tabs · JS (DOM bindings + timers + browser
 env) · from-scratch JS engine (`lumen`, 100% test262) · CSS cascade · box-model +
